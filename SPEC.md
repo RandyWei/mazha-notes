@@ -204,9 +204,13 @@ pub enum Edit {
     Insert { at: usize, text: String },       // at = 源字节偏移（UTF-8 边界）
     Delete { range: Range<usize> },           // 源字节范围
     Replace { range: Range<usize>, text: String },
-    ToggleInline { range: Range<usize>, mark: InlineMark }, // 包裹/取消 强调/代码/链接
-    ToggleBlock  { block: usize, kind: BlockKind },         // 标题/列表/引用/代码块切换
+    ToggleInline { range: Range<usize>, mark: InlineMark },   // 包裹/取消 强调/粗体/删除线/代码
+    ToggleBlock  { range: Range<usize>, target: BlockTarget }, // 标题/引用/列表/段落
 }
+
+/// 行内强调种类 / 块级目标
+pub enum InlineMark { Emphasis, Strong, Strikethrough, Code }
+pub enum BlockTarget { Paragraph, Heading(u8), BlockQuote, List { ordered: bool } }
 
 /// 输入意图 → 编辑命令 的转换（缩进、列表续行、自动配对等）
 pub trait IntentMapper {
@@ -296,13 +300,14 @@ pub struct ChangeSummary {
 }
 ```
 
-> **实现状态**：`Edit`（Insert/Delete/Replace）、`Document`（rope + 边界校验 +
-> undo/redo + 字节/字符边界导航 + `projection()` 全量重建）、`Selection`、
-> `ChangeSummary`、`OffsetMap`（src↔display 双向映射 + 稳定落点规则）、
-> `Projection`（按逻辑行投影：`BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`）
-> 已落地（Phase 1，见 `crates/mazha-core`）。
-> `ToggleInline`/`ToggleBlock`、`IntentMapper`、`DocId`/`DocPath`、
-> `Projection` 的**增量重建**为后续迭代项。
+> **实现状态**：`Edit`（Insert/Delete/Replace + ToggleInline/ToggleBlock，切换命令经
+> `commands` 模块解析为源级编辑）、`Document`（rope + 边界校验 + undo/redo +
+> 字节/字符边界导航 + `projection()` 全量重建）、`Selection`、`ChangeSummary`、
+> `OffsetMap`（src↔display 双向映射 + 稳定落点规则）、`Projection`（按逻辑行投影：
+> `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`）、`IntentMapper`（最小实现：
+> 回车列表续行/退出列表 + 切换转发）已落地（Phase 1，见 `crates/mazha-core`）。
+> `DocId`/`DocPath`、`Projection` 的**增量重建**、更丰富的意图（缩进/自动配对/
+> 删除键合并）为后续迭代项。
 
 ### 6.2 `StorageProvider`（存储抽象）
 
@@ -570,6 +575,7 @@ interface Workspace {
 | 0.1.3 | 2026-10-12 | `mazha-md` 起步：行扫描块级解析（ATX/Setext 标题、段落、分割线、围栏代码、引用、有序/无序/任务列表）+ `SyntaxSpan`/`visible_runs`；决策 D23（自研行扫描，pulldown-cmark 降为 dev 依赖）与 §8 选型更新；16 条单测 |
 | 0.1.4 | 2026-10-12 | `mazha-md` 行内解析：强调/粗体/删除线（递归嵌套 + 颜色继承）、行内代码（等长反引号 + 空格修剪）、链接（URL 隐藏）、图片（Widget 占位）、转义、自动链接；接入段落/标题叶子块；硬换行标记；13 条单测（累计 29） |
 | 0.1.5 | 2026-10-12 | 落地 `Projection`（`mazha-core` 依赖 `mazha-md`）：按逻辑行投影出 `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`，`Document::projection()` 全量重建；13 条单测（累计 47）。确认决策 D23 并新增 `docs/ADR/ADR-001`（自研解析 vs pulldown-cmark 对比）；CI/AGENTS 的 clippy 升级为 `--all-targets` |
+| 0.1.6 | 2026-10-12 | 编辑命令：新增 `Edit::ToggleInline`/`ToggleBlock` + `InlineMark`/`BlockTarget`；`commands` 模块（行内包裹/解包裹、块前缀逐行增删/剥离）；`Document::apply` 解析切换命令并纳入 undo/redo；`IntentMapper` 最小实现（回车列表续行/递增序号/空项退出、切换转发）；22 条单测（累计 69）；SPEC §6.1 契约同步 |
 
 ---
 

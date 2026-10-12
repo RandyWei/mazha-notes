@@ -6,6 +6,47 @@
 
 use std::ops::Range;
 
+/// 行内强调种类（`ToggleInline` 的目标，SPEC §6.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineMark {
+    /// 斜体（`*x*`）。
+    Emphasis,
+    /// 粗体（`**x**`）。
+    Strong,
+    /// 删除线（`~~x~~`）。
+    Strikethrough,
+    /// 行内代码（`` `x` ``）。
+    Code,
+}
+
+impl InlineMark {
+    /// 对应的 Markdown 定界串。
+    pub fn marker(self) -> &'static str {
+        match self {
+            InlineMark::Emphasis => "*",
+            InlineMark::Strong => "**",
+            InlineMark::Strikethrough => "~~",
+            InlineMark::Code => "`",
+        }
+    }
+}
+
+/// 块级样式目标（`ToggleBlock` 的目标，SPEC §6.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockTarget {
+    /// 普通段落（去除块前缀）。
+    Paragraph,
+    /// 标题，级别 1..=6。
+    Heading(u8),
+    /// 引用。
+    BlockQuote,
+    /// 列表：`ordered` 决定有序/无序。
+    List {
+        /// 是否有序列表。
+        ordered: bool,
+    },
+}
+
 /// 对源文本的一次原子编辑。
 ///
 /// 所有偏移量都是 **UTF-8 字节偏移**，且必须是字符边界，否则 `Document::apply`
@@ -33,16 +74,35 @@ pub enum Edit {
         /// 新文本。
         text: String,
     },
+
+    /// 包裹/取消选区内的行内强调。会在 `apply` 时解析成具体的 Insert/Replace。
+    ToggleInline {
+        /// 选区（源字节范围）。
+        range: Range<usize>,
+        /// 强调种类。
+        mark: InlineMark,
+    },
+
+    /// 设置块级样式。会在 `apply` 时解析成具体的 Replace。
+    ToggleBlock {
+        /// 目标块的行范围（源字节范围）。
+        range: Range<usize>,
+        /// 目标样式。
+        target: BlockTarget,
+    },
 }
 
 impl Edit {
     /// 本次编辑在**修改前**文档中影响的源文本字节范围。
     ///
-    /// 插入：`at..at+len`；删除/替换：`range`。供 undo/redo 与投影失效计算使用。
+    /// 插入：`at..at+len`；删除/替换/切换：对应 `range`。供 undo/redo 与投影失效计算使用。
     pub fn source_range(&self) -> Range<usize> {
         match self {
             Edit::Insert { at, text } => *at..at.saturating_add(text.len()),
-            Edit::Delete { range } | Edit::Replace { range, .. } => range.clone(),
+            Edit::Delete { range }
+            | Edit::Replace { range, .. }
+            | Edit::ToggleInline { range, .. }
+            | Edit::ToggleBlock { range, .. } => range.clone(),
         }
     }
 }

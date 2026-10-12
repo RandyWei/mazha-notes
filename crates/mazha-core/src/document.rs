@@ -152,6 +152,9 @@ impl Document {
     /// - 插入偏移不是字符边界 → [`EditError::InvalidBoundary`]。
     /// - 删除/替换范围越界或倒序 → [`EditError::InvalidRange`]。
     pub fn apply(&mut self, edit: Edit) -> Result<ChangeSummary> {
+        // 先把高层命令（ToggleInline / ToggleBlock）解析成对源文本的基础编辑，
+        // 之后 undo/redo 只需记录基础编辑的源级副作用。
+        let edit = self.resolve(edit);
         self.validate_edit(&edit)?;
         // 在修改前生成逆编辑：此时才能取到被覆盖的原文。
         let inverse = self.inverse_of(&edit);
@@ -166,6 +169,19 @@ impl Document {
             self.undo_stack.remove(0);
         }
         Ok(summary)
+    }
+
+    /// 把高层编辑命令解析为具体的基础编辑（Insert/Delete/Replace）。
+    fn resolve(&self, edit: Edit) -> Edit {
+        match edit {
+            Edit::ToggleInline { range, mark } => {
+                crate::commands::toggle_inline(&self.text(), range, mark)
+            }
+            Edit::ToggleBlock { range, target } => {
+                crate::commands::set_block(&self.text(), range, &target)
+            }
+            base => base,
+        }
     }
 
     /// 撤销最近一次编辑。无历史时返回 `None`。
@@ -215,6 +231,10 @@ impl Document {
         match edit {
             Edit::Insert { at, .. } => self.validate_byte_offset(*at),
             Edit::Delete { range } | Edit::Replace { range, .. } => self.validate_byte_range(range),
+            // 切换命令：校验目标范围（apply 前已解析，这里兜底保证自洽）
+            Edit::ToggleInline { range, .. } | Edit::ToggleBlock { range, .. } => {
+                self.validate_byte_range(range)
+            }
         }
     }
 
@@ -263,6 +283,11 @@ impl Document {
                 range: range.start..range.start.saturating_add(text.len()),
                 text: self.slice(range.clone()).into_owned(),
             },
+            // 切换命令：先解析成基础编辑再求逆（apply 前已解析，这里兜底）
+            Edit::ToggleInline { .. } | Edit::ToggleBlock { .. } => {
+                let concrete = self.resolve(edit.clone());
+                self.inverse_of(&concrete)
+            }
         }
     }
 
@@ -287,6 +312,11 @@ impl Document {
                 self.text.remove(start..end);
                 self.text.insert(start, text);
                 range.start..range.start.saturating_add(text.len())
+            }
+            // 切换命令：先解析成基础编辑再应用（apply 前已解析，这里兜底）
+            Edit::ToggleInline { .. } | Edit::ToggleBlock { .. } => {
+                let concrete = self.resolve(edit.clone());
+                self.apply_raw(&concrete).affected
             }
         };
         let doc_len = self.text.len_bytes();
@@ -387,6 +417,62 @@ mod tests {
                 end: 9,
                 doc_len: 3
             })
+        );
+        assert_eq!(d.text(), "abc");
+    }
+
+    #[test]
+    fn toggle_inline_through_document_and_undo() {
+        let mut d = doc("hello world");
+        d.apply(Edit::ToggleInline {
+            range: 6..11,
+            mark: crate::InlineMark::Strong,
+        })
+        .unwrap();
+        assert_eq!(d.text(), "hello **world**");
+        // 再次切换 → 解包裹
+        d.apply(Edit::ToggleInline {
+            range: 8..13,
+            mark: crate::InlineMark::Strong,
+        })
+        .unwrap();
+        assert_eq!(d.text(), "hello world");
+        // undo 两次回到原文
+        d.undo().unwrap();
+        assert_eq!(d.text(), "hello **world**");
+        d.undo().unwrap();
+        assert_eq!(d.text(), "hello world");
+        // redo 恢复
+        d.redo().unwrap();
+        assert_eq!(d.text(), "hello **world**");
+    }
+
+    #[test]
+    fn toggle_block_heading_through_document() {
+        let mut d = doc("title\nbody");
+        d.apply(Edit::ToggleBlock {
+            range: 0..5,
+            target: crate::BlockTarget::Heading(1),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "# title\nbody");
+        d.apply(Edit::ToggleBlock {
+            range: 0..7,
+            target: crate::BlockTarget::Paragraph,
+        })
+        .unwrap();
+        assert_eq!(d.text(), "title\nbody");
+    }
+
+    #[test]
+    fn toggle_invalid_range_rejected() {
+        let mut d = doc("abc");
+        assert!(
+            d.apply(Edit::ToggleInline {
+                range: 0..9,
+                mark: crate::InlineMark::Code,
+            })
+            .is_err()
         );
         assert_eq!(d.text(), "abc");
     }

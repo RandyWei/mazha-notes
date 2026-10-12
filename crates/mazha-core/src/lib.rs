@@ -9,16 +9,20 @@
 //! 光标/选区 + 边界校验（最小可用内核）。`Projection` / `OffsetMap`
 //! 在本里程碑之后的迭代中实现。
 
+mod commands;
 mod document;
 mod edit;
 mod error;
+mod intent;
 mod offset_map;
 mod projection;
 mod selection;
 
+pub use commands::{set_block, toggle_inline};
 pub use document::Document;
-pub use edit::{ChangeSummary, Edit};
+pub use edit::{BlockTarget, ChangeSummary, Edit, InlineMark};
 pub use error::{EditError, Result};
+pub use intent::{DefaultIntentMapper, Intent, IntentMapper};
 pub use offset_map::{DisplayPos, OffsetMap, OffsetMapError};
 pub use projection::{
     BlockStyle, Bullet, ProjectedLine, Projection, RunStyle, TextRun, Widget, WidgetKind,
