@@ -1,26 +1,16 @@
 //! # mazha-store
 //!
-//! 存储抽象层：`StorageProvider` trait（SPEC §6.2）与默认的本地文件系统实现。
-//! 云端 / 自部署 / 用户自定义存储均以 Provider 形式接入。
+//! 存储抽象层（SPEC §5、§6.2）：`StorageProvider` trait 与默认的**本地文件系统**实现
+//! `FileSystemProvider`。云端 / 自部署 / 用户自定义存储均以 Provider 形式接入。
+//!
+//! **本 crate 不得依赖任何 GUI**（SPEC §4.1）。MVP 采用同步接口（决策 D24）。
 
-/// 存储 Provider 能力描述（Phase 5 完善）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StorageCaps {
-    /// 是否支持流式读写。
-    pub streaming: bool,
-    /// 是否支持版本历史。
-    pub versioning: bool,
-    /// 是否支持协作同步。
-    pub collaboration: bool,
-}
+mod error;
+mod local;
+mod path;
+mod provider;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_caps_are_off() {
-        let caps = StorageCaps::default();
-        assert!(!caps.streaming && !caps.versioning && !caps.collaboration);
-    }
-}
+pub use error::{StoreError, StoreResult};
+pub use local::FileSystemProvider;
+pub use path::DocPath;
+pub use provider::{Entry, EntryKind, StorageCaps, StorageProvider};

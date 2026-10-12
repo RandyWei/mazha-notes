@@ -306,28 +306,33 @@ pub struct ChangeSummary {
 > `OffsetMap`（src↔display 双向映射 + 稳定落点规则）、`Projection`（按逻辑行投影：
 > `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`）、`IntentMapper`（最小实现：
 > 回车列表续行/退出列表 + 切换转发）已落地（Phase 1，见 `crates/mazha-core`）。
-> `DocId`/`DocPath`、`Projection` 的**增量重建**、更丰富的意图（缩进/自动配对/
-> 删除键合并）为后续迭代项。
+> `DocId`/`DocPath`（`DocPath` 落在 `mazha-store`，`DocId` 待定）、`Projection` 的**增量重建**、
+> 更丰富的意图（缩进/自动配对/删除键合并）为后续迭代项。
 
 ### 6.2 `StorageProvider`（存储抽象）
 
 ```rust
+/// 工作区内相对路径（`/` 分隔、禁 `..`/`.`/空段/绝对前缀/反斜杠）
+pub struct DocPath(/* normalized */);
+
 pub trait StorageProvider: Send + Sync {
-    fn id(&self) -> &str;                                  // "local" | "mazha-cloud" | "plugin:xxx"
-    fn capabilities(&self) -> StorageCaps;                 // 是否支持流式/版本/协作等
-    async fn list(&self, dir: &str) -> Result<Vec<Entry>>;
-    async fn read(&self, path: &str) -> Result<Vec<u8>>;
-    async fn write(&self, path: &str, data: &[u8]) -> Result<()>;
-    async fn rename(&self, from: &str, to: &str) -> Result<()>;
-    async fn remove(&self, path: &str) -> Result<()>;
-    /// 文件变更订阅（本地用文件监听，云用长连接/轮询）
-    fn watch(&self, cb: Box<dyn Fn(ChangeEvent) + Send + Sync>) -> Result<Watcher>;
+    fn id(&self) -> &'static str;                          // "local" | "mazha-cloud" | "plugin:xxx"
+    fn capabilities(&self) -> StorageCaps;                 // writable/streaming/versioning/collaboration
+    fn list(&self, dir: &DocPath) -> Result<Vec<Entry>>;   // 不递归，目录在前
+    fn read(&self, path: &DocPath) -> Result<Vec<u8>>;
+    fn write(&self, path: &DocPath, data: &[u8]) -> Result<()>;   // 覆盖并自动建父目录
+    fn rename(&self, from: &DocPath, to: &DocPath) -> Result<()>;
+    fn remove(&self, path: &DocPath) -> Result<()>;        // 目录递归删除
 }
 ```
 
-- 本地文件系统是**默认 Provider**。
+- 默认实现 `FileSystemProvider`（本地文件系统）；`DocPath` 定义在 `mazha-store`，
+  由 `mazha-core` 复用（依赖方向 `core → store`，避免循环）。
 - 云/自部署/用户自定义存储均以 Provider 形式接入，其中用户自定义走 **WASM 插件**（第 6.3 节）。
 - 付费用户连接官方云服务，本质是 `mazha-cloud` Provider；是否收费与 Provider 接口无关。
+- **MVP 采用同步接口**（决策 D24，第 14 节）：本地文件系统是唯一 Provider，同步 IO
+  足够且免去异步运行时依赖。异步/流式能力（以及 `watch` 文件监听）留待 Phase 5
+  接入云端 Provider 时评估。
 
 ### 6.3 插件 ABI（WASM）
 
@@ -562,6 +567,7 @@ interface Workspace {
 | D21 | PDF 导出引擎 | Typst | 确认 |
 | D22 | 仓库可见性 | GitHub 私有，发布后转公开（AGPL-3.0） | 确认 |
 | D23 | Markdown 解析实现 | 自研行扫描（块级）+ 自研行内扫描，精确字节偏移；`pulldown-cmark` 降为 dev 依赖（测试对照/后续 HTML 导出参考） | 确认（见 `docs/ADR/ADR-001`） |
+| D24 | 存储接口同步/异步 | MVP 采用**同步** `StorageProvider`（本地文件系统为唯一 Provider）；异步/流式与文件监听推迟到 Phase 5 | 确认 |
 
 ---
 
@@ -576,6 +582,7 @@ interface Workspace {
 | 0.1.4 | 2026-10-12 | `mazha-md` 行内解析：强调/粗体/删除线（递归嵌套 + 颜色继承）、行内代码（等长反引号 + 空格修剪）、链接（URL 隐藏）、图片（Widget 占位）、转义、自动链接；接入段落/标题叶子块；硬换行标记；13 条单测（累计 29） |
 | 0.1.5 | 2026-10-12 | 落地 `Projection`（`mazha-core` 依赖 `mazha-md`）：按逻辑行投影出 `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`，`Document::projection()` 全量重建；13 条单测（累计 47）。确认决策 D23 并新增 `docs/ADR/ADR-001`（自研解析 vs pulldown-cmark 对比）；CI/AGENTS 的 clippy 升级为 `--all-targets` |
 | 0.1.6 | 2026-10-12 | 编辑命令：新增 `Edit::ToggleInline`/`ToggleBlock` + `InlineMark`/`BlockTarget`；`commands` 模块（行内包裹/解包裹、块前缀逐行增删/剥离）；`Document::apply` 解析切换命令并纳入 undo/redo；`IntentMapper` 最小实现（回车列表续行/递增序号/空项退出、切换转发）；22 条单测（累计 69）；SPEC §6.1 契约同步 |
+| 0.1.7 | 2026-10-12 | 落地 `mazha-store`：`StorageProvider`（同步，决策 D24）/`FileSystemProvider`/`DocPath`（校验+根路径）/`Entry`/`StorageCaps`/`StoreError`；12 条单测（累计 81）；SPEC §6.2 契约改为同步接口并记 D24 |
 
 ---
 
