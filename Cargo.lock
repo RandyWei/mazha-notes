@@ -80,6 +80,9 @@ version = "0.1.0"
 [[package]]
 name = "mazha-export"
 version = "0.1.0"
+dependencies = [
+ "mazha-md",
+]
 
 [[package]]
 name = "mazha-ffi"

@@ -1,0 +1,320 @@
+//! Markdown 源文本 → HTML（SPEC §8、§9）。
+//!
+//! 渲染直接基于 `mazha-md` 的 [`Block`]/[`SyntaxSpan`] 模型：块级结构决定标签嵌套，
+//! 行内 [`SpanRole`] 决定 `<em>/<strong>/<del>/<code>/<a>` 等。语法标记（Marker）在
+//! HTML 里**不输出**，等价于 WYSIWYG 的"隐藏标记"；链接目标（[`SpanRole::LinkDest`]）
+//! 虽在编辑器里隐藏，但导出时用于 `<a href>`。
+//!
+//! MVP 取舍：列表一律紧凑渲染（列表项内的段落不加 `<p>`）；引用/列表可嵌套；
+//! 代码块用 `<pre><code class="language-x">`；图片解析 `![alt](dest)` 输出 `<img>`。
+
+use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
+use std::fmt::Write as _;
+
+/// 把 Markdown 源文本渲染为 HTML 片段（不含 `<html>` 外壳）。
+pub fn to_html(source: &str) -> String {
+    let blocks = parse(source);
+    let mut out = String::new();
+    render_blocks(source, &blocks, &mut out, false);
+    out
+}
+
+/// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项）。
+fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool) {
+    for b in blocks {
+        render_block(source, b, out, tight);
+    }
+}
+
+/// 渲染单个块。
+fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
+    match &block.kind {
+        BlockKind::Paragraph => {
+            if tight {
+                render_inline(source, &block.spans, out);
+            } else {
+                out.push_str("<p>");
+                render_inline(source, &block.spans, out);
+                out.push_str("</p>");
+            }
+        }
+        BlockKind::Heading { level } => {
+            let _ = write!(out, "<h{level}>");
+            render_inline(source, &block.spans, out);
+            let _ = write!(out, "</h{level}>");
+        }
+        BlockKind::ThematicBreak => out.push_str("<hr>"),
+        BlockKind::CodeBlock { lang, .. } => {
+            out.push_str("<pre><code");
+            if let Some(lang) = lang {
+                let _ = write!(out, " class=\"language-{}\"", escape_attr(lang));
+            }
+            out.push('>');
+            // 汇总所有 CodeContent 片段（围栏标记不输出）
+            for sp in &block.spans {
+                if sp.role == SpanRole::CodeContent {
+                    out.push_str(&escape_text(&source[sp.range.clone()]));
+                }
+            }
+            out.push_str("</code></pre>");
+        }
+        BlockKind::BlockQuote => {
+            out.push_str("<blockquote>");
+            render_blocks(source, &block.children, out, false);
+            out.push_str("</blockquote>");
+        }
+        BlockKind::List { ordered, start } => {
+            if *ordered {
+                if *start == 1 {
+                    out.push_str("<ol>");
+                } else {
+                    let _ = write!(out, "<ol start=\"{start}\">");
+                }
+            } else {
+                out.push_str("<ul>");
+            }
+            for item in &block.children {
+                render_list_item(source, item, out);
+            }
+            out.push_str(if *ordered { "</ol>" } else { "</ul>" });
+        }
+        // 顶层不应出现列表项；兜底按项渲染
+        BlockKind::ListItem { task } => render_item_body(source, block, *task, out),
+    }
+}
+
+/// 渲染列表项：`<li>` + 可选复选框 + 子块（紧凑）。
+fn render_list_item(source: &str, item: &Block, out: &mut String) {
+    let task = match item.kind {
+        BlockKind::ListItem { task } => task,
+        _ => None,
+    };
+    render_item_body(source, item, task, out);
+}
+
+/// 列表项主体渲染。
+fn render_item_body(source: &str, item: &Block, task: Option<bool>, out: &mut String) {
+    out.push_str("<li>");
+    if let Some(done) = task {
+        if done {
+            out.push_str("<input type=\"checkbox\" disabled checked> ");
+        } else {
+            out.push_str("<input type=\"checkbox\" disabled> ");
+        }
+    }
+    render_blocks(source, &item.children, out, true);
+    out.push_str("</li>");
+}
+
+/// 渲染行内片段序列。
+fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String) {
+    let mut state = InlineState::default();
+    let mut i = 0usize;
+    while i < spans.len() {
+        let sp = &spans[i];
+        // 可见文本一律直接转义输出（样式由成对 Marker 开合）
+        if sp.kind == SpanKind::Text {
+            out.push_str(&escape_text(&source[sp.range.clone()]));
+            i += 1;
+            continue;
+        }
+        // Widget（图片占位）
+        if sp.kind == SpanKind::Widget {
+            if sp.role == SpanRole::ImageMarker
+                && let Some((alt, dest)) = parse_image(&source[sp.range.clone()])
+            {
+                let _ = write!(
+                    out,
+                    "<img src=\"{}\" alt=\"{}\">",
+                    escape_attr(&dest),
+                    escape_attr(&alt)
+                );
+            }
+            i += 1;
+            continue;
+        }
+        // 语法标记：按角色决定开合标签 / 链接 / 隐藏
+        match sp.role {
+            SpanRole::Emphasis => state.toggle(out, "em"),
+            SpanRole::Strong => state.toggle(out, "strong"),
+            SpanRole::Strikethrough => state.toggle(out, "del"),
+            SpanRole::InlineCode => state.toggle(out, "code"),
+            SpanRole::LinkMarker => match source.as_bytes().get(sp.range.start) {
+                Some(b'[') => {
+                    // 普通链接：向前找到隐藏的目标 URL
+                    let href = spans[i..]
+                        .iter()
+                        .find(|s| s.role == SpanRole::LinkDest)
+                        .map(|s| source[s.range.clone()].to_string())
+                        .unwrap_or_default();
+                    let _ = write!(out, "<a href=\"{}\">", escape_attr(&href));
+                }
+                Some(b')') => out.push_str("</a>"),
+                Some(b'<') => {
+                    // 自动链接：`<` 文本 `>`，目标即文本本身
+                    let text = spans
+                        .get(i + 1)
+                        .map(|s| source[s.range.clone()].to_string())
+                        .unwrap_or_default();
+                    let _ = write!(
+                        out,
+                        "<a href=\"{}\">{}</a>",
+                        escape_attr(&text),
+                        escape_text(&text)
+                    );
+                    i += 3; // 跳过 `<`、文本、`>`
+                    continue;
+                }
+                // `](` 中间标记、`>` 收尾：忽略
+                _ => {}
+            },
+            SpanRole::SoftBreak => out.push('\n'),
+            SpanRole::HardBreak => out.push_str("<br>"),
+            // 其余标记（标题/引用/列表/围栏/转义/链接目标等）导出时隐藏
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// 行内样式开关状态（成对标记的第一个为开、第二个为闭）。
+#[allow(clippy::struct_excessive_bools)] // 四个独立样式开关，语义清晰
+#[derive(Default)]
+struct InlineState {
+    em: bool,
+    strong: bool,
+    strike: bool,
+    code: bool,
+}
+
+impl InlineState {
+    /// 按标记出现顺序在"开/闭"间切换，写入对应标签。
+    fn toggle(&mut self, out: &mut String, name: &str) {
+        let flag = match name {
+            "em" => &mut self.em,
+            "strong" => &mut self.strong,
+            "del" => &mut self.strike,
+            _ => &mut self.code,
+        };
+        if *flag {
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+        } else {
+            out.push('<');
+            out.push_str(name);
+            out.push('>');
+        }
+        *flag = !*flag;
+    }
+}
+
+/// 解析图片源码 `![alt](dest)`（MVP：不处理 alt 内的 `]`）。
+fn parse_image(src: &str) -> Option<(String, String)> {
+    let s = src.strip_prefix("![")?;
+    let close = s.find("](")?;
+    let alt = &s[..close];
+    let dest = s[close + 2..].strip_suffix(')')?;
+    Some((alt.to_string(), dest.to_string()))
+}
+
+/// 转义文本节点中的 `& < >`。
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 转义属性值（在文本转义基础上再加 `"`）。
+fn escape_attr(s: &str) -> String {
+    escape_text(s).replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paragraph_and_heading() {
+        assert_eq!(to_html("hello\n"), "<p>hello</p>");
+        assert_eq!(to_html("# 标题\n"), "<h1>标题</h1>");
+        assert_eq!(to_html("### 三级\n"), "<h3>三级</h3>");
+    }
+
+    #[test]
+    fn emphasis_strong_strike_code() {
+        assert_eq!(to_html("**粗**体\n"), "<p><strong>粗</strong>体</p>");
+        assert_eq!(to_html("*斜*\n"), "<p><em>斜</em></p>");
+        assert_eq!(to_html("~~删~~\n"), "<p><del>删</del></p>");
+        assert_eq!(to_html("`x*y`\n"), "<p><code>x*y</code></p>");
+    }
+
+    #[test]
+    fn nested_strong_emphasis() {
+        assert_eq!(
+            to_html("**a *b* c**\n"),
+            "<p><strong>a <em>b</em> c</strong></p>"
+        );
+    }
+
+    #[test]
+    fn link_hides_markers_keeps_href() {
+        assert_eq!(
+            to_html("[文字](https://x.com)\n"),
+            "<p><a href=\"https://x.com\">文字</a></p>"
+        );
+    }
+
+    #[test]
+    fn autolink() {
+        assert_eq!(
+            to_html("<https://x.com>\n"),
+            "<p><a href=\"https://x.com\">https://x.com</a></p>"
+        );
+    }
+
+    #[test]
+    fn image_widget() {
+        assert_eq!(
+            to_html("![图](a.png)\n"),
+            "<p><img src=\"a.png\" alt=\"图\"></p>"
+        );
+    }
+
+    #[test]
+    fn thematic_break_and_code_block() {
+        assert_eq!(to_html("---\n"), "<hr>");
+        assert_eq!(
+            to_html("```rust\nfn f() {}\n```\n"),
+            "<pre><code class=\"language-rust\">fn f() {}</code></pre>"
+        );
+    }
+
+    #[test]
+    fn blockquote_and_list() {
+        assert_eq!(to_html("> 引用\n"), "<blockquote><p>引用</p></blockquote>");
+        assert_eq!(to_html("- a\n- b\n"), "<ul><li>a</li><li>b</li></ul>");
+        assert_eq!(to_html("1. a\n2. b\n"), "<ol><li>a</li><li>b</li></ol>");
+    }
+
+    #[test]
+    fn task_list() {
+        assert_eq!(
+            to_html("- [x] done\n- [ ] todo\n"),
+            "<ul><li><input type=\"checkbox\" disabled checked> done</li>\
+             <li><input type=\"checkbox\" disabled> todo</li></ul>"
+        );
+    }
+
+    #[test]
+    fn escapes_html() {
+        assert_eq!(to_html("a < b & c\n"), "<p>a &lt; b &amp; c</p>");
+    }
+}

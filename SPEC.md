@@ -435,7 +435,7 @@ interface Workspace {
 | 公式 | `ratex-parser/layout/render/svg` + `ratex-gpui` | KaTeX 移植 |
 | 图表 | `mermaid-rs-renderer` | 纯 Rust → SVG/PNG |
 | PDF 导出 | Typst | 纯 Rust；排版质量优先（已确认） |
-| HTML 导出 | pulldown-cmark 渲染 + 模板 | 纯 Rust |
+| HTML 导出 | 基于 `mazha-md` 块/片段模型自研渲染（[`mazha-export::to_html`]） | 纯 Rust；与编辑器同源（D23 后 `pulldown-cmark` 仅 dev 对照） |
 | DOCX/EPUB | `[待确认]` `docx-rs` / Zip+XHTML | 后续 Phase |
 | 字体/中文字形 | `[待确认]` 系统字体 + 内置 CJK 子集 | Web/wasm 需内置 |
 
@@ -585,6 +585,7 @@ interface Workspace {
 | 0.1.6 | 2026-10-12 | 编辑命令：新增 `Edit::ToggleInline`/`ToggleBlock` + `InlineMark`/`BlockTarget`；`commands` 模块（行内包裹/解包裹、块前缀逐行增删/剥离）；`Document::apply` 解析切换命令并纳入 undo/redo；`IntentMapper` 最小实现（回车列表续行/递增序号/空项退出、切换转发）；22 条单测（累计 69）；SPEC §6.1 契约同步 |
 | 0.1.7 | 2026-10-12 | 落地 `mazha-store`：`StorageProvider`（同步，决策 D24）/`FileSystemProvider`/`DocPath`（校验+根路径）/`Entry`/`StorageCaps`/`StoreError`；12 条单测（累计 81）；SPEC §6.2 契约改为同步接口并记 D24 |
 | 0.1.8 | 2026-10-12 | `mazha-core` 依赖 `mazha-store`：落地 `Workspace<S: StorageProvider>`（`open`/`save`/`list`，UTF-8 校验、存储错误透传）；重导出 `DocPath`/`StorageProvider`；3 条单测（累计 84） |
+| 0.1.9 | 2026-10-12 | 落地 `mazha-export::to_html`：基于 `mazha-md` 块/片段模型渲染 HTML（标题/段落/引用/列表/任务表/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义）；11 条单测（累计 124）；SPEC §8 HTML 导出选型改为自研同源渲染 |
 
 ---
 

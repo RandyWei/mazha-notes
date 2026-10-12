@@ -24,7 +24,7 @@ cargo test --workspace
 | `mazha-md` | ✅ 块级 + 行内 | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`（强调/粗体/删除线/代码/链接/图片/转义/自动链接）、`Block`/`SyntaxSpan`/`visible_runs` | 增量解析（脏块重解析）、`serialize`、表格/callout/wiki-link 等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ⬜ 占位 | — | yrs `Y.Text` 封装、同步协议、持久化 |
-| `mazha-export` | ⬜ 占位 | — | HTML / PDF（Typst）导出 |
+| `mazha-export` | 🟡 HTML 完成 | `to_html`：基于 md 块/片段模型渲染（标题/段落/引用/列表/任务/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义） | PDF（Typst）、DOCX/EPUB、模板/主题 |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -34,7 +34,8 @@ cargo test --workspace
 - `mazha-core`：72
 - `mazha-md`：29
 - `mazha-store`：12
-- 合计 **113** 条（其余为占位 crate 的版本号冒烟测试）
+- `mazha-export`：11
+- 合计 **124** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -50,15 +51,16 @@ cargo test --workspace
 
 ## 下一步（建议顺序）
 
-1. `mazha-store` 文件监听（`watch`）或 `mazha-core` 增量投影 / `mazha-md` 增量解析
-2. `mazha-md::serialize`（AST→Markdown）与往返一致性测试
-3. `mazha-export`：源文本 → HTML（+ 后续 PDF via Typst）
+1. `mazha-export`：Markdown → HTML 完整文档外壳 / CSS 主题；PDF（Typst）
+2. `mazha-store` 文件监听（`watch`）或 `mazha-core` 增量投影 / `mazha-md` 增量解析
+3. `mazha-md::serialize`（AST→Markdown）与往返一致性测试
 4. `mazha-crdt`：yrs `Y.Text` 封装与同步协议
 5. Phase 2：桌面 GPUI 只读投影渲染 → WYSIWYG 显隐标记 → IME
 
 ## 提交历史（近期）
 
 ```
+322bd33 docs: 新增 HANDOFF.md 进度总览，并约定每次提交同步更新
 145a781 feat(core): Workspace 串联存储与文档（open/save/list）
 f68f2b3 feat(store): 本地文件系统 StorageProvider（同步接口，D24）
 334351e feat(core): 编辑命令 ToggleInline/ToggleBlock + IntentMapper
