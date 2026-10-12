@@ -592,6 +592,7 @@ interface Workspace {
 | 0.1.13 | 2026-10-12 | `mazha-core` 依赖 `mazha-crdt`：新增 `crdt` 桥接模块（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`，Edit 字节偏移 ↔ CrdtDoc 字符索引安全转换，CJK 安全）；`Document::apply_and_sync`（编辑+同步原子操作）；1 条集成单测（core 77，总计 149） |
 | 0.1.14 | 2026-10-12 | `Document::apply_and_sync` 集成测试补充（CRDT 往返 + 投影行数一致）；修 clippy（未用导入、`# Panics` 文档）；core 78，总计 150 |
 | 0.1.15 | 2026-10-12 | 协同闭环：`CrdtDoc::fork`（同状态多端副本）、`mazha_core::apply_remote`（远端更新帧 → `CrdtDoc` 并入 → `Document` 整体重建，返回是否变化）；双端收敛/非法帧不改文档测试；core 80 + crdt 8（总计 154） |
+| 0.1.16 | 2026-10-12 | CRDT 持久化：`mazha_core::{save_crdt,load_crdt}`（更新帧经 `StorageProvider` 落盘/读回，`CrdtSyncError` 统一 Store/CRDT 错误）；3 条测试（存取往返+继续编辑收敛、缺文件、损坏帧）；core 83（总计 157） |
 
 ---
 

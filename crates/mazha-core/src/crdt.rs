@@ -13,12 +13,55 @@
 //! - 远端更新：远端更新应用到 `CrdtDoc` 后，用 [`crdt_to_document`] 把源文本
 //!   重新载入 `Document`（MVP 采用"整体重建"策略，不做字符级合并）。
 
-use crate::{Document, Edit};
+use crate::{Document, Edit, Workspace};
 use mazha_crdt::CrdtDoc;
+use mazha_store::{DocPath, StorageProvider, StoreError};
+
+/// CRDT 持久化/加载错误。
+#[derive(Debug, thiserror::Error)]
+pub enum CrdtSyncError {
+    /// 存储层错误（文件不存在/读写失败等）。
+    #[error(transparent)]
+    Store(#[from] StoreError),
+
+    /// CRDT 更新帧解码失败（文件损坏或格式不符）。
+    #[error(transparent)]
+    Crdt(#[from] mazha_crdt::CrdtError),
+}
+
+/// 本模块的 `Result` 别名。
+pub type CrdtSyncResult<T> = std::result::Result<T, CrdtSyncError>;
 
 /// 从 `Document` 的当前源文本创建一份 `CrdtDoc`（用于初次上云/持久化）。
 pub fn document_to_crdt(doc: &Document) -> CrdtDoc {
     CrdtDoc::from_text(&doc.text())
+}
+
+/// 把 `CrdtDoc` 的完整更新帧写入工作区文件（覆盖写；自动创建父目录）。
+///
+/// 这是离线协同的最小可行方案：本地持续写更新帧，下次打开时加载并继续。
+///
+/// # Errors
+/// 存储层写失败时返回 [`CrdtSyncError::Store`]。
+pub fn save_crdt<S: StorageProvider>(
+    ws: &Workspace<S>,
+    path: &DocPath,
+    crdt: &CrdtDoc,
+) -> CrdtSyncResult<()> {
+    ws.store().write(path, &crdt.encode_update())?;
+    Ok(())
+}
+
+/// 从工作区文件加载 `CrdtDoc`（无更新帧内容时返回空文档）。
+///
+/// # Errors
+/// - 文件不存在/读取失败 → [`CrdtSyncError::Store`]；
+/// - 内容是损坏/非 Yjs v1 更新帧 → [`CrdtSyncError::Crdt`]。
+pub fn load_crdt<S: StorageProvider>(ws: &Workspace<S>, path: &DocPath) -> CrdtSyncResult<CrdtDoc> {
+    let bytes = ws.store().read(path)?;
+    let mut crdt = CrdtDoc::new();
+    crdt.apply_update(&bytes)?;
+    Ok(crdt)
 }
 
 /// 从 `CrdtDoc` 的当前源文本重建 `Document`（远端更新后调用）。
@@ -206,5 +249,62 @@ mod tests {
         // 构造一个非法的更新帧（0xFF 不是合法的 v1 编码）
         assert!(apply_remote(&mut doc, &mut crdt, &[0xFF, 0xFF]).is_err());
         assert_eq!(doc.text(), "x", "失败不应修改文档");
+    }
+
+    #[test]
+    fn save_and_load_crdt_roundtrip() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let ws = crate::Workspace::new(mazha_store::FileSystemProvider::open(dir.path()).unwrap());
+        let path = DocPath::new(".mazha/note.yrs").unwrap();
+
+        // {} 保存
+        let mut doc = Document::new("# 标题");
+        let mut crdt = document_to_crdt(&doc);
+        doc.apply_and_sync(
+            Edit::Insert {
+                at: 0,
+                text: "> ".to_string(),
+            },
+            &mut crdt,
+        )
+        .unwrap();
+        save_crdt(&ws, &path, &crdt).unwrap();
+
+        // 模拟重开应用：加载后继续编辑，状态应延续
+        let mut loaded = load_crdt(&ws, &path).unwrap();
+        assert_eq!(loaded.text(), crdt.text());
+        assert_eq!(crdt_to_document(&loaded).text(), "> # 标题");
+
+        // 加载后的文档继续演进并与原副本收敛
+        loaded.insert(6, " 新增").unwrap();
+        let diff = loaded.encode_diff(&crdt.state_vector()).unwrap();
+        crdt.apply_update(&diff).unwrap();
+        assert_eq!(crdt.text(), loaded.text());
+    }
+
+    #[test]
+    fn load_crdt_missing_file_errors() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let ws = crate::Workspace::new(mazha_store::FileSystemProvider::open(dir.path()).unwrap());
+        let path = DocPath::new(".mazha/none.yrs").unwrap();
+        assert!(matches!(
+            load_crdt(&ws, &path),
+            Err(CrdtSyncError::Store(StoreError::NotFound(_)))
+        ));
+    }
+
+    #[test]
+    fn load_crdt_corrupt_file_errors() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let ws = crate::Workspace::new(mazha_store::FileSystemProvider::open(dir.path()).unwrap());
+        let path = DocPath::new(".mazha/bad.yrs").unwrap();
+        ws.store().write(&path, &[0xFF, 0xFF, 0x00]).unwrap();
+        assert!(matches!(load_crdt(&ws, &path), Err(CrdtSyncError::Crdt(_))));
     }
 }
