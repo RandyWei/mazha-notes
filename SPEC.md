@@ -589,6 +589,7 @@ interface Workspace {
 | 0.1.10 | 2026-10-12 | `mazha-crdt` 基于 `yrs` 封装：`CrdtDoc`（`Y.Text` 根 `content`）、字符索引（UTF-8 字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛测试；6 条单测（累计 130） |
 | 0.1.11 | 2026-10-12 | `mazha-md` 新增 `serialize_source`/`to_md`（极简 AST→Markdown MVP）；补充 6 条回归测试（段落/标题/列表/代码块/引用/任务/行内/链接），修复链接序列化丢失 URL 的问题（`[text](url)` 整体重建）；累计 37 条（总计 141） |
 | 0.1.12 | 2026-10-12 | `mazha-export` 新增 `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）；3 条新单测（累计 14，总计 144） |
+| 0.1.13 | 2026-10-12 | `mazha-core` 依赖 `mazha-crdt`：新增 `crdt` 桥接模块（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`，Edit 字节偏移 ↔ CrdtDoc 字符索引安全转换，CJK 安全）；5 条新单测（core 77，总计 149） |
 
 ---
 

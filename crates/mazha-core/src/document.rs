@@ -172,7 +172,7 @@ impl Document {
     }
 
     /// 把高层编辑命令解析为具体的基础编辑（Insert/Delete/Replace）。
-    fn resolve(&self, edit: Edit) -> Edit {
+    pub(crate) fn resolve(&self, edit: Edit) -> Edit {
         match edit {
             Edit::ToggleInline { range, mark } => {
                 crate::commands::toggle_inline(&self.text(), range, mark)

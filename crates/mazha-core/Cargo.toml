@@ -12,6 +12,7 @@ ropey = "1"
 thiserror = "2"
 mazha-md = { path = "../mazha-md" }
 mazha-store = { path = "../mazha-store" }
+mazha-crdt = { path = "../mazha-crdt" }
 
 [dev-dependencies]
 tempfile = "3"
