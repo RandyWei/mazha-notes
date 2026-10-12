@@ -24,6 +24,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## 提交约定
+
+- **每次提交代码时，同步更新 `HANDOFF.md`**（进度总览 / crate 状态 / 测试计数 / 近期提交 / 下一步），与该次提交一并纳入同一个 commit。
+- 提交信息用中文，概括本次变更要点。
+
 ## 目录速查（SPEC §4.4）
 
 - `crates/`：共享 Rust 核心（core / md / crdt / store / export / plugin / ffi / wasm）
