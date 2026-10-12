@@ -32,10 +32,10 @@ cargo test --workspace
 ## 测试现状
 
 - `mazha-core`：72
-- `mazha-md`：32
+- `mazha-md`：35
 - `mazha-export`：11
 - `mazha-crdt`：6
-- 合计 **136** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **139** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
