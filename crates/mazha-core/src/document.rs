@@ -41,6 +41,9 @@ pub struct Document {
     redo_stack: Vec<Change>,
     /// 撤销栈最大深度。
     max_history: usize,
+    /// 块森林缓存（与 `text` 保持一致：每次编辑后增量重解析）。
+    /// 供 [`Document::projection`] 与 [`Document::blocks`] 复用，避免重复全量解析。
+    blocks: Vec<mazha_md::Block>,
 }
 
 impl Document {
@@ -51,6 +54,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             max_history: DEFAULT_MAX_HISTORY,
+            blocks: mazha_md::parse(text),
         }
     }
 
@@ -70,12 +74,15 @@ impl Document {
         self.text.to_string()
     }
 
+    /// 当前块森林（缓存，与源文本同步；每次编辑后增量重解析）。
+    pub fn blocks(&self) -> &[mazha_md::Block] {
+        &self.blocks
+    }
+
     /// 生成整篇渲染投影（隐藏语法标记，供 UI 直接渲染）。
-    ///
-    /// 当前实现为**全量重建**（解析 + 逐行投影）；后续迭代将按
-    /// [`ChangeSummary`] 的受影响范围只重建脏行。
     pub fn projection(&self) -> crate::Projection {
-        crate::projection::build(&self.text())
+        let text = self.text.to_string();
+        crate::projection::build_from(&text, &self.blocks)
     }
 
     /// 返回字节范围 `range` 内的文本（`Cow`：连续 chunk 时零拷贝借用，否则拷贝）。
@@ -158,7 +165,7 @@ impl Document {
         self.validate_edit(&edit)?;
         // 在修改前生成逆编辑：此时才能取到被覆盖的原文。
         let inverse = self.inverse_of(&edit);
-        let summary = self.apply_raw(&edit);
+        let summary = self.apply_and_refresh(&edit);
         // 任何新编辑都会使重做栈失效。
         self.redo_stack.clear();
         self.undo_stack.push(Change {
@@ -211,15 +218,15 @@ impl Document {
     /// 撤销最近一次编辑。无历史时返回 `None`。
     pub fn undo(&mut self) -> Option<ChangeSummary> {
         let change = self.undo_stack.pop()?;
-        let summary = self.apply_raw(&change.inverse);
+        let summary = self.apply_and_refresh(&change.inverse);
         self.redo_stack.push(change);
         Some(summary)
     }
 
-    /// 重做最近一次撤销。无可重做项时返回 `None`。
+    /// 重做最近一次撤销。无可重做项返回 `None`。
     pub fn redo(&mut self) -> Option<ChangeSummary> {
         let change = self.redo_stack.pop()?;
-        let summary = self.apply_raw(&change.original);
+        let summary = self.apply_and_refresh(&change.original);
         self.undo_stack.push(change);
         Some(summary)
     }
@@ -316,6 +323,22 @@ impl Document {
     }
 
     /// 直接对文本应用编辑（不触碰任何历史栈），返回变更摘要。
+    /// 应用编辑并增量刷新块缓存（apply/undo/redo 的统一入口）。
+    ///
+    /// 与 [`Document::apply_raw`] 的区别：apply 后按本次编辑的源范围做
+    /// **增量重解析**（[`mazha_md::reparse`]），使 `self.blocks` 与 `self.text` 保持同步。
+    fn apply_and_refresh(&mut self, edit: &Edit) -> ChangeSummary {
+        let old_len = self.text.len_bytes();
+        let affected = edit.source_range();
+        let summary = self.apply_raw(edit);
+        // 增量重解析：把旧块森林迁移到新文本上。
+        // 取走缓存避免与 self.text 的借用冲突。
+        let blocks = std::mem::take(&mut self.blocks);
+        let text = self.text.to_string();
+        self.blocks = mazha_md::reparse(&text, old_len, &blocks, affected);
+        summary
+    }
+
     fn apply_raw(&mut self, edit: &Edit) -> ChangeSummary {
         let affected = match edit {
             Edit::Insert { at, text } => {
@@ -687,6 +710,81 @@ mod tests {
         let d2 = crdt_to_document(&crdt);
         assert_eq!(d2.text(), d.text());
         assert_eq!(d2.projection().lines.len(), d.projection().lines.len());
+    }
+
+    /// 断言块缓存与全量解析一致（校验增量重解析的正确性）。
+    fn assert_blocks_match(d: &Document, step: &str) {
+        let full = mazha_md::parse(&d.text());
+        let shape = |blocks: &[mazha_md::Block]| -> Vec<String> {
+            blocks
+                .iter()
+                .map(|b| format!("{:?}@{}..{}", b.kind, b.range.start, b.range.end))
+                .collect()
+        };
+        let cached = shape(d.blocks());
+        let full = shape(&full);
+        assert_eq!(
+            cached,
+            full,
+            "[{step}] 块缓存应与全量解析一致\ntext={:?}\ncached={:?}\nfull={:?}",
+            d.text(),
+            cached,
+            full,
+        );
+    }
+
+    #[test]
+    fn blocks_stay_synced_after_edits() {
+        let mut d = doc("# 标题\n\n第一段\n\n第二段\n\n第三段\n");
+        assert_blocks_match(&d, "初始");
+
+        // 1) 段中插入（CJK；字节 10 是“第一段”起点，字符边界安全）
+        d.apply(Edit::Insert {
+            at: 10,
+            text: "新增".into(),
+        })
+        .unwrap();
+        assert_blocks_match(&d, "段中插入");
+
+        // 2) 前缀化：把段落变成标题
+        d.apply(Edit::Insert {
+            at: 0,
+            text: "# ".into(),
+        })
+        .unwrap();
+        assert_blocks_match(&d, "前缀化");
+
+        // 3) 删除（含块间空行 → 可能合并块）
+        d.apply(Edit::Delete { range: 0..2 }).unwrap();
+        assert_blocks_match(&d, "删除空行");
+
+        // 4) 末尾追加
+        d.apply(Edit::Insert {
+            at: d.len(),
+            text: "\n末尾追加\n".into(),
+        })
+        .unwrap();
+        assert_blocks_match(&d, "末尾追加");
+
+        // 5) 撤销/重做后缓存仍应一致
+        d.undo().unwrap();
+        assert_blocks_match(&d, "撤销");
+        d.redo().unwrap();
+        assert_blocks_match(&d, "重做");
+    }
+
+    #[test]
+    fn blocks_synced_for_code_block_edit() {
+        let mut d = doc("```rust\nfn a() {}\nfn b() {}\n```\n\n结尾段\n");
+        d.apply(Edit::Insert {
+            at: 22,
+            text: "fn c() {}\n".into(),
+        })
+        .unwrap();
+        assert_blocks_match(&d, "代码块插入");
+        // 投影应看到 3 个代码内容行
+        let proj = d.projection();
+        assert!(proj.lines.iter().any(|l| l.block.code_block));
     }
 
     #[test]

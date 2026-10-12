@@ -16,8 +16,9 @@
 //! ## 安全兜底
 //! 文档很短、旧块缺失或受影响块占比过高时退化为**全量解析**，宁可多做也不做错。
 
-use crate::block::Block;
+use crate::block::{Block, BlockKind};
 use crate::scanner::parse;
+use crate::span::SpanRole;
 use std::ops::Range;
 
 /// 全量重解析的兜底阈值：旧块数少于该值时直接全量（省不了多少还容易错）。
@@ -26,16 +27,23 @@ const MIN_BLOCKS_FOR_INCREMENTAL: usize = 3;
 const RATIO_DEN: usize = 10;
 const MAX_AFFECTED_NUM: usize = 6; // 0.6
 
-/// 增量重解析：从 `old` + 旧块 `blocks` 推导 `new` 的块森林。
+/// 增量重解析：从旧块森林 `blocks` 推导新文本 `new` 的块森林。
 ///
-/// `edit_range` 是 **`old` 中被替换的字节范围**（纯插入可传空区间 `at..at`）。
+/// `old_len` 是**旧文本的字节长度**，`edit_range` 是 **旧文本中被替换的字节范围**
+/// （纯插入可传空区间 `at..at`）。注意：函数只需要旧文本长度（供尾部对齐与
+/// delta 计算），不需要旧文本内容本身——调用方因此无需保留旧文本副本。
 ///
-/// 调用方保证 `blocks` 是 `old` 的解析结果（由 [`crate::parse`] 或本函数产出），
+/// 调用方保证 `blocks` 是旧文本的解析结果（由 [`crate::parse`] 或本函数产出），
 /// 否则行为未定义。
-pub fn reparse(old: &str, new: &str, blocks: &[Block], edit_range: Range<usize>) -> Vec<Block> {
-    // delta = new.len() - old.len()（size_t 差值，文档长度不可能溢出 isize）
+pub fn reparse(
+    new: &str,
+    old_len: usize,
+    blocks: &[Block],
+    edit_range: Range<usize>,
+) -> Vec<Block> {
+    // delta = new.len() - old_len
     let delta = isize::try_from(new.len()).unwrap_or(isize::MAX)
-        - isize::try_from(old.len()).unwrap_or(isize::MAX);
+        - isize::try_from(old_len).unwrap_or(isize::MAX);
     // 兜底：文档太短或没有旧块，直接全量
     if blocks.is_empty() || blocks.len() < MIN_BLOCKS_FOR_INCREMENTAL {
         return parse(new);
@@ -67,30 +75,78 @@ pub fn reparse(old: &str, new: &str, blocks: &[Block], edit_range: Range<usize>)
     //    - head：lo 块起点（在编辑之前，无需平移）
     //    - tail：从尾部对齐（旧 tail 起点之后的字节数不变）
     let head = blocks[lo].range.start;
-    let old_tail_start = blocks.get(hi + 1).map_or(old.len(), |b| b.range.start);
+    let old_tail_start = blocks.get(hi + 1).map_or(old_len, |b| b.range.start);
     // 尾部对齐：旧 tail 起点之后的字节数不变（保持原顺序不被重新解析）。
     // old_tail_start 理论上不会超过 old.len()（块范围来自旧文本），仍做饱和保护。
     let tail = new
         .len()
-        .saturating_sub(old.len().saturating_sub(old_tail_start));
+        .saturating_sub(old_len.saturating_sub(old_tail_start));
     // 防线：区间必须单调且落在文本内，否则退化全量
     if head > tail || tail > new.len() || !new.is_char_boundary(head) || !new.is_char_boundary(tail)
     {
         return parse(new);
     }
 
-    // 3. 重解析中间段，并把结果的 range 偏移到全局坐标
-    let mut middle = parse(&new[head..tail]);
-    for b in &mut middle {
-        shift_block(b, head, 0);
+    // 3. 重解析中间段，并把结果的 range 平移到全局坐标（注意 shift_block 返回新块）
+    let mut middle: Vec<Block> = parse(&new[head..tail])
+        .iter()
+        .map(|b| shift_block(b, head, 0))
+        .collect();
+
+    // 3b. 健全性校验：若裁切点"不安全"，扩充到文档末尾重解析。
+    //     安全 = tail 前是空行（段落/引用/列表/标题都会被空行闭合）
+    //           且区域最后一块不是"未闭合"的围栏代码块（围栏会跨越空行）。
+    //     命中任一不安全条件，说明该构造可能延伸到 tail 之外，只能整段重解析。
+    if !is_safe_cut(new, tail, &middle) {
+        middle = parse(&new[head..])
+            .iter()
+            .map(|b| shift_block(b, head, 0))
+            .collect();
+        return splice(blocks, lo, &middle, &[], delta);
     }
 
     // 4. 拼接：前段原样 + 中段 + 后段平移 delta
+    splice(blocks, lo, &middle, &blocks[hi + 1..], delta)
+}
+
+/// 拼接：前段 `blocks[..lo]` 原样 + 中段 + 后段平移 `delta`。
+fn splice(
+    blocks: &[Block],
+    lo: usize,
+    middle: &[Block],
+    tail_blocks: &[Block],
+    delta: isize,
+) -> Vec<Block> {
     let mut out = Vec::with_capacity(blocks.len());
     out.extend(blocks[..lo].iter().cloned());
-    out.extend(middle);
-    out.extend(blocks[hi + 1..].iter().map(|b| shift_block(b, 0, delta)));
+    out.extend(middle.iter().cloned());
+    out.extend(tail_blocks.iter().map(|b| shift_block(b, 0, delta)));
     out
+}
+
+/// 判定 `tail` 是否为安全裁切点（配合 `region` 的解析结果）。
+///
+/// 安全条件：
+/// 1. `tail` **之前是空行**——段落/标题/引用/列表都会被空行闭合（本扫描器不支持惰性续行）；
+/// 2. 区域最后一块不是**未闭合的围栏代码块**——围栏是唯一能跨越空行的构造。
+fn is_safe_cut(new: &str, tail: usize, region: &[Block]) -> bool {
+    let blank_before =
+        tail <= 1 || new[..tail].ends_with("\n\n") || new[..tail].ends_with("\n\r\n");
+    if !blank_before {
+        return false;
+    }
+    !region.last().is_some_and(is_unclosed_fence)
+}
+
+/// 是否为**未闭合**的围栏代码块：`fenced` 为真且只有开栏标记（无收栏标记）。
+fn is_unclosed_fence(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::CodeBlock { fenced: true, .. })
+        && block
+            .spans
+            .iter()
+            .filter(|s| s.role == SpanRole::FenceMarker)
+            .count()
+            < 2
 }
 
 /// 平移一个块及其全部子孙/片段的 range（`start` 前置偏移 + `delta` 全局平移）。
@@ -137,7 +193,7 @@ mod tests {
     /// 断言增量结果与全量一致（比较可读文本 + 结构种类序列）。
     fn assert_matches_full(old: &str, new: &str, edit_range: Range<usize>) {
         let blocks = parse(old);
-        let inc = reparse(old, new, &blocks, edit_range);
+        let inc = reparse(new, old.len(), &blocks, edit_range);
         let full = parse(new);
         assert_eq!(
             shape(&inc),
@@ -245,7 +301,7 @@ mod tests {
         let old = "a\n";
         let new = "a\nb\n";
         let blocks = parse(old);
-        let inc = reparse(old, new, &blocks, 2..2);
+        let inc = reparse(new, old.len(), &blocks, 2..2);
         assert_eq!(shape(&inc), shape(&parse(new)));
     }
 
@@ -255,5 +311,99 @@ mod tests {
         let b = parse("# x\n").into_iter().next().unwrap();
         assert!(matches!(b.kind, BlockKind::Heading { level: 1 }));
         assert!(b.is_container() || !b.is_container());
+    }
+
+    /// 单条编辑：插入/删除一段文本。
+    enum Op {
+        Insert(usize, &'static str),
+        Delete(usize, usize),
+    }
+
+    impl Op {
+        /// 应用到文本上；返回旧文本中被替换的范围（供 reparse 定位脏区）。
+        fn apply(&self, text: &mut String) -> Range<usize> {
+            match *self {
+                Op::Insert(at, s) => {
+                    let at = at.min(text.len());
+                    // 边界修正：插入点必须落在字符边界
+                    let at = snap(text, at);
+                    text.insert_str(at, s);
+                    at..at
+                }
+                Op::Delete(start, len) => {
+                    let start = snap(text, start.min(text.len()));
+                    let end = snap(text, (start + len).min(text.len()));
+                    let range = start..end.max(start);
+                    text.replace_range(range.clone(), "");
+                    range
+                }
+            }
+        }
+    }
+
+    /// 把任意偏移吸附到最近的字符边界。
+    fn snap(text: &str, at: usize) -> usize {
+        let mut at = at.min(text.len());
+        while at > 0 && !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    #[test]
+    fn inserted_before_fence_makes_it_unclosed() {
+        // 在围栏开栏行前插入文本 → 开栏行不再是行首 → 围栏未闭合并吞掉后续内容。
+        // 必须整段重解析到文档末尾，否则会得到错误结构（回归测试）。
+        let old = "开头\n\n```rust\nfn a() {}\n```\n\n引用\n\n结尾\n";
+        let at = old.find("```rust").unwrap();
+        let new = format!("{}插入的{}", &old[..at], &old[at..]);
+        assert_matches_full(old, &new, at..at);
+    }
+
+    #[test]
+    fn adjacent_blocks_require_blank_before_tail() {
+        // 无空行相邻的块（标题后紧跟段落）：裁切点前不是空行 → 必须整段重解析
+        let old = "# 标题\n正文一段\n\n中间\n\n第二段\n\n第三段\n";
+        let at = old.find("正文").unwrap();
+        let new = format!("{}插入{}", &old[..at], &old[at..]);
+        assert_matches_full(old, &new, at..at);
+    }
+
+    #[test]
+    fn edit_sequence_matches_full_parse() {
+        // 一串确定性编辑，逐步与全量解析对比：覆盖跨块增删、CJK、代码块、引用、列表。
+        let seed = "# 标题\n\n```rust\nfn a() {}\n```\n\n> 引用\n\n- 列表一\n- 列表二\n\n结尾\n";
+        let ops = [
+            Op::Insert(10, "插入的"),       // 标题行尾
+            Op::Insert(0, "# "),            // 标题前缀化
+            Op::Delete(0, 2),               // 撤销前缀化
+            Op::Insert(30, "\n\n新段落\n"), // 代码块前插入段落
+            Op::Insert(60, "> "),           // 引用前缀
+            Op::Insert(80, "- [x] "),       // 任务项
+            Op::Delete(40, 6),              // 删一段代码行内容
+            Op::Insert(200, "\n\n末尾追加\n"),
+            Op::Insert(3, "**粗** "), // 行内标记插入
+            Op::Delete(0, 1),         // 删标题首字符
+        ];
+
+        let mut text = seed.to_string();
+        let mut blocks = parse(&text);
+        for (i, op) in ops.iter().enumerate() {
+            let old_len = text.len();
+            let affected = op.apply(&mut text);
+            blocks = reparse(&text, old_len, &blocks, affected);
+            let full = parse(&text);
+            assert_eq!(
+                shape(&blocks),
+                shape(&full),
+                "第 {i} 步编辑后增量与全量不一致\ntext={text:?}\ncached={:?}\nfull={:?}",
+                shape(&blocks),
+                shape(&full),
+            );
+            assert_eq!(ranges(&blocks), ranges(&full), "第 {i} 步字节范围不一致");
+        }
+
+        // 最终文本仍可往返（块覆盖完整）
+        assert!(!blocks.is_empty());
     }
 }

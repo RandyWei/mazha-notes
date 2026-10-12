@@ -161,19 +161,27 @@ impl WidgetKind {
 
 /// 由源文本构造整篇投影。
 pub fn build(source: &str) -> Projection {
-    let lines = split_lines(source);
     let blocks = mazha_md::parse(source);
+    build_from(source, &blocks)
+}
+
+/// 用**已有块森林**构建投影（供 `Document` 复用缓存，避免重复全量解析）。
+///
+/// `blocks` 必须是 `source` 的解析结果（[`mazha_md::parse`] 或
+/// [`mazha_md::reparse`] 产出），否则投影与文本会不一致。
+pub fn build_from(source: &str, blocks: &[Block]) -> Projection {
+    let lines = split_lines(source);
 
     // 每行的块样式：默认段落，再由块森林按继承上下文覆盖（最深叶子优先）。
     let mut styles: Vec<BlockStyle> = vec![BlockStyle::default(); lines.len()];
     let ctx = StyleCtx::default();
-    for b in &blocks {
+    for b in blocks {
         assign_style(b, &ctx, &lines, &mut styles);
     }
 
     // 收集整棵树的片段（容器标记 + 叶子内容），按行归并。
     let mut spans: Vec<SyntaxSpan> = Vec::new();
-    for b in &blocks {
+    for b in blocks {
         collect_spans(b, &mut spans);
     }
 
