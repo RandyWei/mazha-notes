@@ -593,6 +593,7 @@ interface Workspace {
 | 0.1.14 | 2026-10-12 | `Document::apply_and_sync` 集成测试补充（CRDT 往返 + 投影行数一致）；修 clippy（未用导入、`# Panics` 文档）；core 78，总计 150 |
 | 0.1.15 | 2026-10-12 | 协同闭环：`CrdtDoc::fork`（同状态多端副本）、`mazha_core::apply_remote`（远端更新帧 → `CrdtDoc` 并入 → `Document` 整体重建，返回是否变化）；双端收敛/非法帧不改文档测试；core 80 + crdt 8（总计 154） |
 | 0.1.16 | 2026-10-12 | CRDT 持久化：`mazha_core::{save_crdt,load_crdt}`（更新帧经 `StorageProvider` 落盘/读回，`CrdtSyncError` 统一 Store/CRDT 错误）；3 条测试（存取往返+继续编辑收敛、缺文件、损坏帧）；core 83（总计 157） |
+| 0.1.17 | 2026-10-12 | `mazha-md::reparse` 增量重解析：按旧块森林定位受影响块区间（前后各放宽一块）→ 局部重解析 + 未受影响块 range 平移 `delta`；短文档/高命中比例/区间非法时退化为全量；8 条"增量==全量"对照测试（CJK、删空行合并、代码块内插入、标题前缀、末尾追加等）；md 45（总计 165） |
 
 ---
 
