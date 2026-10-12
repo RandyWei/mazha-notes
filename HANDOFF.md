@@ -20,7 +20,7 @@ cargo test --workspace
 
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
-| `mazha-core` | ✅ Phase 1 主体 + CRDT 桥接 | `Document`（rope/编辑/undo-redo/边界导航）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射）、`commands`（toggle_inline/set_block）、`IntentMapper`（回车续列表等）、`Workspace`（open/save/list）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`，字节↔字符安全转换） | 增量投影/增量解析、更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
+| `mazha-core` | ✅ Phase 1 主体 + CRDT 桥接 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射）、`commands`（toggle_inline/set_block）、`IntentMapper`（回车续列表等）、`Workspace`（open/save/list）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`，字节↔字符安全转换） | 增量投影/增量解析、更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
 | `mazha-md` | ✅ 块级 + 行内 + 序列化（MVP） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`、`serialize_source/to_md`（极简 AST→Markdown） | 增量解析（脏块重解析）、完善 serialize 覆盖、往返一致性测试、表格/callout/wiki-link 等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | 🟡 MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛 | 多文档/快照/持久化、字符索引统一封装 |
@@ -31,11 +31,11 @@ cargo test --workspace
 
 ## 测试现状
 
-- `mazha-core`：77
+- `mazha-core`：78
 - `mazha-md`：37
 - `mazha-export`：14
 - `mazha-crdt`：6
-- 合计 **149** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **150** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -60,6 +60,7 @@ cargo test --workspace
 ## 提交历史（近期）
 
 ```
+4c2df22 feat(core): CRDT 桥接（Document ↔ CrdtDoc 双向同步）
 c690b8c feat(export): to_html_document 完整 HTML5 外壳 + 默认 CSS
 d917644 fix(md): 序列化修复链接 URL 丢失 + 补充行内/链接回归测试
 746202b test(md): serialize 更多回归（代码块/引用/任务）

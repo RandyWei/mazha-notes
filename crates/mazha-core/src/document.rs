@@ -171,6 +171,30 @@ impl Document {
         Ok(summary)
     }
 
+    /// 应用一次编辑并同步到 CRDT（`CrdtDoc`）。
+    ///
+    /// 与 [`Document::apply`] 的区别：apply 成功后立即把解析后的基础编辑同步到
+    /// `crdt`，保证本地文档与 CRDT 状态一致（供后续增量同步给远端）。
+    ///
+    /// # Errors
+    /// - 编辑非法（同 [`Document::apply`]）时返回错误，**不会**修改 `crdt`。
+    ///
+    /// # Panics
+    /// 若同步阶段报告越界则 panic；由于 `apply` 已对同一组偏移做过校验，
+    /// 这在正常情况下不可能发生。
+    pub fn apply_and_sync(
+        &mut self,
+        edit: Edit,
+        crdt: &mut mazha_crdt::CrdtDoc,
+    ) -> Result<ChangeSummary> {
+        let resolved = self.resolve(edit);
+        let summary = self.apply(resolved.clone())?;
+        // apply 已成功，同步阶段理论上不会失败（同一组已校验的偏移）
+        crate::crdt::apply_edit_to_crdt(crdt, &resolved)
+            .expect("CRDT 同步失败（apply 已校验偏移，不应发生）");
+        Ok(summary)
+    }
+
     /// 把高层编辑命令解析为具体的基础编辑（Insert/Delete/Replace）。
     pub(crate) fn resolve(&self, edit: Edit) -> Edit {
         match edit {
@@ -644,6 +668,25 @@ mod tests {
         d.clear_history();
         assert!(!d.can_undo());
         assert!(d.undo().is_none());
+    }
+
+    #[test]
+    fn apply_and_sync_integrates_crdt() {
+        use crate::crdt::{crdt_to_document, document_to_crdt};
+        let mut d = doc("# 标题\n正文");
+        let mut crdt = document_to_crdt(&d);
+        d.apply_and_sync(
+            Edit::Insert {
+                at: 0,
+                text: "> ".into(),
+            },
+            &mut crdt,
+        )
+        .unwrap();
+        assert_eq!(d.text(), crdt.text());
+        let d2 = crdt_to_document(&crdt);
+        assert_eq!(d2.text(), d.text());
+        assert_eq!(d2.projection().lines.len(), d.projection().lines.len());
     }
 
     #[test]
