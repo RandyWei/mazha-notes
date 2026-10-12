@@ -23,7 +23,7 @@ cargo test --workspace
 | `mazha-core` | ✅ Phase 1 主体 | `Document`（rope/编辑/undo-redo/边界导航）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射）、`commands`（toggle_inline/set_block）、`IntentMapper`（回车续列表等）、`Workspace`（open/save/list） | 增量投影/增量解析、更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
 | `mazha-md` | ✅ 块级 + 行内 | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`（强调/粗体/删除线/代码/链接/图片/转义/自动链接）、`Block`/`SyntaxSpan`/`visible_runs` | 增量解析（脏块重解析）、`serialize`、表格/callout/wiki-link 等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
-| `mazha-crdt` | ⬜ 占位 | — | yrs `Y.Text` 封装、同步协议、持久化 |
+| `mazha-crdt` | 🟡 MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛 | 多文档/快照/持久化、字符索引统一封装 |
 | `mazha-export` | 🟡 HTML 完成 | `to_html`：基于 md 块/片段模型渲染（标题/段落/引用/列表/任务/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义） | PDF（Typst）、DOCX/EPUB、模板/主题 |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
@@ -35,7 +35,8 @@ cargo test --workspace
 - `mazha-md`：29
 - `mazha-store`：12
 - `mazha-export`：11
-- 合计 **124** 条（其余为占位 crate 的版本号冒烟测试）
+- `mazha-crdt`：6
+- 合计 **130** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -51,10 +52,10 @@ cargo test --workspace
 
 ## 下一步（建议顺序）
 
-1. `mazha-export`：Markdown → HTML 完整文档外壳 / CSS 主题；PDF（Typst）
+1. `mazha-crdt`：多文档名册/持久化原子写入、`apply_update` 校验与合并策略、与 `Workspace`/`core::Document` 对接
 2. `mazha-store` 文件监听（`watch`）或 `mazha-core` 增量投影 / `mazha-md` 增量解析
 3. `mazha-md::serialize`（AST→Markdown）与往返一致性测试
-4. `mazha-crdt`：yrs `Y.Text` 封装与同步协议
+4. `mazha-export`：Markdown → HTML 完整文档外壳 / CSS 主题；PDF（Typst）
 5. Phase 2：桌面 GPUI 只读投影渲染 → WYSIWYG 显隐标记 → IME
 
 ## 提交历史（近期）

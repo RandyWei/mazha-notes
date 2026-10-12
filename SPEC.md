@@ -586,6 +586,7 @@ interface Workspace {
 | 0.1.7 | 2026-10-12 | 落地 `mazha-store`：`StorageProvider`（同步，决策 D24）/`FileSystemProvider`/`DocPath`（校验+根路径）/`Entry`/`StorageCaps`/`StoreError`；12 条单测（累计 81）；SPEC §6.2 契约改为同步接口并记 D24 |
 | 0.1.8 | 2026-10-12 | `mazha-core` 依赖 `mazha-store`：落地 `Workspace<S: StorageProvider>`（`open`/`save`/`list`，UTF-8 校验、存储错误透传）；重导出 `DocPath`/`StorageProvider`；3 条单测（累计 84） |
 | 0.1.9 | 2026-10-12 | 落地 `mazha-export::to_html`：基于 `mazha-md` 块/片段模型渲染 HTML（标题/段落/引用/列表/任务表/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义）；11 条单测（累计 124）；SPEC §8 HTML 导出选型改为自研同源渲染 |
+| 0.1.10 | 2026-10-12 | `mazha-crdt` 基于 `yrs` 封装：`CrdtDoc`（`Y.Text` 根 `content`）、字符索引（UTF-8 字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛测试；6 条单测（累计 130） |
 
 ---
 

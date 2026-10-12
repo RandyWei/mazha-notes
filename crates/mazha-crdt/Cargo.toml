@@ -8,6 +8,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+yrs = "0.28"
+thiserror = "2"
 
 [lints]
 workspace = true
