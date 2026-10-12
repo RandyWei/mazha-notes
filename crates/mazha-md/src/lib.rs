@@ -8,10 +8,12 @@
 //! 也不依赖 `mazha-core`（依赖方向为 `mazha-core → mazha-md`）。
 
 mod block;
+mod inline;
 mod scanner;
 mod span;
 
 pub use block::{Block, BlockKind};
+pub use inline::parse_inline;
 pub use scanner::parse;
 pub use span::{SpanKind, SpanRole, SyntaxSpan, visible_runs};
 

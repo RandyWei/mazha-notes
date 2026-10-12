@@ -346,7 +346,13 @@ fn scan_blocks(source: &str, lines: &[Line]) -> Vec<Block> {
             continue;
         }
         if let Some((level, prefix_end, content_len)) = atx_heading(rest) {
-            blocks.push(build_atx_heading(line, level, prefix_end, content_len));
+            blocks.push(build_atx_heading(
+                source,
+                line,
+                level,
+                prefix_end,
+                content_len,
+            ));
             i += 1;
         } else if is_thematic_break(rest) {
             let spans = vec![SyntaxSpan::marker(
@@ -381,7 +387,13 @@ fn scan_blocks(source: &str, lines: &[Line]) -> Vec<Block> {
 }
 
 /// 构造 ATX 标题块。
-fn build_atx_heading(line: Line, level: u8, prefix_end: usize, content_len: usize) -> Block {
+fn build_atx_heading(
+    source: &str,
+    line: Line,
+    level: u8,
+    prefix_end: usize,
+    content_len: usize,
+) -> Block {
     let content_start = line.content + prefix_end;
     let content_end = content_start + content_len;
     let mut spans = vec![SyntaxSpan::marker(
@@ -389,9 +401,10 @@ fn build_atx_heading(line: Line, level: u8, prefix_end: usize, content_len: usiz
         SpanRole::HeadingMarker,
     )];
     if content_start < content_end {
-        spans.push(SyntaxSpan::text(
+        // 标题正文按行内语法解析（粗体/斜体/代码/链接…）
+        spans.extend(crate::inline::parse_inline(
+            source,
             content_start..content_end,
-            SpanRole::Normal,
         ));
     }
     // 结尾闭合式 `#`
@@ -593,7 +606,7 @@ fn build_paragraph(source: &str, lines: &[Line], start_idx: usize) -> (Block, us
     }
     let start = para.first().map_or(lines[start_idx].start, |l| l.start);
     let mut end = para.last().map_or(lines[start_idx].end, |l| l.end);
-    let mut spans = paragraph_spans(&para);
+    let mut spans = paragraph_spans(source, &para);
     let kind = if let Some((level, underline)) = heading {
         // Setext 下划线整行作为标记
         spans.push(SyntaxSpan::marker(
@@ -608,11 +621,19 @@ fn build_paragraph(source: &str, lines: &[Line], start_idx: usize) -> (Block, us
     (Block::leaf(kind, start..end, spans), i)
 }
 
-/// 逐行生成段落片段：内容文本 + 行间软/硬换行标记。
-fn paragraph_spans(para: &[Line]) -> Vec<SyntaxSpan> {
+/// 逐行生成段落片段：内容按行内语法解析 + 行间软/硬换行标记。
+fn paragraph_spans(source: &str, para: &[Line]) -> Vec<SyntaxSpan> {
     let mut spans = Vec::new();
     for (k, l) in para.iter().enumerate() {
-        spans.push(SyntaxSpan::text(l.content..l.end, SpanRole::Normal));
+        // 行尾连续两个及以上空格 = 硬换行（这些空格归为标记）
+        let content = &source[l.content..l.end];
+        let trailing = content.len() - content.trim_end_matches(' ').len();
+        let hard = trailing >= 2;
+        let text_end = if hard { l.end - trailing } else { l.end };
+        spans.extend(crate::inline::parse_inline(source, l.content..text_end));
+        if hard {
+            spans.push(SyntaxSpan::marker(text_end..l.end, SpanRole::HardBreak));
+        }
         if k + 1 < para.len() {
             spans.push(SyntaxSpan::marker(
                 l.end..para[k + 1].start,

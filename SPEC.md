@@ -541,6 +541,7 @@ interface Workspace {
 | 0.1.1 | 2026-10-12 | Phase 1 启动：落地 `mazha-core` 最小可用内核（Document/Edit/Selection/ChangeSummary + undo/redo + 边界校验），契约 §6.1 同步实现态签名；接入 ropey 1.6 + thiserror 2；新增约定 AGENTS.md（规范驱动 + 必备注释 + CI 命令） |
 | 0.1.2 | 2026-10-12 | 内核迭代：落地 `OffsetMap`（可见区间模型 + src↔display 双向映射 + 交叉点稳定落点规则），契约 §6.1 补充实现细节；12 条新单测 |
 | 0.1.3 | 2026-10-12 | `mazha-md` 起步：行扫描块级解析（ATX/Setext 标题、段落、分割线、围栏代码、引用、有序/无序/任务列表）+ `SyntaxSpan`/`visible_runs`；决策 D23（自研行扫描，pulldown-cmark 降为 dev 依赖）与 §8 选型更新；16 条单测 |
+| 0.1.4 | 2026-10-12 | `mazha-md` 行内解析：强调/粗体/删除线（递归嵌套 + 颜色继承）、行内代码（等长反引号 + 空格修剪）、链接（URL 隐藏）、图片（Widget 占位）、转义、自动链接；接入段落/标题叶子块；硬换行标记；13 条单测（累计 29） |
 
 ---
 
