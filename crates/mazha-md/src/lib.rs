@@ -34,3 +34,6 @@ mod tests {
         assert_eq!(Dialect::default(), Dialect::GfmKb);
     }
 }
+mod serialize;
+
+pub use serialize::{serialize, serialize_source, to_md};
