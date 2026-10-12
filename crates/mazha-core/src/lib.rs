@@ -5,8 +5,19 @@
 //!
 //! **本 crate 不得依赖任何 GUI 框架**（SPEC §4.1），以便在无 UI 环境下单测。
 //!
-//! Phase 1 将在此实现契约草案中的 `Document` / `Edit` / `Projection` /
-//! `OffsetMap` / `Selection`。
+//! Phase 1 当前里程碑：`Document`（源文本真相）+ `Edit` + 撤销/重做 +
+//! 光标/选区 + 边界校验（最小可用内核）。`Projection` / `OffsetMap`
+//! 在本里程碑之后的迭代中实现。
+
+mod document;
+mod edit;
+mod error;
+mod selection;
+
+pub use document::Document;
+pub use edit::{ChangeSummary, Edit};
+pub use error::{EditError, Result};
+pub use selection::Selection;
 
 /// 核心 crate 版本号（编译期注入）。
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,0 +1,566 @@
+//! 文档：源文本的单一真相（SPEC §4.3）。
+//!
+//! 这是整个编辑器的最核心数据结构。所有编辑都通过 [`Document::apply`] 进入，
+//! 先做**字符边界校验**，再以 `ropey::Rope` 应用修改（O(log n)），并按
+//! `Edit → 逆 Edit` 的形式维护 undo/redo 历史。
+//!
+//! 设计要点：
+//! - 对外一律用**字节偏移**（UTF-8），内部换算成 rope 的字符索引；
+//! - 渲染投影（`Projection`）、CRDT（`Y.Text`）、文件保存都派生自这里的文本；
+//! - 本模块**不做任何 UI 语义**（如行/列/隐藏标记），那是投影层的事。
+
+use crate::edit::{ChangeSummary, Edit};
+use crate::error::{EditError, Result};
+use ropey::Rope;
+use std::borrow::Cow;
+use std::ops::Range;
+
+/// undo/redo 栈的默认上限，防止长会话内存无限增长。
+const DEFAULT_MAX_HISTORY: usize = 1000;
+
+/// 一条历史记录：保存原始编辑与其逆编辑。
+///
+/// - `undo` 重放 `inverse` 并从撤销栈弹出；被撤销的 `original` 推入重做栈。
+/// - `redo` 重放 `original` 并推回撤销栈。
+/// - 逆编辑在 `apply` 时生成（此时还能拿到被删除的原文），之后无需再次访问文本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Change {
+    /// 用户原始编辑（redo 时重放）。
+    original: Edit,
+    /// 逆向编辑（undo 时重放）。
+    inverse: Edit,
+}
+
+/// 码札文档：持有一份 Markdown 源文本。
+pub struct Document {
+    /// 源文本（rope，支持 O(log n) 的插入/删除）。
+    text: Rope,
+    /// 撤销栈：栈顶是最近一次编辑。
+    undo_stack: Vec<Change>,
+    /// 重做栈：栈顶是可重做的最近一次撤销。
+    redo_stack: Vec<Change>,
+    /// 撤销栈最大深度。
+    max_history: usize,
+}
+
+impl Document {
+    /// 用初始文本新建文档。
+    pub fn new(text: &str) -> Self {
+        Self {
+            text: Rope::from_str(text),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            max_history: DEFAULT_MAX_HISTORY,
+        }
+    }
+
+    /// 文档当前字节长度。
+    pub fn len(&self) -> usize {
+        self.text.len_bytes()
+    }
+
+    /// 文档是否为空（零字节）。
+    pub fn is_empty(&self) -> bool {
+        self.text.len_bytes() == 0
+    }
+
+    /// 返回整篇文档文本（**拷贝**）。只适合低频场景（保存、小文档读取）。
+    /// 逐行渲染用 [`Document::slice`]，避免整体拷贝。
+    pub fn text(&self) -> String {
+        self.text.to_string()
+    }
+
+    /// 返回字节范围 `range` 内的文本（`Cow`：连续 chunk 时零拷贝借用，否则拷贝）。
+    ///
+    /// # Panics
+    /// `range` 两端不是字符边界时会 panic；调用方应先通过
+    /// [`Document::snap_to_boundary`] 或本次编辑的返回保证合法性。
+    pub fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        // ropey 的 `slice`/`insert`/`remove` 都以"字符索引"为参数，
+        // 这里把字节边界换算成字符边界：end 落在边界上时，
+        // byte_to_char(end) 恰好是"第一个被排除的字符"。
+        let cstart = self.text.byte_to_char(range.start);
+        let cend = self.text.byte_to_char(range.end);
+        self.text.slice(cstart..cend).into()
+    }
+
+    /// 尝试返回字节范围文本。
+    ///
+    /// # Errors
+    /// - 范围两端不是字符边界 → [`EditError::InvalidBoundary`]。
+    /// - 范围越界或倒序 → [`EditError::InvalidRange`]。
+    pub fn try_slice(&self, range: Range<usize>) -> Result<Cow<'_, str>> {
+        self.validate_byte_range(&range)?;
+        Ok(self.slice(range))
+    }
+
+    /// 暴露底层 rope，供投影/导出层做高效逐行读取。
+    pub fn rope(&self) -> &Rope {
+        &self.text
+    }
+
+    /// 把任意字节偏移吸附到最近的字符边界（超出长度 clamp 到末尾）。
+    pub fn snap_to_boundary(&self, byte: usize) -> usize {
+        if byte >= self.text.len_bytes() {
+            return self.text.len_bytes();
+        }
+        let char_idx = self.text.byte_to_char(byte);
+        // byte_to_char 返回"包含该字节的字符"的索引，char_to_byte 取该字符起点，
+        // 因此总能得到边界；若 byte 本身是边界，两者相同。
+        self.text.char_to_byte(char_idx)
+    }
+
+    /// 从字节偏移向前（左）移动**一个字符**，落在字符边界上。
+    pub fn prev_char_boundary(&self, byte: usize) -> usize {
+        if byte == 0 {
+            return 0;
+        }
+        let char_idx = self.text.byte_to_char(byte);
+        let is_boundary = self.text.char_to_byte(char_idx) == byte;
+        if is_boundary && char_idx > 0 {
+            // 当前就在边界：上一个字符的起点
+            self.text.char_to_byte(char_idx - 1)
+        } else {
+            // 落在字符内部：吸附到该字符起点
+            self.text.char_to_byte(char_idx)
+        }
+    }
+
+    /// 从字节偏移向后（右）移动**一个字符**，落在字符边界上。
+    pub fn next_char_boundary(&self, byte: usize) -> usize {
+        if byte >= self.text.len_bytes() {
+            return self.text.len_bytes();
+        }
+        let char_idx = self.text.byte_to_char(byte);
+        let next = (char_idx + 1).min(self.text.len_chars());
+        self.text.char_to_byte(next)
+    }
+
+    /// 应用一次编辑，更新 undo 历史并返回变更摘要。
+    ///
+    /// 若偏移非法（非字符边界 / 越界），返回错误且**不修改文档**。
+    ///
+    /// # Errors
+    /// - 插入偏移不是字符边界 → [`EditError::InvalidBoundary`]。
+    /// - 删除/替换范围越界或倒序 → [`EditError::InvalidRange`]。
+    pub fn apply(&mut self, edit: Edit) -> Result<ChangeSummary> {
+        self.validate_edit(&edit)?;
+        // 在修改前生成逆编辑：此时才能取到被覆盖的原文。
+        let inverse = self.inverse_of(&edit);
+        let summary = self.apply_raw(&edit);
+        // 任何新编辑都会使重做栈失效。
+        self.redo_stack.clear();
+        self.undo_stack.push(Change {
+            original: edit,
+            inverse,
+        });
+        if self.undo_stack.len() > self.max_history {
+            self.undo_stack.remove(0);
+        }
+        Ok(summary)
+    }
+
+    /// 撤销最近一次编辑。无历史时返回 `None`。
+    pub fn undo(&mut self) -> Option<ChangeSummary> {
+        let change = self.undo_stack.pop()?;
+        let summary = self.apply_raw(&change.inverse);
+        self.redo_stack.push(change);
+        Some(summary)
+    }
+
+    /// 重做最近一次撤销。无可重做项时返回 `None`。
+    pub fn redo(&mut self) -> Option<ChangeSummary> {
+        let change = self.redo_stack.pop()?;
+        let summary = self.apply_raw(&change.original);
+        self.undo_stack.push(change);
+        Some(summary)
+    }
+
+    /// 是否可以撤销/重做。
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    /// 是否可以重做。
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// 清空 undo/redo 历史（如打开新文件时）。
+    pub fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// 设置撤销栈最大深度。
+    pub fn set_max_history(&mut self, max: usize) {
+        self.max_history = max;
+        while self.undo_stack.len() > max {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    // ---- 内部实现 ----
+
+    /// 校验编辑合法性：全部偏移落在边界内。
+    fn validate_edit(&self, edit: &Edit) -> Result<()> {
+        match edit {
+            Edit::Insert { at, .. } => self.validate_byte_offset(*at),
+            Edit::Delete { range } | Edit::Replace { range, .. } => self.validate_byte_range(range),
+        }
+    }
+
+    /// 校验单个字节偏移是否合法且为字符边界。
+    fn validate_byte_offset(&self, byte: usize) -> Result<()> {
+        if byte > self.text.len_bytes() {
+            return Err(EditError::InvalidRange {
+                start: byte,
+                end: byte,
+                doc_len: self.text.len_bytes(),
+            });
+        }
+        let char_idx = self.text.byte_to_char(byte);
+        if self.text.char_to_byte(char_idx) != byte {
+            return Err(EditError::InvalidBoundary { offset: byte });
+        }
+        Ok(())
+    }
+
+    /// 校验字节范围是否有序且包围合法边界。
+    fn validate_byte_range(&self, range: &Range<usize>) -> Result<()> {
+        if range.start > range.end || range.end > self.text.len_bytes() {
+            return Err(EditError::InvalidRange {
+                start: range.start,
+                end: range.end,
+                doc_len: self.text.len_bytes(),
+            });
+        }
+        self.validate_byte_offset(range.start)?;
+        self.validate_byte_offset(range.end)?;
+        Ok(())
+    }
+
+    /// 在**修改前**依据当前文本生成逆编辑。
+    fn inverse_of(&self, edit: &Edit) -> Edit {
+        match edit {
+            Edit::Insert { at, text } => Edit::Delete {
+                range: *at..at.saturating_add(text.len()),
+            },
+            Edit::Delete { range } => Edit::Insert {
+                at: range.start,
+                text: self.slice(range.clone()).into_owned(),
+            },
+            Edit::Replace { range, text } => Edit::Replace {
+                // 替换后的范围以新文本长度计算
+                range: range.start..range.start.saturating_add(text.len()),
+                text: self.slice(range.clone()).into_owned(),
+            },
+        }
+    }
+
+    /// 直接对文本应用编辑（不触碰任何历史栈），返回变更摘要。
+    fn apply_raw(&mut self, edit: &Edit) -> ChangeSummary {
+        let affected = match edit {
+            Edit::Insert { at, text } => {
+                let char_idx = self.text.byte_to_char(*at);
+                self.text.insert(char_idx, text);
+                *at..at.saturating_add(text.len())
+            }
+            Edit::Delete { range } => {
+                let start = self.text.byte_to_char(range.start);
+                let end = self.text.byte_to_char(range.end);
+                self.text.remove(start..end);
+                range.start..range.start
+            }
+            Edit::Replace { range, text } => {
+                let start = self.text.byte_to_char(range.start);
+                let end = self.text.byte_to_char(range.end);
+                // ropey 没有 replace，等价于 remove + insert（两者都是 O(log n)）。
+                self.text.remove(start..end);
+                self.text.insert(start, text);
+                range.start..range.start.saturating_add(text.len())
+            }
+        };
+        let doc_len = self.text.len_bytes();
+        ChangeSummary { affected, doc_len }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::selection::Selection;
+
+    fn doc(s: &str) -> Document {
+        Document::new(s)
+    }
+
+    #[test]
+    fn empty_and_text() {
+        let d = doc("你好，世界!");
+        assert_eq!(d.len(), "你好，世界!".len());
+        assert!(!d.is_empty());
+        assert_eq!(d.text(), "你好，世界!");
+        assert!(doc("").is_empty());
+    }
+
+    #[test]
+    fn insert_at_edges_and_middle() {
+        let mut d = doc("abcd");
+        d.apply(Edit::Insert {
+            at: 0,
+            text: "Z".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "Zabcd");
+        d.apply(Edit::Insert {
+            at: 5,
+            text: "E".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "ZabcdE");
+        d.apply(Edit::Insert {
+            at: 2,
+            text: "X".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "ZaXbcdE");
+    }
+
+    #[test]
+    fn insert_multi_byte_char_boundary() {
+        // 「你」= 3 字节；1 不是边界，3 是边界
+        let mut d = doc("你");
+        assert_eq!(
+            d.apply(Edit::Insert {
+                at: 1,
+                text: "x".into()
+            }),
+            Err(EditError::InvalidBoundary { offset: 1 })
+        );
+        assert_eq!(d.text(), "你", "非法编辑不应修改文档");
+        d.apply(Edit::Insert {
+            at: 3,
+            text: "a".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "你a");
+    }
+
+    #[test]
+    fn delete_and_replace() {
+        let mut d = doc("hello world");
+        d.apply(Edit::Delete { range: 5..6 }).unwrap();
+        assert_eq!(d.text(), "helloworld");
+        d.apply(Edit::Replace {
+            range: 0..5,
+            text: "HELLO".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "HELLOworld");
+    }
+
+    #[test]
+    fn delete_invalid_ranges_error() {
+        let mut d = doc("abc");
+        assert_eq!(
+            d.apply(Edit::Delete { range: 2..1 }),
+            Err(EditError::InvalidRange {
+                start: 2,
+                end: 1,
+                doc_len: 3
+            })
+        );
+        assert_eq!(
+            d.apply(Edit::Delete { range: 1..9 }),
+            Err(EditError::InvalidRange {
+                start: 1,
+                end: 9,
+                doc_len: 3
+            })
+        );
+        assert_eq!(d.text(), "abc");
+    }
+
+    #[test]
+    fn undo_redo_roundtrip() {
+        let mut d = doc("abc");
+        d.apply(Edit::Insert {
+            at: 3,
+            text: "d".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "abcd");
+        assert!(d.can_undo());
+        d.undo().unwrap();
+        assert_eq!(d.text(), "abc");
+        assert!(d.can_redo());
+        d.redo().unwrap();
+        assert_eq!(d.text(), "abcd");
+    }
+
+    #[test]
+    fn undo_clears_redo_on_new_edit() {
+        let mut d = doc("a");
+        d.apply(Edit::Insert {
+            at: 1,
+            text: "b".into(),
+        })
+        .unwrap(); // ab
+        d.undo().unwrap(); // a
+        assert!(d.can_redo());
+        d.apply(Edit::Insert {
+            at: 1,
+            text: "c".into(),
+        })
+        .unwrap(); // ac
+        assert!(!d.can_redo(), "新编辑应使重做栈失效");
+        assert_eq!(d.text(), "ac");
+    }
+
+    #[test]
+    fn undo_multiple_then_redo_all() {
+        let mut d = doc("start");
+        d.apply(Edit::Replace {
+            range: 0..5,
+            text: "hello".into(),
+        })
+        .unwrap();
+        d.apply(Edit::Insert {
+            at: 5,
+            text: " world".into(),
+        })
+        .unwrap();
+        d.apply(Edit::Replace {
+            range: 0..11,
+            text: "mazha".into(),
+        })
+        .unwrap();
+        assert_eq!(d.text(), "mazha");
+        d.undo().unwrap();
+        assert_eq!(d.text(), "hello world");
+        d.undo().unwrap();
+        assert_eq!(d.text(), "hello");
+        d.undo().unwrap();
+        assert_eq!(d.text(), "start");
+        assert!(!d.can_undo());
+        d.redo().unwrap();
+        d.redo().unwrap();
+        d.redo().unwrap();
+        assert_eq!(d.text(), "mazha");
+    }
+
+    #[test]
+    fn undo_with_cjk() {
+        let mut d = doc("你好");
+        d.apply(Edit::Insert {
+            at: 3,
+            text: "到".into(),
+        })
+        .unwrap(); // 你到好
+        assert_eq!(d.text(), "你到好");
+        d.undo().unwrap();
+        assert_eq!(d.text(), "你好");
+        d.redo().unwrap();
+        assert_eq!(d.text(), "你到好");
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut d = doc("");
+        d.set_max_history(2);
+        for i in 0..5 {
+            d.apply(Edit::Insert {
+                at: i,
+                text: i.to_string().as_str().into(),
+            })
+            .unwrap();
+        }
+        // 5 次插入但只保留最近 2 条
+        d.undo().unwrap();
+        d.undo().unwrap();
+        assert!(!d.can_undo(), "超出上限的历史应被丢弃");
+        assert_eq!(d.text(), "012");
+    }
+
+    #[test]
+    fn snap_to_boundary_clamps() {
+        let d = doc("你好abc");
+        assert_eq!(d.snap_to_boundary(0), 0);
+        assert_eq!(d.snap_to_boundary(1), 0); // 「你」中间 → 起点
+        assert_eq!(d.snap_to_boundary(3), 3); // 正好是边界
+        assert_eq!(d.snap_to_boundary(999), d.len());
+    }
+
+    #[test]
+    fn char_movement_respects_boundaries() {
+        let d = doc("你好a");
+        // 字节: 你=0..3, 好=3..6, a=6..7
+        assert_eq!(d.prev_char_boundary(6), 3);
+        assert_eq!(d.next_char_boundary(3), 6);
+        assert_eq!(d.prev_char_boundary(7), 6);
+        assert_eq!(d.next_char_boundary(7), 7);
+        assert_eq!(d.prev_char_boundary(0), 0);
+        assert_eq!(d.prev_char_boundary(1), 0, "落在字符中间应吸附回起点");
+        assert_eq!(d.next_char_boundary(1), 3, "落在字符中间应跳到字符末尾");
+    }
+
+    #[test]
+    fn slice_and_try_slice() {
+        let d = doc("你好世界");
+        assert_eq!(d.slice(3..9), "好世");
+        assert_eq!(
+            d.try_slice(1..9),
+            Err(EditError::InvalidBoundary { offset: 1 })
+        );
+        assert_eq!(
+            d.try_slice(0..99),
+            Err(EditError::InvalidRange {
+                start: 0,
+                end: 99,
+                doc_len: 12
+            })
+        );
+    }
+
+    #[test]
+    fn summary_reports_affected_range() {
+        let mut d = doc("abcdef");
+        let s = d
+            .apply(Edit::Replace {
+                range: 2..4,
+                text: "XY".into(),
+            })
+            .unwrap();
+        assert_eq!(s.affected, 2..4);
+        assert_eq!(s.doc_len, 6);
+        let s = d.apply(Edit::Delete { range: 0..1 }).unwrap();
+        assert_eq!(s.affected, 0..0, "删除点为空区间");
+    }
+
+    #[test]
+    fn clear_history() {
+        let mut d = doc("a");
+        d.apply(Edit::Insert {
+            at: 1,
+            text: "b".into(),
+        })
+        .unwrap();
+        d.clear_history();
+        assert!(!d.can_undo());
+        assert!(d.undo().is_none());
+    }
+
+    #[test]
+    fn selection_offsets_are_byte_based() {
+        // 用中文验证偏移确实按字节而非字符
+        let mut d = doc("你");
+        let sel = Selection::new(0, 3);
+        assert!(sel.contains(3));
+        d.apply(Edit::Delete {
+            range: sel.start()..sel.end(),
+        })
+        .unwrap();
+        assert!(d.is_empty());
+    }
+}

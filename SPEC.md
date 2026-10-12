@@ -241,12 +241,27 @@ pub struct Selection { pub anchor: usize, pub head: usize }
 pub struct Document { /* rope + 解析缓存 + 撤销栈 */ }
 
 impl Document {
-    pub fn text(&self) -> &str;
-    pub fn apply(&mut self, edit: Edit) -> ChangeSummary;
-    pub fn projection(&self) -> Projection;
-    pub fn undo(&mut self); pub fn redo(&mut self);
+    pub fn text(&self) -> String;                       // 全文拷贝；逐段读取用 slice()
+    pub fn slice(&self, range: Range<usize>) -> Cow<str>; // 字节范围 → 文本（可能零拷贝）
+    pub fn len(&self) -> usize;                         // 字节长度
+    pub fn apply(&mut self, edit: Edit) -> Result<ChangeSummary>; // 非法偏移返回错误，不改文档
+    pub fn undo(&mut self) -> Option<ChangeSummary>;
+    pub fn redo(&mut self) -> Option<ChangeSummary>;
+    pub fn projection(&self) -> Projection;             // Phase 2（投影层）
+    pub fn snap_to_boundary(&self, byte: usize) -> usize; // 吸附到字符边界
+}
+
+/// 一次编辑的变更摘要（UI 据此决定重解析/重绘范围）
+pub struct ChangeSummary {
+    pub affected: Range<usize>,   // 新文档中发生变化的字节范围
+    pub doc_len: usize,           // 应用后字节长度
 }
 ```
+
+> **实现状态**：`Edit`（Insert/Delete/Replace）、`Document`（rope + 边界校验 +
+> undo/redo + 字节/字符边界导航）、`Selection`、`ChangeSummary` 已落地（Phase 1 最小内核，22
+> 条单测，见 `crates/mazha-core`）。`ToggleInline`/`ToggleBlock`、`OffsetMap`/`Projection`、
+> `DocId`/`DocPath` 为后续迭代项。
 
 ### 6.2 `StorageProvider`（存储抽象）
 
@@ -508,6 +523,7 @@ interface Workspace {
 | 版本 | 日期 | 变更内容 |
 |------|------|----------|
 | 0.1 | 2026-10-12 | 初始规范（规划版）：完成平台矩阵、总体架构、核心模块与契约草案、里程碑与决策记录 |
+| 0.1.1 | 2026-10-12 | Phase 1 启动：落地 `mazha-core` 最小可用内核（Document/Edit/Selection/ChangeSummary + undo/redo + 边界校验），契约 §6.1 同步实现态签名；接入 ropey 1.6 + thiserror 2；新增约定 AGENTS.md（规范驱动 + 必备注释 + CI 命令） |
 
 ---
 
