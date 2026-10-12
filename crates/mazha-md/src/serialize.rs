@@ -123,26 +123,69 @@ fn block_to_md(source: &str, b: &Block) -> String {
 
 fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
     let mut out = String::new();
-    for (i, sp) in spans.iter().enumerate() {
+    let mut pos = 0usize;
+    while pos < spans.len() {
+        let sp = &spans[pos];
+        if sp.kind == SpanKind::Text {
+            out.push_str(&slice(source, &sp.range));
+            pos += 1;
+            continue;
+        }
         match (sp.kind, sp.role) {
-            (SpanKind::Text, _) => out.push_str(&slice(source, &sp.range)),
             (SpanKind::Marker, SpanRole::SoftBreak) => out.push('\n'),
             (SpanKind::Marker, SpanRole::HardBreak) => out.push_str("  \n"),
             (SpanKind::Marker, SpanRole::EscapeMarker) => out.push('\\'),
-            (SpanKind::Marker, SpanRole::InlineCode) => {
-                // 同一角色的开/闭：此处只输出 ``
-                out.push('`');
-            }
+            (SpanKind::Marker, SpanRole::InlineCode) => out.push('`'),
             (SpanKind::Marker, SpanRole::Strong) => out.push_str("**"),
             (SpanKind::Marker, SpanRole::Emphasis) => out.push('*'),
             (SpanKind::Marker, SpanRole::Strikethrough) => out.push_str("~~"),
             (SpanKind::Marker, SpanRole::LinkMarker) => {
-                let b = source.as_bytes()[sp.range.start];
-                match b {
-                    b'[' => out.push('['),
-                    b']' => out.push(']'),
-                    b'(' => out.push('('),
-                    b')' => out.push(')'),
+                let ch = source.as_bytes()[sp.range.start];
+                if ch == b'[' {
+                    // 普通链接：`[text](url)` 整体重建（含嵌套行内样式）
+                    let mut dest: Option<String> = None;
+                    let mut close: Option<usize> = None;
+                    let mut bracket: Option<usize> = None;
+                    let mut k = pos + 1;
+                    while k < spans.len() {
+                        let item = &spans[k];
+                        if item.kind == SpanKind::Marker && item.role == SpanRole::LinkDest {
+                            dest = Some(slice(source, &item.range));
+                        }
+                        if item.kind == SpanKind::Marker && item.role == SpanRole::LinkMarker {
+                            let ch2 = source.as_bytes()[item.range.start];
+                            if ch2 == b']' && bracket.is_none() {
+                                bracket = Some(k);
+                            }
+                            if ch2 == b')' {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    let bracket = bracket.unwrap_or(close.unwrap_or(spans.len()));
+                    out.push('[');
+                    for item2 in &spans[pos + 1..bracket] {
+                        if item2.kind == SpanKind::Text {
+                            out.push_str(&slice(source, &item2.range));
+                        } else if item2.kind == SpanKind::Marker {
+                            match item2.role {
+                                SpanRole::Strong => out.push_str("**"),
+                                SpanRole::Emphasis => out.push('*'),
+                                SpanRole::Strikethrough => out.push_str("~~"),
+                                SpanRole::InlineCode => out.push('`'),
+                                _ => {}
+                            }
+                        }
+                    }
+                    out.push_str("](");
+                    out.push_str(&dest.unwrap_or_default());
+                    out.push(')');
+                    pos = (close.unwrap_or(spans.len())) + 1;
+                    continue;
+                }
+                match ch {
                     b'<' => out.push('<'),
                     b'>' => out.push('>'),
                     _ => {}
@@ -153,8 +196,7 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
             }
             _ => {}
         }
-        // 跳过 LinkDest 的单独输出（放在 LinkMarker 流程）
-        let _ = i;
+        pos += 1;
     }
     out
 }
@@ -214,4 +256,19 @@ mod tests {
         assert!(out.contains("[x]"));
         assert!(out.contains("[ ]"));
     }
+}
+
+#[test]
+fn to_md_inline_marks() {
+    let out = to_md("**粗** *斜* ~~删~~ `码`\n");
+    assert!(out.contains("粗"));
+    assert!(out.contains("斜"));
+    assert!(out.contains("删"));
+}
+
+#[test]
+fn to_md_link() {
+    let out = to_md("[文字](https://x.com)\n");
+    assert!(out.contains("文字"));
+    assert!(out.contains("https://x.com"));
 }
