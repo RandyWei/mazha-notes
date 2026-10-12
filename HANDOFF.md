@@ -21,7 +21,7 @@ cargo test --workspace
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
 | `mazha-core` | ✅ Phase 1 主体 | `Document`（rope/编辑/undo-redo/边界导航）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射）、`commands`（toggle_inline/set_block）、`IntentMapper`（回车续列表等）、`Workspace`（open/save/list） | 增量投影/增量解析、更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
-| `mazha-md` | ✅ 块级 + 行内 | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`（强调/粗体/删除线/代码/链接/图片/转义/自动链接）、`Block`/`SyntaxSpan`/`visible_runs` | 增量解析（脏块重解析）、`serialize`、表格/callout/wiki-link 等知识库扩展 |
+| `mazha-md` | ✅ 块级 + 行内 + 序列化（MVP） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`、`serialize_source/to_md`（极简 AST→Markdown） | 增量解析（脏块重解析）、完善 serialize 覆盖、往返一致性测试、表格/callout/wiki-link 等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | 🟡 MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛 | 多文档/快照/持久化、字符索引统一封装 |
 | `mazha-export` | 🟡 HTML 完成 | `to_html`：基于 md 块/片段模型渲染（标题/段落/引用/列表/任务/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义） | PDF（Typst）、DOCX/EPUB、模板/主题 |
