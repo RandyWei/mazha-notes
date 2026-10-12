@@ -20,17 +20,6 @@ license = "AGPL-3.0-or-later"
 authors = ["RandyWei <weizhengheng@chinahrt.com>"]
 repository = ""
 
-[workspace.dependencies]
-# 内部 crate（路径依赖）
-mazha-core = { path = "crates/mazha-core" }
-mazha-md = { path = "crates/mazha-md" }
-mazha-crdt = { path = "crates/mazha-crdt" }
-mazha-store = { path = "crates/mazha-store" }
-mazha-export = { path = "crates/mazha-export" }
-mazha-plugin = { path = "crates/mazha-plugin" }
-mazha-ffi = { path = "crates/mazha-ffi" }
-mazha-wasm = { path = "crates/mazha-wasm" }
-
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"

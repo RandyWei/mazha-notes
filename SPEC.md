@@ -388,8 +388,8 @@ interface Workspace {
 |------|------|------|
 | 桌面 UI | GPUI + gpui-kit 0.7 | Apache-2.0；GPUI 为 git 依赖 |
 | 文本模型 | `ropey` | rope 结构，O(log n) 编辑 |
-| Markdown 解析 | `pulldown-cmark`（GFM） | 带字节偏移，支持块级缓存；代码高亮用 tree-sitter |
-| 增量解析 | 自研脏块重解析（基于 pulldown-cmark 偏移） | 见第 11 节 |
+| Markdown 解析 | 自研行扫描（`mazha-md`），覆盖 MVP 方言子集 | 精确字节偏移、便于脏块增量解析；`pulldown-cmark` 仅作测试对照（dev 依赖） |
+| 增量解析 | 自研脏块重解析（基于块级字节范围） | 见第 11 节 |
 | CRDT | `yrs` | Yjs Rust 实现，与 Web Yjs 互通 |
 | 移动端 FFI | `uniffi` | 生成 Swift/Kotlin 绑定 |
 | 鸿蒙 FFI | `napi-rs` (@ohos) | `[待确认]` |
@@ -529,6 +529,7 @@ interface Workspace {
 | D20 | 代码高亮 | tree-sitter（gpui-kit 内置） | 确认 |
 | D21 | PDF 导出引擎 | Typst | 确认 |
 | D22 | 仓库可见性 | GitHub 私有，发布后转公开（AGPL-3.0） | 确认 |
+| D23 | Markdown 解析实现 | 自研行扫描（块级）+ 自研行内扫描，精确字节偏移；`pulldown-cmark` 降为 dev 依赖（测试对照/后续 HTML 导出参考） | 待确认 |
 
 ---
 
@@ -539,6 +540,7 @@ interface Workspace {
 | 0.1 | 2026-10-12 | 初始规范（规划版）：完成平台矩阵、总体架构、核心模块与契约草案、里程碑与决策记录 |
 | 0.1.1 | 2026-10-12 | Phase 1 启动：落地 `mazha-core` 最小可用内核（Document/Edit/Selection/ChangeSummary + undo/redo + 边界校验），契约 §6.1 同步实现态签名；接入 ropey 1.6 + thiserror 2；新增约定 AGENTS.md（规范驱动 + 必备注释 + CI 命令） |
 | 0.1.2 | 2026-10-12 | 内核迭代：落地 `OffsetMap`（可见区间模型 + src↔display 双向映射 + 交叉点稳定落点规则），契约 §6.1 补充实现细节；12 条新单测 |
+| 0.1.3 | 2026-10-12 | `mazha-md` 起步：行扫描块级解析（ATX/Setext 标题、段落、分割线、围栏代码、引用、有序/无序/任务列表）+ `SyntaxSpan`/`visible_runs`；决策 D23（自研行扫描，pulldown-cmark 降为 dev 依赖）与 §8 选型更新；16 条单测 |
 
 ---
 
