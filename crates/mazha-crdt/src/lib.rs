@@ -58,6 +58,21 @@ impl CrdtDoc {
         self.root.get_string(&txn)
     }
 
+    /// 克隆一份 **CRDT 状态相同** 的独立文档（同一文档在另一端的副本）。
+    ///
+    /// 用于多端同步：各端从同一持久化状态出发，各自持有自己的 `CrdtDoc`，
+    /// 之后通过状态向量/增量更新互相收敛。
+    ///
+    /// # Panics
+    /// 理论上不会 panic：自身的更新帧必然可被自身状态构成的更新解码。
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        let mut me = Self::new();
+        me.apply_update(&self.encode_update())
+            .expect("fork 应用自身更新应可解码");
+        me
+    }
+
     /// 当前文本的 **UTF-8 字节** 长度（yrs 原生单位）。
     pub fn byte_len(&self) -> u32 {
         let txn = self.doc.transact();
@@ -234,4 +249,33 @@ mod tests {
         assert_eq!(a.text(), b.text());
         assert!(a.text().contains('X') && a.text().contains('Y'));
     }
+}
+
+#[test]
+fn fork_preserves_state() {
+    let a = CrdtDoc::from_text("你好**世界**");
+    let b = a.fork();
+    assert_eq!(a.text(), b.text());
+    // fork 后各自演进，交换更新可收敛
+    let mut a = a;
+    let mut b = b;
+    a.insert(0, "> ").unwrap();
+    let diff = a.encode_diff(&b.state_vector()).unwrap();
+    b.apply_update(&diff).unwrap();
+    assert_eq!(a.text(), b.text());
+    assert_eq!(a.text(), "> 你好**世界**");
+}
+
+#[test]
+fn fork_then_concurrent_inserts() {
+    let base = CrdtDoc::from_text("ab");
+    let mut a = base.fork();
+    let mut b = base.fork();
+    a.insert(1, "X").unwrap();
+    b.insert(1, "Y").unwrap();
+    let ua = a.encode_update();
+    let ub = b.encode_update();
+    a.apply_update(&ub).unwrap();
+    b.apply_update(&ua).unwrap();
+    assert_eq!(a.text(), b.text());
 }

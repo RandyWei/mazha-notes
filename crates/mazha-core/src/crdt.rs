@@ -63,6 +63,28 @@ fn byte_to_char(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())].chars().count()
 }
 
+/// 应用一个远端更新帧：先并入 `crdt`，若源文本变化则重建 `doc`。
+///
+/// 这是 MVP 的"远端 → 本地"通道：`bytes` 为 Yjs v1 编码的更新（由对端的
+/// [`mazha_crdt::CrdtDoc::encode_diff`] / `encode_update` 产出）。返回是否发生实际变化
+/// （无变化时不会触动本地 undo/redo 历史）。
+///
+/// # Errors
+/// 更新帧解码失败时返回 [`mazha_crdt::CrdtError`]。
+pub fn apply_remote(
+    doc: &mut Document,
+    crdt: &mut CrdtDoc,
+    bytes: &[u8],
+) -> mazha_crdt::CrdtResult<bool> {
+    crdt.apply_update(bytes)?;
+    let latest = crdt.text();
+    if latest == doc.text() {
+        return Ok(false);
+    }
+    *doc = crdt_to_document(crdt);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +164,47 @@ mod tests {
         doc.apply(resolved.clone()).unwrap();
         apply_edit_to_crdt(&mut crdt, &resolved).unwrap();
         assert_eq!(crdt.text(), doc.text());
+    }
+
+    #[test]
+    fn remote_update_rebuilds_document() {
+        // 模拟双端：从同一 CRDT 状态派生两个副本（fork），A 本地编辑 →
+        // 增量帧 → B 远端应用并重建。
+        let mut crdt_a = document_to_crdt(&Document::new("hello world"));
+        let mut crdt_b = crdt_a.fork();
+        let mut a = crdt_to_document(&crdt_a);
+        let mut b = crdt_to_document(&crdt_b);
+        assert_eq!(a.text(), b.text());
+
+        // A 端编辑（含 CJK，验证字节→字符转换）
+        a.apply_and_sync(
+            crate::Edit::Insert {
+                at: 5,
+                text: " 你好".to_string(),
+            },
+            &mut crdt_a,
+        )
+        .unwrap();
+
+        // B 端状态向量 → A 端增量 → B 端应用
+        let sv_b = crdt_b.state_vector();
+        let diff = crdt_a.encode_diff(&sv_b).unwrap();
+        let changed = apply_remote(&mut b, &mut crdt_b, &diff).unwrap();
+        assert!(changed, "应有内容变化");
+        assert_eq!(a.text(), b.text(), "双端应收敛");
+        assert_eq!(b.text(), "hello 你好 world");
+
+        // 再次应用同一帧应无变化
+        let again = apply_remote(&mut b, &mut crdt_b, &diff).unwrap();
+        assert!(!again, "重复应用不应产生变化");
+    }
+
+    #[test]
+    fn remote_update_with_bad_bytes_errors() {
+        let mut doc = Document::new("x");
+        let mut crdt = document_to_crdt(&doc);
+        // 构造一个非法的更新帧（0xFF 不是合法的 v1 编码）
+        assert!(apply_remote(&mut doc, &mut crdt, &[0xFF, 0xFF]).is_err());
+        assert_eq!(doc.text(), "x", "失败不应修改文档");
     }
 }

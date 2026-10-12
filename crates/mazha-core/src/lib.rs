@@ -33,7 +33,7 @@ pub use selection::Selection;
 pub use workspace::{Workspace, WorkspaceError, WorkspaceResult};
 
 // CRDT 桥接（core → mazha-crdt）
-pub use crdt::{apply_edit_to_crdt, crdt_to_document, document_to_crdt};
+pub use crdt::{apply_edit_to_crdt, apply_remote, crdt_to_document, document_to_crdt};
 
 // 便捷重导出存储层类型（依赖方向 core → store）
 pub use mazha_store::{DocPath, StorageProvider};
