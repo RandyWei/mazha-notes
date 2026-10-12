@@ -1,0 +1,13 @@
+[package]
+name = "mazha-plugin"
+description = "码札 WASM 插件宿主：能力授权、存储插件桥、组件模型接口"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

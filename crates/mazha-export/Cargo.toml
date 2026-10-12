@@ -1,0 +1,13 @@
+[package]
+name = "mazha-export"
+description = "码札导出：源文本 → HTML / PDF（Typst）/ DOCX / EPUB，纯 Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

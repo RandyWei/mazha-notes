@@ -1,0 +1,13 @@
+[package]
+name = "mazha-crdt"
+description = "码札 CRDT 同步：基于 yrs 的 Y.Text 源文本、同步协议、合并"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

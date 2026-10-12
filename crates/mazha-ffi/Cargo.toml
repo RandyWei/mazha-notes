@@ -1,0 +1,13 @@
+[package]
+name = "mazha-ffi"
+description = "码札移动端 FFI：UniFFI 定义与绑定（Swift / Kotlin），鸿蒙走 NAPI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

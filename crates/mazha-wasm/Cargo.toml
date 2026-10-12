@@ -1,0 +1,13 @@
+[package]
+name = "mazha-wasm"
+description = "码札 Web 绑定：暴露 mazha-core 给浏览器（Phase 7，spike 后定方案）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 平台构建产物（见 SPEC §4.4）
+/platforms/desktop/build/
+/platforms/ios/build/
+/platforms/ios/DerivedData/
+/platforms/android/build/
+/platforms/android/.gradle/
+/platforms/harmony/build/
+/platforms/harmony/.hvigor/
+/platforms/harmony/oh_modules/
+/platforms/web/node_modules/
+/platforms/web/dist/
+node_modules/

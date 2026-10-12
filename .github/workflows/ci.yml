@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: Rust 核心（fmt + clippy + test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（rust-toolchain.toml）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt --check
+        run: cargo fmt --all --check
+
+      - name: clippy -D warnings
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: 校验核心 crate 不依赖 GUI（SPEC §4.1、§12.1）
+        run: |
+          cargo tree -p mazha-core > /tmp/mazha-core-tree.txt
+          if rg -qi "zed|egui|iced|tauri|winit|wry|gtk" /tmp/mazha-core-tree.txt; then
+            echo "mazha-core 依赖了 GUI 框架，违反 SPEC §4.1"; exit 1
+          fi
