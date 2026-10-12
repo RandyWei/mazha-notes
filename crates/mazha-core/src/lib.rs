@@ -17,6 +17,7 @@ mod intent;
 mod offset_map;
 mod projection;
 mod selection;
+mod workspace;
 
 pub use commands::{set_block, toggle_inline};
 pub use document::Document;
@@ -28,6 +29,10 @@ pub use projection::{
     BlockStyle, Bullet, ProjectedLine, Projection, RunStyle, TextRun, Widget, WidgetKind,
 };
 pub use selection::Selection;
+pub use workspace::{Workspace, WorkspaceError, WorkspaceResult};
+
+// 便捷重导出存储层类型（依赖方向 core → store）
+pub use mazha_store::{DocPath, StorageProvider};
 
 /// 核心 crate 版本号（编译期注入）。
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

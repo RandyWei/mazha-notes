@@ -306,8 +306,9 @@ pub struct ChangeSummary {
 > `OffsetMap`（src↔display 双向映射 + 稳定落点规则）、`Projection`（按逻辑行投影：
 > `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`）、`IntentMapper`（最小实现：
 > 回车列表续行/退出列表 + 切换转发）已落地（Phase 1，见 `crates/mazha-core`）。
-> `DocId`/`DocPath`（`DocPath` 落在 `mazha-store`，`DocId` 待定）、`Projection` 的**增量重建**、
+> `DocId`（待定）、`Projection` 的**增量重建**、
 > 更丰富的意图（缩进/自动配对/删除键合并）为后续迭代项。
+> `Workspace<S: StorageProvider>`（`open`/`save`/`list`，串联存储与文档）已落地。
 
 ### 6.2 `StorageProvider`（存储抽象）
 
@@ -583,6 +584,7 @@ interface Workspace {
 | 0.1.5 | 2026-10-12 | 落地 `Projection`（`mazha-core` 依赖 `mazha-md`）：按逻辑行投影出 `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`，`Document::projection()` 全量重建；13 条单测（累计 47）。确认决策 D23 并新增 `docs/ADR/ADR-001`（自研解析 vs pulldown-cmark 对比）；CI/AGENTS 的 clippy 升级为 `--all-targets` |
 | 0.1.6 | 2026-10-12 | 编辑命令：新增 `Edit::ToggleInline`/`ToggleBlock` + `InlineMark`/`BlockTarget`；`commands` 模块（行内包裹/解包裹、块前缀逐行增删/剥离）；`Document::apply` 解析切换命令并纳入 undo/redo；`IntentMapper` 最小实现（回车列表续行/递增序号/空项退出、切换转发）；22 条单测（累计 69）；SPEC §6.1 契约同步 |
 | 0.1.7 | 2026-10-12 | 落地 `mazha-store`：`StorageProvider`（同步，决策 D24）/`FileSystemProvider`/`DocPath`（校验+根路径）/`Entry`/`StorageCaps`/`StoreError`；12 条单测（累计 81）；SPEC §6.2 契约改为同步接口并记 D24 |
+| 0.1.8 | 2026-10-12 | `mazha-core` 依赖 `mazha-store`：落地 `Workspace<S: StorageProvider>`（`open`/`save`/`list`，UTF-8 校验、存储错误透传）；重导出 `DocPath`/`StorageProvider`；3 条单测（累计 84） |
 
 ---
 

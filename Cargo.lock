@@ -67,7 +67,9 @@ name = "mazha-core"
 version = "0.1.0"
 dependencies = [
  "mazha-md",
+ "mazha-store",
  "ropey",
+ "tempfile",
  "thiserror",
 ]
 
