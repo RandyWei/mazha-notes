@@ -499,6 +499,7 @@ interface Workspace {
 | D19 | 工具链 | Rust edition 2024，最新 stable | 确认 |
 | D20 | 代码高亮 | tree-sitter（gpui-kit 内置） | 确认 |
 | D21 | PDF 导出引擎 | Typst | 确认 |
+| D22 | 仓库可见性 | GitHub 私有，发布后转公开（AGPL-3.0） | 确认 |
 
 ---
 
