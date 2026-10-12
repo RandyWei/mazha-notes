@@ -7,7 +7,7 @@
 
 mod html;
 
-pub use html::to_html;
+pub use html::{DEFAULT_CSS, to_html, to_html_document};
 
 /// 支持的导出目标格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

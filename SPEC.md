@@ -588,6 +588,7 @@ interface Workspace {
 | 0.1.9 | 2026-10-12 | 落地 `mazha-export::to_html`：基于 `mazha-md` 块/片段模型渲染 HTML（标题/段落/引用/列表/任务表/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义）；11 条单测（累计 124）；SPEC §8 HTML 导出选型改为自研同源渲染 |
 | 0.1.10 | 2026-10-12 | `mazha-crdt` 基于 `yrs` 封装：`CrdtDoc`（`Y.Text` 根 `content`）、字符索引（UTF-8 字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛测试；6 条单测（累计 130） |
 | 0.1.11 | 2026-10-12 | `mazha-md` 新增 `serialize_source`/`to_md`（极简 AST→Markdown MVP）；补充 6 条回归测试（段落/标题/列表/代码块/引用/任务/行内/链接），修复链接序列化丢失 URL 的问题（`[text](url)` 整体重建）；累计 37 条（总计 141） |
+| 0.1.12 | 2026-10-12 | `mazha-export` 新增 `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）；3 条新单测（累计 14，总计 144） |
 
 ---
 

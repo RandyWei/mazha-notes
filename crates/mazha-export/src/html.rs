@@ -19,6 +19,45 @@ pub fn to_html(source: &str) -> String {
     out
 }
 
+/// 默认内联 CSS（极简排版）。
+pub const DEFAULT_CSS: &str = r#"body{max-width:42em;margin:2em auto;padding:0 1em;
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+line-height:1.6;color:#24292f}
+pre{background:#f6f8fa;padding:1em;overflow:auto}
+code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:.9em}
+code{background:#f6f8fa;padding:.2em .4em;border-radius:4px}
+pre code{background:none;padding:0}
+blockquote{margin:1em 0;padding:.5em 1em;color:#57606a;border-left:.25em solid #d0d7de;background:#f6f8fa}
+img{max-width:100%}
+table{border-collapse:collapse}
+th,td{border:1px solid #d0d7de;padding:.4em .8em}
+a{color:#0969da;text-decoration:none}
+a:hover{text-decoration:underline}
+"#;
+
+/// 把 Markdown 源文本渲染为完整 HTML5 文档（含 `<html>/<head>/<body>` 外壳）。
+///
+/// `title` 用于 `<title>` 标签（经 HTML 转义）；`css` 为 `None` 时使用
+/// [`DEFAULT_CSS`]，传 `Some("")` 可完全省略 `<style>`。
+pub fn to_html_document(source: &str, title: &str, css: Option<&str>) -> String {
+    let body = to_html(source);
+    let css = css.unwrap_or(DEFAULT_CSS);
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n\
+         <meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n\
+         <title>{title}</title>",
+        title = escape_attr(title)
+    );
+    if !css.is_empty() {
+        let _ = write!(out, "\n<style>\n{css}\n</style>");
+    }
+    let _ = write!(out, "\n</head>\n<body>\n{body}\n</body>\n</html>");
+    out
+}
+
 /// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项）。
 fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool) {
     for b in blocks {
@@ -316,5 +355,29 @@ mod tests {
     #[test]
     fn escapes_html() {
         assert_eq!(to_html("a < b & c\n"), "<p>a &lt; b &amp; c</p>");
+    }
+
+    #[test]
+    fn html_document_has_shell() {
+        let doc = to_html_document("# 标题\n", "测试", None);
+        assert!(doc.starts_with("<!DOCTYPE html>"));
+        assert!(doc.contains("<html lang=\"zh-CN\">"));
+        assert!(doc.contains("<meta charset=\"utf-8\">"));
+        assert!(doc.contains("<title>测试</title>"));
+        assert!(doc.contains("<style>"));
+        assert!(doc.contains("<h1>标题</h1>"));
+        assert!(doc.ends_with("</html>"));
+    }
+
+    #[test]
+    fn html_document_escapes_title() {
+        let doc = to_html_document("x\n", "<b>&", None);
+        assert!(doc.contains("<title>&lt;b&gt;&amp;</title>"));
+    }
+
+    #[test]
+    fn html_document_empty_css_omits_style() {
+        let doc = to_html_document("x\n", "t", Some(""));
+        assert!(!doc.contains("<style>"));
     }
 }

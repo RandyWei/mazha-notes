@@ -24,7 +24,7 @@ cargo test --workspace
 | `mazha-md` | ✅ 块级 + 行内 + 序列化（MVP） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`、`serialize_source/to_md`（极简 AST→Markdown） | 增量解析（脏块重解析）、完善 serialize 覆盖、往返一致性测试、表格/callout/wiki-link 等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | 🟡 MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、并发收敛 | 多文档/快照/持久化、字符索引统一封装 |
-| `mazha-export` | 🟡 HTML 完成 | `to_html`：基于 md 块/片段模型渲染（标题/段落/引用/列表/任务/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义） | PDF（Typst）、DOCX/EPUB、模板/主题 |
+| `mazha-export` | 🟡 HTML 完成 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：基于 md 块/片段模型渲染（标题/段落/引用/列表/任务/围栏代码/分割线 + 行内强调/粗体/删除线/代码/链接/自动链接/图片/换行，HTML 转义） | PDF（Typst）、DOCX/EPUB、模板/主题 |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -33,9 +33,9 @@ cargo test --workspace
 
 - `mazha-core`：72
 - `mazha-md`：37
-- `mazha-export`：11
+- `mazha-export`：14
 - `mazha-crdt`：6
-- 合计 **141** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **144** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -60,13 +60,8 @@ cargo test --workspace
 ## 提交历史（近期）
 
 ```
-322bd33 docs: 新增 HANDOFF.md 进度总览，并约定每次提交同步更新
-145a781 feat(core): Workspace 串联存储与文档（open/save/list）
-f68f2b3 feat(store): 本地文件系统 StorageProvider（同步接口，D24）
-334351e feat(core): 编辑命令 ToggleInline/ToggleBlock + IntentMapper
-90e5977 feat(core): 落地 Projection 投影层；确认 D23 并新增 ADR-001
-d24ce45 feat(md): 行内解析（强调/粗体/删除线/代码/链接/图片/转义）
-5f07fe3 feat(md): 起步 mazha-md 行扫描块级解析（16 单测）
-6438e2a feat(core): OffsetMap 显示↔源偏移双向映射
-0b5b997 feat(core): Phase 1 最小可用内核
+d917644 fix(md): 序列化修复链接 URL 丢失 + 补充行内/链接回归测试
+746202b test(md): serialize 更多回归（代码块/引用/任务）
+c7c04bf test(md): serialize 回归（段落/标题/列表）
+5e927c9 feat(crdt): yrs Y.Text 封装（字符索引 ↔ UTF-8 字节）
 ```
