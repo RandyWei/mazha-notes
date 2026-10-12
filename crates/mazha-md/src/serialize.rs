@@ -170,3 +170,29 @@ pub fn to_md(source: &str) -> String {
     let blocks = parse(source);
     serialize_source(source, &blocks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_md_paragraph() {
+        let s = "hello world\n";
+        let out = to_md(s);
+        assert!(out.contains("hello world"));
+    }
+
+    #[test]
+    fn to_md_heading() {
+        let out = to_md("# 标题\n");
+        assert!(out.contains("标题"));
+        assert!(out.starts_with('#'));
+    }
+
+    #[test]
+    fn to_md_list() {
+        let out = to_md("- a\n- b\n");
+        assert!(out.contains("- a"));
+        assert!(out.contains("- b"));
+    }
+}
