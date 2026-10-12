@@ -195,4 +195,23 @@ mod tests {
         assert!(out.contains("- a"));
         assert!(out.contains("- b"));
     }
+    #[test]
+    fn to_md_code_block() {
+        let out = to_md("```rust\nfn main(){}\n```\n");
+        assert!(out.contains("```"));
+        assert!(out.contains("fn main(){}"));
+    }
+
+    #[test]
+    fn to_md_blockquote() {
+        let out = to_md("> 引用\n");
+        assert!(out.contains('>'));
+    }
+
+    #[test]
+    fn to_md_task_list() {
+        let out = to_md("- [x] done\n- [ ] todo\n");
+        assert!(out.contains("[x]"));
+        assert!(out.contains("[ ]"));
+    }
 }
