@@ -227,12 +227,26 @@ pub struct ProjectedLine {
 }
 
 /// 显示偏移 ↔ 源偏移 双向映射（WYSIWYG 最关键的数据结构）
-pub struct OffsetMap { /* 段内区间映射表 */ }
+///
+/// 模型：一行文本划分为若干**可见区间**（连续可见字符的源字节范围），相邻区间之间是被
+/// 隐藏的语法标记（宽度 0）。光标只能在源文本的**字符边界**上落点，绝不会插进隐藏标记。
+/// 纯文本区间内 1 显示字符 = 1 源字符，故用"可见字符起始边界"数组即可精确双向映射。
+pub struct OffsetMap { /* 可见字符的 src_marks 与等长 disp_marks */ }
 
 impl OffsetMap {
+    /// 由"可见源区间"构造（隐藏区间=补集）。要求区间有序、不重叠、字符边界对齐，
+    /// 相邻区间自动合并。
+    pub fn from_visible_runs(source: &str, visible_runs: &[Range<usize>]) -> MapResult<Self>;
+    /// 源字节偏移 → 显示位置；落进隐藏标记时吸附到标记前（最近显示边界）。
     pub fn source_to_display(&self, src: usize) -> DisplayPos;
+    /// 显示位置 → 源字节偏移；交叉点取源偏移更小者（=隐藏标记起点，稳定落点）。
     pub fn display_to_source(&self, disp: DisplayPos) -> usize;
+    /// 整行显示宽度（可见字符总数）。
+    pub fn display_len(&self) -> usize;
 }
+
+/// 显示位置：显示文本中的字符索引（newtype）。
+pub struct DisplayPos(pub usize);
 
 /// 光标/选区均以源偏移表示
 pub struct Selection { pub anchor: usize, pub head: usize }
@@ -259,9 +273,9 @@ pub struct ChangeSummary {
 ```
 
 > **实现状态**：`Edit`（Insert/Delete/Replace）、`Document`（rope + 边界校验 +
-> undo/redo + 字节/字符边界导航）、`Selection`、`ChangeSummary` 已落地（Phase 1 最小内核，22
-> 条单测，见 `crates/mazha-core`）。`ToggleInline`/`ToggleBlock`、`OffsetMap`/`Projection`、
-> `DocId`/`DocPath` 为后续迭代项。
+> undo/redo + 字节/字符边界导航）、`Selection`、`ChangeSummary`、`OffsetMap`
+> （src↔display 双向映射 + 稳定落点规则）已落地（Phase 1，见 `crates/mazha-core`）。
+> `ToggleInline`/`ToggleBlock`、`Projection`、`DocId`/`DocPath` 为后续迭代项。
 
 ### 6.2 `StorageProvider`（存储抽象）
 
@@ -524,6 +538,7 @@ interface Workspace {
 |------|------|----------|
 | 0.1 | 2026-10-12 | 初始规范（规划版）：完成平台矩阵、总体架构、核心模块与契约草案、里程碑与决策记录 |
 | 0.1.1 | 2026-10-12 | Phase 1 启动：落地 `mazha-core` 最小可用内核（Document/Edit/Selection/ChangeSummary + undo/redo + 边界校验），契约 §6.1 同步实现态签名；接入 ropey 1.6 + thiserror 2；新增约定 AGENTS.md（规范驱动 + 必备注释 + CI 命令） |
+| 0.1.2 | 2026-10-12 | 内核迭代：落地 `OffsetMap`（可见区间模型 + src↔display 双向映射 + 交叉点稳定落点规则），契约 §6.1 补充实现细节；12 条新单测 |
 
 ---
 
