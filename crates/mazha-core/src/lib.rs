@@ -13,12 +13,16 @@ mod document;
 mod edit;
 mod error;
 mod offset_map;
+mod projection;
 mod selection;
 
 pub use document::Document;
 pub use edit::{ChangeSummary, Edit};
 pub use error::{EditError, Result};
 pub use offset_map::{DisplayPos, OffsetMap, OffsetMapError};
+pub use projection::{
+    BlockStyle, Bullet, ProjectedLine, Projection, RunStyle, TextRun, Widget, WidgetKind,
+};
 pub use selection::Selection;
 
 /// 核心 crate 版本号（编译期注入）。

@@ -213,17 +213,41 @@ pub trait IntentMapper {
     fn map(&self, intent: &Intent, doc: &Document) -> Vec<Edit>;
 }
 
-/// 渲染投影：UI 只消费它，不再自己解析 Markdown
+/// 渲染投影：UI 只消费它，不再自己解析 Markdown（按源文本逻辑行 + 末尾空行）
 pub struct Projection {
-    pub lines: Vec<ProjectedLine>,   // 每逻辑行
+    pub lines: Vec<ProjectedLine>,
 }
 
 pub struct ProjectedLine {
-    pub source_range: Range<usize>,  // 本行在源文本中的字节范围
-    pub block: BlockStyle,           // 段落/标题N/引用/代码块/列表项/表格行…
-    pub runs: Vec<TextRun>,          // 带样式的文本片段（已隐藏语法标记）
-    pub widgets: Vec<Widget>,        // 图片/公式/图表/表格/任务复选框等占位
+    pub source_range: Range<usize>,  // 本行在源文本中的字节范围（不含行尾换行）
+    pub block: BlockStyle,           // 块样式（标题级别/引用深度/列表/任务/代码块/分割线）
+    pub runs: Vec<TextRun>,          // 带样式的可见文本片段（已隐藏语法标记）
+    pub widgets: Vec<Widget>,        // 图片/公式/图表等占位
     pub offset_map: OffsetMap,       // 显示位置 ↔ 源偏移
+}
+
+/// 块样式（容器样式可叠加，如"引用中的列表项"）
+pub struct BlockStyle {
+    pub quote_depth: u8,
+    pub heading: Option<u8>,         // 1..=6
+    pub bullet: Option<Bullet>,      // 列表项符号（有序/无序 + 序号）
+    pub task: Option<bool>,          // 任务项状态
+    pub code_block: bool,
+    pub code_lang: Option<String>,
+    pub thematic_break: bool,
+}
+
+pub struct TextRun {
+    pub source_range: Range<usize>,  // 连续可见文本的源字节范围
+    pub display_start: usize,        // 首字符的显示字符列
+    pub style: RunStyle,             // Normal/Emphasis/Strong/Strikethrough/InlineCode/LinkText
+    pub text: String,                // 可见文本
+}
+
+pub struct Widget {                  // 内联占位（源文本隐藏，UI 绘制）
+    pub source_range: Range<usize>,
+    pub display_col: usize,
+    pub kind: WidgetKind,            // Image { alt } …
 }
 
 /// 显示偏移 ↔ 源偏移 双向映射（WYSIWYG 最关键的数据结构）
@@ -273,9 +297,12 @@ pub struct ChangeSummary {
 ```
 
 > **实现状态**：`Edit`（Insert/Delete/Replace）、`Document`（rope + 边界校验 +
-> undo/redo + 字节/字符边界导航）、`Selection`、`ChangeSummary`、`OffsetMap`
-> （src↔display 双向映射 + 稳定落点规则）已落地（Phase 1，见 `crates/mazha-core`）。
-> `ToggleInline`/`ToggleBlock`、`Projection`、`DocId`/`DocPath` 为后续迭代项。
+> undo/redo + 字节/字符边界导航 + `projection()` 全量重建）、`Selection`、
+> `ChangeSummary`、`OffsetMap`（src↔display 双向映射 + 稳定落点规则）、
+> `Projection`（按逻辑行投影：`BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`）
+> 已落地（Phase 1，见 `crates/mazha-core`）。
+> `ToggleInline`/`ToggleBlock`、`IntentMapper`、`DocId`/`DocPath`、
+> `Projection` 的**增量重建**为后续迭代项。
 
 ### 6.2 `StorageProvider`（存储抽象）
 
@@ -529,7 +556,7 @@ interface Workspace {
 | D20 | 代码高亮 | tree-sitter（gpui-kit 内置） | 确认 |
 | D21 | PDF 导出引擎 | Typst | 确认 |
 | D22 | 仓库可见性 | GitHub 私有，发布后转公开（AGPL-3.0） | 确认 |
-| D23 | Markdown 解析实现 | 自研行扫描（块级）+ 自研行内扫描，精确字节偏移；`pulldown-cmark` 降为 dev 依赖（测试对照/后续 HTML 导出参考） | 待确认 |
+| D23 | Markdown 解析实现 | 自研行扫描（块级）+ 自研行内扫描，精确字节偏移；`pulldown-cmark` 降为 dev 依赖（测试对照/后续 HTML 导出参考） | 确认（见 `docs/ADR/ADR-001`） |
 
 ---
 
@@ -542,6 +569,7 @@ interface Workspace {
 | 0.1.2 | 2026-10-12 | 内核迭代：落地 `OffsetMap`（可见区间模型 + src↔display 双向映射 + 交叉点稳定落点规则），契约 §6.1 补充实现细节；12 条新单测 |
 | 0.1.3 | 2026-10-12 | `mazha-md` 起步：行扫描块级解析（ATX/Setext 标题、段落、分割线、围栏代码、引用、有序/无序/任务列表）+ `SyntaxSpan`/`visible_runs`；决策 D23（自研行扫描，pulldown-cmark 降为 dev 依赖）与 §8 选型更新；16 条单测 |
 | 0.1.4 | 2026-10-12 | `mazha-md` 行内解析：强调/粗体/删除线（递归嵌套 + 颜色继承）、行内代码（等长反引号 + 空格修剪）、链接（URL 隐藏）、图片（Widget 占位）、转义、自动链接；接入段落/标题叶子块；硬换行标记；13 条单测（累计 29） |
+| 0.1.5 | 2026-10-12 | 落地 `Projection`（`mazha-core` 依赖 `mazha-md`）：按逻辑行投影出 `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`，`Document::projection()` 全量重建；13 条单测（累计 47）。确认决策 D23 并新增 `docs/ADR/ADR-001`（自研解析 vs pulldown-cmark 对比）；CI/AGENTS 的 clippy 升级为 `--all-targets` |
 
 ---
 

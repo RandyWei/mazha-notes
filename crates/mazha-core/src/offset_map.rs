@@ -200,6 +200,7 @@ impl OffsetMap {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // 测试里大量单区间数组是刻意写法，非笔误
 mod tests {
     use super::*;
 

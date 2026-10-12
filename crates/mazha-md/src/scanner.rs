@@ -717,7 +717,7 @@ mod tests {
             let blocks = parse(s);
             assert_eq!(blocks.len(), 1, "{s:?}");
             assert_eq!(blocks[0].kind, BlockKind::ThematicBreak);
-            assert!(blocks[0].spans[0].role == SpanRole::ThematicBreak);
+            assert_eq!(blocks[0].spans[0].role, SpanRole::ThematicBreak);
         }
     }
 

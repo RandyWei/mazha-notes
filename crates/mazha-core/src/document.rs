@@ -70,6 +70,14 @@ impl Document {
         self.text.to_string()
     }
 
+    /// 生成整篇渲染投影（隐藏语法标记，供 UI 直接渲染）。
+    ///
+    /// 当前实现为**全量重建**（解析 + 逐行投影）；后续迭代将按
+    /// [`ChangeSummary`] 的受影响范围只重建脏行。
+    pub fn projection(&self) -> crate::Projection {
+        crate::projection::build(&self.text())
+    }
+
     /// 返回字节范围 `range` 内的文本（`Cow`：连续 chunk 时零拷贝借用，否则拷贝）。
     ///
     /// # Panics
@@ -361,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)] // 刻意构造倒序区间以验证错误路径
     fn delete_invalid_ranges_error() {
         let mut d = doc("abc");
         assert_eq!(
