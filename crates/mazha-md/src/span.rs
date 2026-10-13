@@ -43,6 +43,8 @@ pub enum SpanRole {
     HeadingMarker,
     /// 引用 `>` 前缀。
     QuoteMarker,
+    /// 提示块标记 `[!NOTE]`（渲染时隐藏）。
+    CalloutMarker,
     /// 列表项 `-`/`1.` 前缀。
     ListMarker,
     /// 任务列表复选框 `[ ]`/`[x]`。

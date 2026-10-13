@@ -90,6 +90,22 @@ fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
             }
             prefix_lines(&inner, prefix)
         }
+        BlockKind::Callout { kind, title } => {
+            // 提示块：首行 "> [!TYPE]"（+ 可选标题），后续子块同引用加 "> " 前缀
+            let mut inner = String::new();
+            inner.push_str("> [!");
+            inner.push_str(kind.as_str());
+            inner.push(']');
+            if let Some(t) = title {
+                inner.push(' ');
+                inner.push_str(t);
+            }
+            inner.push('\n');
+            for ch in &b.children {
+                inner.push_str(&block_to_md(source, ch, "> "));
+            }
+            prefix_lines(&inner, prefix)
+        }
         BlockKind::List { ordered, start } => {
             let mut s = String::new();
             for (i, item) in b.children.iter().enumerate() {

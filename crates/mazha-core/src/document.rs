@@ -1169,4 +1169,15 @@ mod tests {
         assert_projection_matches(&mut d, "表格追加行");
         assert_eq!(d.projection().lines.len(), 4);
     }
+
+    #[test]
+    fn callout_projects_as_quote_depth() {
+        let mut d = doc("> [!NOTE]\n> 内容");
+        assert_projection_matches(&mut d, "提示块");
+        let proj = d.projection();
+        // 2 行：标记行（隐藏）+ 内容行；内容行 quote_depth = 1
+        assert_eq!(proj.lines.len(), 2);
+        assert_eq!(proj.lines[1].display_text(), "内容");
+        assert_eq!(proj.lines[1].block.quote_depth, 1, "提示块按引用深度投影");
+    }
 }

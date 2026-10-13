@@ -19,6 +19,13 @@ pub enum BlockKind {
     },
     /// 引用块（容器）。
     BlockQuote,
+    /// 提示块（容器，`> [!NOTE]` 语法）。
+    Callout {
+        /// 提示块类型。
+        kind: CalloutKind,
+        /// 自定义标题（`> [!NOTE] 自定义标题` 时非空，否则用默认标题）。
+        title: Option<String>,
+    },
     /// 列表容器。
     List {
         /// 是否有序列表。
@@ -56,6 +63,49 @@ pub enum Align {
     Center,
     /// 右对齐。
     Right,
+}
+
+/// 提示块类型（GitHub 五种 + 自定义）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalloutKind {
+    /// 说明（默认）。
+    Note,
+    /// 技巧。
+    Tip,
+    /// 重要。
+    Important,
+    /// 警告。
+    Warning,
+    /// 注意。
+    Caution,
+    /// 自定义类型名（如 `> [!BUG]`）。
+    Custom(String),
+}
+
+impl CalloutKind {
+    /// 从标记名解析（大小写不敏感）；未知名归入 [`Custom`](Self::Custom)。
+    pub fn parse(name: &str) -> Self {
+        match name.to_ascii_uppercase().as_str() {
+            "NOTE" => Self::Note,
+            "TIP" => Self::Tip,
+            "IMPORTANT" => Self::Important,
+            "WARNING" => Self::Warning,
+            "CAUTION" => Self::Caution,
+            _ => Self::Custom(name.to_string()),
+        }
+    }
+
+    /// 标记名（用于序列化回 `[!NAME]`）。
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Note => "NOTE",
+            Self::Tip => "TIP",
+            Self::Important => "IMPORTANT",
+            Self::Warning => "WARNING",
+            Self::Caution => "CAUTION",
+            Self::Custom(s) => s,
+        }
+    }
 }
 
 /// 一个块。
@@ -101,7 +151,10 @@ impl Block {
     pub fn is_container(&self) -> bool {
         matches!(
             self.kind,
-            BlockKind::BlockQuote | BlockKind::List { .. } | BlockKind::ListItem { .. }
+            BlockKind::BlockQuote
+                | BlockKind::Callout { .. }
+                | BlockKind::List { .. }
+                | BlockKind::ListItem { .. }
         )
     }
 }

@@ -13,7 +13,7 @@ mod inline;
 mod scanner;
 mod span;
 
-pub use block::{Align, Block, BlockKind};
+pub use block::{Align, Block, BlockKind, CalloutKind};
 pub use incremental::reparse;
 pub use inline::parse_inline;
 pub use scanner::parse;

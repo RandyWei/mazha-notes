@@ -365,7 +365,7 @@ struct StyleCtx {
 fn assign_style(block: &Block, ctx: &StyleCtx, lines: &[Line], styles: &mut [BlockStyle]) {
     if block.is_container() {
         match &block.kind {
-            BlockKind::BlockQuote => {
+            BlockKind::BlockQuote | BlockKind::Callout { .. } => {
                 let mut inner = ctx.clone();
                 inner.quote_depth = inner.quote_depth.saturating_add(1);
                 for c in &block.children {

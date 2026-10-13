@@ -206,6 +206,21 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
             render_blocks(source, &block.children, out, false);
             out.push_str("</blockquote>");
         }
+        BlockKind::Callout { kind, title } => {
+            // 提示块：GitHub 风格 <div class="callout callout-note">
+            let type_name = kind.as_str().to_ascii_lowercase();
+            let _ = write!(out, "<div class=\"callout callout-{type_name}\">");
+            // 标题：自定义优先，否则用类型默认名
+            let heading = title.as_deref().unwrap_or_else(|| kind.as_str());
+            let _ = write!(
+                out,
+                "<div class=\"callout-title\">{}</div>",
+                escape_text(heading)
+            );
+            out.push_str("<div class=\"callout-content\">");
+            render_blocks(source, &block.children, out, false);
+            out.push_str("</div></div>");
+        }
         BlockKind::List { ordered, start } => {
             if *ordered {
                 if *start == 1 {
@@ -521,5 +536,42 @@ mod tests {
         // 只有表头（无数据行）：仍应产出合法 table/thead
         let html = to_html("| a |\n| --- |\n");
         assert_eq!(html, "<table><thead><tr><th>a</th></tr></thead></table>");
+    }
+
+    #[test]
+    fn html_callout_note() {
+        let html = to_html("> [!NOTE]\n> 内容\n");
+        assert_eq!(
+            html,
+            "<div class=\"callout callout-note\">\
+             <div class=\"callout-title\">NOTE</div>\
+             <div class=\"callout-content\"><p>内容</p></div></div>"
+        );
+    }
+
+    #[test]
+    fn html_callout_custom_title() {
+        let html = to_html("> [!TIP] 自定义\n> 内容\n");
+        assert!(html.contains("callout-tip"));
+        assert!(html.contains("<div class=\"callout-title\">自定义</div>"));
+        assert!(html.contains("<p>内容</p>"));
+    }
+
+    #[test]
+    fn html_callout_custom_type() {
+        let html = to_html("> [!BUG]\n> 内容\n");
+        assert!(html.contains("callout-bug"));
+    }
+
+    #[test]
+    fn html_callout_escapes_title() {
+        let html = to_html("> [!NOTE] <b>\n> 内容\n");
+        assert!(html.contains("<div class=\"callout-title\">&lt;b&gt;</div>"));
+    }
+
+    #[test]
+    fn html_quote_without_marker_is_blockquote() {
+        let html = to_html("> 普通引用\n");
+        assert!(html.contains("<blockquote>"));
     }
 }

@@ -7,7 +7,7 @@
 //! MVP 支持的块：ATX/Setext 标题、段落、分割线、围栏/缩进代码块、引用、列表
 //! （有序/无序/任务）。表格、脚注、HTML 块、惰性续行等留待后续迭代。
 
-use crate::block::{Align, Block, BlockKind};
+use crate::block::{Align, Block, BlockKind, CalloutKind};
 use crate::span::{SpanRole, SyntaxSpan};
 
 /// 一行（去除换行后）在源文本中的位置。
@@ -228,6 +228,29 @@ fn quote_prefix(rest: &str) -> Option<usize> {
         n += 1;
     }
     Some(n)
+}
+
+/// 解析提示块标记 `[!TYPE]` + 可选自定义标题。
+///
+/// `rest` 是引用前缀剥离后的内容。返回 `(kind, title, marker_byte_len)`；
+/// `marker_byte_len` 是 `[!TYPE]` 部分的字节长度（不含标题）。
+fn parse_callout_marker(rest: &str) -> Option<(CalloutKind, Option<String>, usize)> {
+    if !rest.starts_with("[!") {
+        return None;
+    }
+    let close = rest.find(']')?;
+    let name = &rest[2..close];
+    if name.is_empty() {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    let after_trimmed = after.trim_start();
+    let title = if after_trimmed.is_empty() {
+        None
+    } else {
+        Some(after_trimmed.trim_end().to_string())
+    };
+    Some((CalloutKind::parse(name), title, close + 1))
 }
 
 /// 列表项标记信息。
@@ -615,6 +638,7 @@ fn build_block_quote(source: &str, lines: &[Line], start_idx: usize) -> (Block, 
     let first_start = lines[start_idx].start;
     let mut last_end = lines[start_idx].end;
     let mut i = start_idx;
+    let mut callout: Option<(CalloutKind, Option<String>)> = None;
     while i < lines.len() {
         let l = lines[i];
         let rest = l.rest(source);
@@ -625,22 +649,42 @@ fn build_block_quote(source: &str, lines: &[Line], start_idx: usize) -> (Block, 
             l.content..l.content + consumed,
             SpanRole::QuoteMarker,
         ));
+        let content_start = l.content + consumed;
+        // 仅在第一行检查提示块标记 `[!TYPE]`
+        if i == start_idx && callout.is_none() {
+            let content = &source[content_start..l.end];
+            if let Some((kind, title, marker_len)) = parse_callout_marker(content) {
+                callout = Some((kind, title));
+                spans.push(SyntaxSpan::marker(
+                    content_start..content_start + marker_len,
+                    SpanRole::CalloutMarker,
+                ));
+                // 标题部分已单独存储，不作为内容行；第一行内容置空
+                inner.push(Line {
+                    start: l.start,
+                    end: l.end,
+                    content: l.end,
+                });
+                last_end = l.end;
+                i += 1;
+                continue;
+            }
+        }
         inner.push(Line {
             start: l.start,
             end: l.end,
-            content: l.content + consumed,
+            content: content_start,
         });
         last_end = l.end;
         i += 1;
     }
     let children = scan_blocks(source, &inner);
+    let kind = match callout {
+        Some((kind, title)) => BlockKind::Callout { kind, title },
+        None => BlockKind::BlockQuote,
+    };
     (
-        Block::container(
-            BlockKind::BlockQuote,
-            first_start..last_end,
-            spans,
-            children,
-        ),
+        Block::container(kind, first_start..last_end, spans, children),
         i,
     )
 }
@@ -1100,5 +1144,112 @@ mod table_tests {
         // 单元格内转义竖线不算分隔
         let b = table("| a | b |\n| - | - |\n| x \\| y | z |\n");
         assert!(matches!(b.kind, BlockKind::Table { .. }));
+    }
+}
+
+#[cfg(test)]
+mod callout_tests {
+    use super::*;
+    use crate::serialize::to_md;
+    use crate::span::SpanKind;
+
+    fn block(src: &str) -> Block {
+        parse(src).into_iter().next().expect("至少一个块")
+    }
+
+    #[test]
+    fn callout_parse_note() {
+        let b = block("> [!NOTE]\n> 内容\n");
+        assert!(matches!(
+            b.kind,
+            BlockKind::Callout {
+                kind: CalloutKind::Note,
+                ..
+            }
+        ));
+        assert_eq!(b.children.len(), 1);
+        assert_eq!(b.children[0].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn callout_parse_custom_title() {
+        let b = block("> [!TIP] 自定义标题\n> 内容\n");
+        assert!(matches!(
+            b.kind,
+            BlockKind::Callout {
+                kind: CalloutKind::Tip,
+                ..
+            }
+        ));
+        // title 是 Option<String>
+        if let BlockKind::Callout { title, .. } = &b.kind {
+            assert_eq!(title.as_deref(), Some("自定义标题"));
+        } else {
+            panic!("应为 Callout");
+        }
+    }
+
+    #[test]
+    fn callout_parse_case_insensitive() {
+        let b = block("> [!warning]\n> 内容\n");
+        assert!(matches!(
+            b.kind,
+            BlockKind::Callout {
+                kind: CalloutKind::Warning,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn callout_parse_custom_type() {
+        let b = block("> [!BUG]\n> 内容\n");
+        assert!(matches!(
+            b.kind,
+            BlockKind::Callout {
+                kind: CalloutKind::Custom(ref s),
+                ..
+            } if s == "BUG"
+        ));
+    }
+
+    #[test]
+    fn callout_marker_span_hidden() {
+        let src = "> [!NOTE]\n> 内容\n";
+        let b = parse(src).into_iter().next().expect("至少一个块");
+        let marker = b
+            .spans
+            .iter()
+            .find(|s| s.role == SpanRole::CalloutMarker)
+            .expect("应有 CalloutMarker 片段");
+        assert_eq!(marker.kind, SpanKind::Marker);
+        assert_eq!(&src[marker.range.clone()], "[!NOTE]");
+    }
+
+    #[test]
+    fn callout_roundtrip() {
+        let src = "> [!NOTE]\n> 内容\n";
+        let md = to_md(src);
+        assert_eq!(md, src);
+    }
+
+    #[test]
+    fn callout_roundtrip_custom_title() {
+        let src = "> [!TIP] 自定义\n> 内容\n";
+        let md = to_md(src);
+        assert_eq!(md, src);
+    }
+
+    #[test]
+    fn quote_without_marker_stays_blockquote() {
+        let b = block("> 普通引用\n");
+        assert_eq!(b.kind, BlockKind::BlockQuote);
+    }
+
+    #[test]
+    fn callout_empty_name_rejected() {
+        // `[!]` 空名不算 callout，仍是普通引用
+        let b = block("> [!]\n> 内容\n");
+        assert_eq!(b.kind, BlockKind::BlockQuote);
     }
 }
