@@ -598,6 +598,7 @@ interface Workspace {
 | 0.1.19 | 2026-10-12 | `Projection::refresh` 增量刷新：定位脏行 → 样式全量重算 + 只重建脏行 runs/`OffsetMap` → 后续旧行整体平移源坐标（`OffsetMap::shift`、`ProjectedLine::shifted`）；`Document` 持有投影缓存，`projection()` 改为 `&mut self -> &Projection` 并随编辑增量刷新；新增内部辅助 `old_range_of`/`new_range_of`（精确旧/新坐标对，修正 `Edit::source_range` 插入语义）；2 条"增量==全量"逐字段比对测试（6 类编辑 + 撤销/重做 + OffsetMap 双向换算逐点一致）；core 87（总计 172） |
 | 0.1.20 | 2026-10-12 | `IntentMapper` 增强：新增 `Intent::Indent`（块级缩进/反缩进——选区扩展到整行，单个原子 `Replace`，一次一级=两空格或一个制表符，无改动则不产出编辑）与 `Intent::DeletePair`（光标位于空配对符号 `()[]{}""''``**__~~` 之间时成对退格）；10 条新测试；core 97（总计 182） |
 | 0.1.21 | 2026-10-12 | `mazha-md` 序列化重写（嵌套结构正确性）：引入**前缀穿线**（`block_to_md(source, block, prefix)` + `prefix_lines` 逐行补前缀），修复嵌套列表无缩进、多行引用/段落续行漏前缀两处真实缺陷；顶层块间空行分隔、结果单换行收尾；新增 9 条往返测试（嵌套有序/无序/任务/引用、混合文档结构保持、规范化输入逐字节往返 + 幂等性）；md 57（总计 191） |
+| 0.1.22 | 2026-10-12 | `mazha-crdt` 新增 `push()`（末尾追加）与 `snapshot()`（快照压缩：CRDT 历史清零、文本保留，把更新帧体积从 O(历史) 收敛到 O(文本)），并明确压缩与远端同步的兼容性代价；3 条新测试（体积显著下降、快照后续编辑、fork 与 snapshot 的历史差异）；crdt 11（总计 194） |
 
 ---
 

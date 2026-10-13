@@ -60,8 +60,8 @@ impl CrdtDoc {
 
     /// 克隆一份 **CRDT 状态相同** 的独立文档（同一文档在另一端的副本）。
     ///
-    /// 用于多端同步：各端从同一持久化状态出发，各自持有自己的 `CrdtDoc`，
-    /// 之后通过状态向量/增量更新互相收敛。
+    /// 与 [`CrdtDoc::snapshot`] 的区别：`fork` 保留完整 CRDT 历史（可与原文档
+    /// 无缝互相同步）；`snapshot` 只保留当前文本快照（历史清零）。
     ///
     /// # Panics
     /// 理论上不会 panic：自身的更新帧必然可被自身状态构成的更新解码。
@@ -73,10 +73,35 @@ impl CrdtDoc {
         me
     }
 
+    /// 生成当前文本的**快照文档**（CRDT 历史清零）。
+    ///
+    /// 用途：更新帧文件会随编辑历史**无限增长**（每次插入/删除都留下记录），
+    /// 定期用快照替换可把存储收敛到 O(文本长度)。
+    ///
+    /// 代价：快照是新的 CRDT 文档（新身份），因此
+    /// - 与快照**之前**的旧状态向量/更新帧不再兼容（远端需要重新全量同步）；
+    /// - 快照后未同步的本地并发编辑若以旧帧发给快照后的文档，会被当作
+    ///   "另一个文档的内容"合并进来（理论上不丢数据，但顺序可能与预期不同）。
+    ///
+    /// 因此：**仅在确认没有待同步的远端**（或愿意重新全量同步）时压缩。
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        Self::from_text(&self.text())
+    }
+
     /// 当前文本的 **UTF-8 字节** 长度（yrs 原生单位）。
     pub fn byte_len(&self) -> u32 {
         let txn = self.doc.transact();
         self.root.len(&txn)
+    }
+
+    /// 在末尾追加 `chunk`（等价于 `insert(当前字符数, chunk)`）。
+    ///
+    /// # Errors
+    /// 越界时返回 [`CrdtError`]（正常情况下不会）。
+    pub fn push(&mut self, chunk: &str) -> CrdtResult<()> {
+        let idx = self.text().chars().count();
+        self.insert(idx, chunk)
     }
 
     /// 在字符索引 `index` 处插入 `chunk`。
@@ -278,4 +303,57 @@ fn fork_then_concurrent_inserts() {
     a.apply_update(&ub).unwrap();
     b.apply_update(&ua).unwrap();
     assert_eq!(a.text(), b.text());
+}
+
+#[test]
+fn snapshot_compacts_update_size() {
+    // 反复编辑会让更新帧不断变大；快照应把体积收敛到 O(文本长度)
+    let mut d = CrdtDoc::new();
+    for i in 0..50 {
+        let at = d.text().chars().count();
+        d.insert(at, &format!("第 {i} 行内容\n")).unwrap();
+        // 每轮再删掉几个字符，制造大量历史
+        let len = d.text().chars().count();
+        if len > 4 {
+            d.delete(len - 3, 3).unwrap();
+        }
+    }
+    let text = d.text();
+    let fat = d.encode_update();
+    let snap = d.snapshot();
+    assert_eq!(snap.text(), text, "快照必须保留当前文本");
+    let slim = snap.encode_update();
+    assert!(
+        slim.len() * 2 < fat.len(),
+        "快照应显著压缩：fat={} slim={}",
+        fat.len(),
+        slim.len()
+    );
+}
+
+#[test]
+fn snapshot_keeps_text_and_accepts_new_edits() {
+    let mut d = CrdtDoc::from_text("你好**世界**");
+    d.insert(0, "> ").unwrap();
+    d.delete(3, 4).unwrap();
+    let snap = d.snapshot();
+    assert_eq!(snap.text(), d.text());
+    // 快照继续编辑：本地自洽
+    let mut snap = snap;
+    snap.push("!").unwrap();
+    assert_eq!(snap.text(), format!("{}!", d.text()));
+}
+
+#[test]
+fn fork_and_snapshot_differ_in_history() {
+    let mut a = CrdtDoc::from_text("ab");
+    let fork_b = a.fork();
+    let snap_c = a.snapshot();
+    // fork 保留身份：可同步
+    a.insert(1, "X").unwrap();
+    let mut b = fork_b;
+    b.apply_update(&a.encode_update()).unwrap();
+    assert_eq!(a.text(), b.text());
+    // 快照是全新文档：文本相同但不共享历史
+    assert_eq!(snap_c.text(), "ab");
 }
