@@ -1142,4 +1142,31 @@ mod tests {
         let d = doc("");
         assert_eq!(d.word_range_at(0), 0..0);
     }
+
+    #[test]
+    fn table_projects_with_visible_pipes_and_hidden_delimiter() {
+        let mut d = doc("| a | b |\n| --- | --- |\n| 1 | 2 |");
+        let proj = d.projection();
+        // 3 行：表头 / 分隔行（隐藏）/ 数据行（无尾随换行）
+        assert_eq!(proj.lines.len(), 3);
+        // 显示文本 = 可见片段拼接：竖线（可见）+ 单元格内容（trim 后）；空格被裁掉
+        assert_eq!(proj.lines[0].display_text(), "|a|b|");
+        assert_eq!(proj.lines[1].display_text(), "", "分隔行整行隐藏");
+        assert_eq!(proj.lines[2].display_text(), "|1|2|");
+    }
+
+    #[test]
+    fn table_edit_keeps_projection_consistent() {
+        let mut d = doc("| a | b |\n| --- | --- |\n| 1 | 2 |");
+        assert_projection_matches(&mut d, "表格初始");
+        // 追加一行 → 增量刷新后仍与全量一致
+        let at = d.len();
+        d.apply(Edit::Insert {
+            at,
+            text: "\n| 3 | 4 |".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "表格追加行");
+        assert_eq!(d.projection().lines.len(), 4);
+    }
 }

@@ -602,6 +602,7 @@ interface Workspace {
 | 0.1.23 | 2026-10-12 | `Document` 导航助手（供 UI 光标操作/双击选词）：`line_range_of`（逻辑行范围，换行符位置归前一行、EOF 后为空行）与 `word_range_at`（CJK 感知——ASCII 词 `[0-9A-Za-z_'-]`、CJK 连续段成词，两侧词互不粘连，光标紧贴词的一侧归该词，空白/标点处为空区间；多字节中部偏移先吸附）；9 条新测试；core 106（总计 203） |
 | 0.1.24 | 2026-10-12 | ① `Intent::InsertText` 改为携带**选区**（空区间=纯插入，非空=覆盖替换为原子 `Replace`，一次 undo 还原）+ 新增 `Intent::DeleteSelection`；② `Workspace` 文件管理 API：`create`（`read()` 探测存在性，父目录不存在也能建）、`remove`、`rename`、`list_markdown`（只列 `.md`/`.markdown` 文件）、`find_markdown`；8 条新测试；core 114（总计 211） |
 | 0.1.25 | 2026-10-12 | **GFM 表格**支持（方言声明的核心特性补齐）：`BlockKind::Table { align: Vec<Align> }` + `Align`；解析要求"表头行含 `|` + 分隔行 `-`/`:` + 连续数据行"，分隔行决定列数与对齐，单元格按行内语法解析，竖线为可见 `TablePipe`、分隔行为隐藏 `TableDelim`；序列化按对齐重写分隔行（紧跟表头）；HTML 导出真 `<table>/<thead>/<tbody>` + 列对齐样式；投影侧表格行即普通行（竖线可见）；8 + 5 条新测试（含转义竖线、仅表头、字节往返）；md 65 + export 19（总计 224） |
+| 0.1.26 | 2026-10-12 | 表格投影验证：`Document` 层补 2 条测试——① 表格投影显示文本为可见片段拼接（竖线可见、分隔行整行隐藏为空、单元格内容 trim 后无空格）；② 追加表格行后增量刷新投影与全量重建逐字段一致（`assert_projection_matches`）。core 116（总计 226） |
 
 ---
 
