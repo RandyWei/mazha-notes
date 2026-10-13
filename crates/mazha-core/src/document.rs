@@ -1180,4 +1180,14 @@ mod tests {
         assert_eq!(proj.lines[1].display_text(), "内容");
         assert_eq!(proj.lines[1].block.quote_depth, 1, "提示块按引用深度投影");
     }
+
+    #[test]
+    fn frontmatter_projects_as_empty_lines() {
+        let mut d = doc("---\ntitle: x\n---\n正文");
+        assert_projection_matches(&mut d, "front-matter");
+        let proj = d.projection();
+        // front-matter 无片段 → 显示为空；正文正常
+        let last = proj.lines.last().expect("至少一行");
+        assert_eq!(last.display_text(), "正文");
+    }
 }

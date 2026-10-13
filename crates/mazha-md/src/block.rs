@@ -47,6 +47,11 @@ pub enum BlockKind {
     },
     /// 分割线（`---` / `***` / `___`）。
     ThematicBreak,
+    /// Front-matter（文档开头 `---` YAML `---`；`content` 为原始 YAML 文本）。
+    FrontMatter {
+        /// 原始 YAML 文本（不含分隔线）。
+        content: String,
+    },
     /// GFM 表格（表头行 + 分隔行 + 若干数据行）。
     Table {
         /// 每列的对齐方式（列数 = 该数组长度）。

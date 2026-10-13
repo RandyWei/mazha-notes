@@ -50,6 +50,17 @@ pub fn serialize_source(source: &str, blocks: &[Block]) -> String {
 fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
     match &b.kind {
         BlockKind::ThematicBreak => prefix_lines("---\n", prefix),
+        BlockKind::FrontMatter { content } => {
+            // front-matter：`---` + 原文 + `---`（不加 prefix，仅文档开头）。
+            // 末尾不带换行：由 serialize_source 在块间补一个换行。
+            let mut s = String::from("---\n");
+            s.push_str(content);
+            if !content.is_empty() && !content.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("---");
+            s
+        }
         BlockKind::Heading { level } => {
             let hashes = "#".repeat(*level as usize);
             prefix_lines(

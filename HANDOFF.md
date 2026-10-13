@@ -21,7 +21,7 @@ cargo test --workspace
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
 | `mazha-core` | ✅ Phase 1 主体 + CRDT 桥接 + 增量缓存 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存增量维护）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`（含平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射 + `build_projection_from` + **增量 refresh**）、`commands`、`IntentMapper`、`Workspace`、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | 更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
-| `mazha-md` | ✅ 块级 + 行内 + 序列化 + 增量重解析 + GFM 表格 + callout + wiki-link | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**表格**、**提示块**）、`parse_inline`（含 **wiki-link** `[[Page]]`/`[[Page|Alias]]`）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | front-matter/标签等知识库扩展 |
+| `mazha-md` | ✅ 块级 + 行内 + 序列化 + 增量重解析 + GFM 表格 + callout + wiki-link + front-matter | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**表格**、**提示块**、**front-matter**）、`parse_inline`（含 **wiki-link** `[[Page]]`/`[[Page|Alias]]`）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | 标签等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、并发收敛 | 多文档名册、持久化落盘 |
 | `mazha-export` | 🟡 HTML 完成 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/**提示块（callout div + 标题 + 类型）**/列表/任务/围栏代码/分割线/**GFM 表格（table/thead/tbody + 列对齐 + 单元格行内 + 转义）**/行内强调/粗体/删除线/代码/链接/**wiki-link（a.wikilink + href=目标）**/自动链接/图片/换行 | PDF（Typst）、DOCX/EPUB、模板/主题 |
@@ -31,11 +31,11 @@ cargo test --workspace
 
 ## 测试现状
 
-- `mazha-core`：117
-- `mazha-md`：83
-- `mazha-export`：27
+- `mazha-core`：118
+- `mazha-md`：91
+- `mazha-export`：28
 - `mazha-crdt`：11
-- 合计 **253** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **263** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 

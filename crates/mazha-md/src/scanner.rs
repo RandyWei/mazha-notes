@@ -354,13 +354,21 @@ fn starts_new_block(source: &str, line: Line) -> bool {
 /// 解析源文本为顶层块森林。
 pub fn parse(source: &str) -> Vec<Block> {
     let lines = split_lines(source);
-    scan_blocks(source, &lines)
+    let mut blocks = Vec::new();
+    let mut start = 0usize;
+    // front-matter 仅出现在文档最开头（第一行 `---` 且后有闭合 `---`/`...`）
+    if let Some((block, next)) = build_front_matter(source, &lines) {
+        blocks.push(block);
+        start = next;
+    }
+    blocks.extend(scan_blocks_range(source, &lines, start));
+    blocks
 }
 
-/// 对一组（可能是前缀剥离后的）行做块级扫描。
-fn scan_blocks(source: &str, lines: &[Line]) -> Vec<Block> {
+/// 从 `start` 行起解析顶层块森林。
+fn scan_blocks_range(source: &str, lines: &[Line], start: usize) -> Vec<Block> {
     let mut blocks = Vec::new();
-    let mut i = 0usize;
+    let mut i = start;
     while i < lines.len() {
         let line = lines[i];
         let rest = line.rest(source);
@@ -411,6 +419,11 @@ fn scan_blocks(source: &str, lines: &[Line]) -> Vec<Block> {
         }
     }
     blocks
+}
+
+/// 对一组（可能是前缀剥离后的）行做块级扫描。
+fn scan_blocks(source: &str, lines: &[Line]) -> Vec<Block> {
+    scan_blocks_range(source, lines, 0)
 }
 
 /// 构造 ATX 标题块。
@@ -687,6 +700,43 @@ fn build_block_quote(source: &str, lines: &[Line], start_idx: usize) -> (Block, 
         Block::container(kind, first_start..last_end, spans, children),
         i,
     )
+}
+
+/// 构造 front-matter（文档开头 `---` YAML `---`）。
+///
+/// 仅当第一行恰为 `---`（无前导空格）且后续存在闭合行 `---`/`...` 时成立；
+/// 否则返回 `None`（第一行按普通块处理）。
+fn build_front_matter(source: &str, lines: &[Line]) -> Option<(Block, usize)> {
+    let first = *lines.first()?;
+    let first_rest = first.rest(source);
+    // 第一行必须恰为 `---`（trim 后），且 content 在行首（无前导空格）
+    if first.content != first.start || first_rest.trim_end() != "---" {
+        return None;
+    }
+    // 找闭合行（`---` 或 `...`）
+    let mut close_idx = None;
+    for (j, l) in lines.iter().enumerate().skip(1) {
+        let r = l.rest(source).trim_end();
+        if r == "---" || r == "..." {
+            close_idx = Some(j);
+            break;
+        }
+    }
+    let close_idx = close_idx?;
+    // YAML 内容：第一行之后到闭合行之前
+    let content_start = first.end + 1; // 跳过第一行的换行
+    let content_end = lines[close_idx].start;
+    let content = if content_start < content_end {
+        source[content_start..content_end].to_string()
+    } else {
+        String::new()
+    };
+    let block = Block::leaf(
+        BlockKind::FrontMatter { content },
+        first.start..lines[close_idx].end,
+        Vec::new(),
+    );
+    Some((block, close_idx + 1))
 }
 
 /// 构造列表（容器 + 若干列表项）。
@@ -1251,5 +1301,90 @@ mod callout_tests {
         // `[!]` 空名不算 callout，仍是普通引用
         let b = block("> [!]\n> 内容\n");
         assert_eq!(b.kind, BlockKind::BlockQuote);
+    }
+}
+
+#[cfg(test)]
+mod frontmatter_tests {
+    use super::*;
+    use crate::serialize::to_md;
+
+    #[test]
+    fn frontmatter_parse() {
+        let src = "---\ntitle: 测试\n---\n正文\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0].kind,
+            BlockKind::FrontMatter { content } if content == "title: 测试\n"
+        ));
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn frontmatter_empty() {
+        let src = "---\n---\n正文\n";
+        let blocks = parse(src);
+        assert!(matches!(
+            &blocks[0].kind,
+            BlockKind::FrontMatter { content } if content.is_empty()
+        ));
+    }
+
+    #[test]
+    fn frontmatter_dot_close() {
+        let src = "---\ntitle: x\n...\n正文\n";
+        let blocks = parse(src);
+        assert!(matches!(blocks[0].kind, BlockKind::FrontMatter { .. }));
+    }
+
+    #[test]
+    fn frontmatter_not_at_start_is_thematic_break() {
+        // 非文档开头的 `---` 不是 front-matter
+        let src = "正文\n---\n更多\n";
+        let blocks = parse(src);
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !matches!(b.kind, BlockKind::FrontMatter { .. }))
+        );
+    }
+
+    #[test]
+    fn frontmatter_no_close_is_thematic_break() {
+        // 开头 `---` 但无闭合：按分割线处理
+        let src = "---\ntitle: x\n正文\n";
+        let blocks = parse(src);
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !matches!(b.kind, BlockKind::FrontMatter { .. }))
+        );
+    }
+
+    #[test]
+    fn frontmatter_indented_not_recognized() {
+        // 前导空格的 `---` 不算 front-matter
+        let src = " ---\ntitle: x\n---\n正文\n";
+        let blocks = parse(src);
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !matches!(b.kind, BlockKind::FrontMatter { .. }))
+        );
+    }
+
+    #[test]
+    fn frontmatter_roundtrip() {
+        let src = "---\ntitle: 测试\n---\n正文\n";
+        let out = to_md(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn frontmatter_roundtrip_empty() {
+        let src = "---\n---\n正文\n";
+        let out = to_md(src);
+        assert_eq!(out, src);
     }
 }

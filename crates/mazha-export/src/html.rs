@@ -186,6 +186,9 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
             let _ = write!(out, "</h{level}>");
         }
         BlockKind::ThematicBreak => out.push_str("<hr>"),
+        BlockKind::FrontMatter { .. } => {
+            // front-matter 是元数据，导出时不渲染
+        }
         BlockKind::Table { align } => render_table(source, block, align, out),
         BlockKind::CodeBlock { lang, .. } => {
             out.push_str("<pre><code");
@@ -611,5 +614,12 @@ mod tests {
         let html = to_html("[[Page\"x\"]]\n");
         assert!(html.contains("href=\"Page&quot;x&quot;\""));
         assert!(html.contains("class=\"wikilink\""));
+    }
+
+    #[test]
+    fn html_frontmatter_hidden() {
+        // front-matter 是元数据，导出时不渲染
+        let html = to_html("---\ntitle: x\n---\n正文\n");
+        assert_eq!(html, "<p>正文</p>");
     }
 }
