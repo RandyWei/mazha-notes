@@ -172,6 +172,38 @@ impl Document {
         self.text.char_to_byte(char_idx)
     }
 
+    /// 包含字节偏移 `at` 的**逻辑行**源范围（不含行尾换行）。
+    ///
+    /// `at` 恰为换行符位置时归**前一行**（与 `line_index_of` 的约定一致：
+    /// 让"删行尾换行"这类编辑把两行都纳入影响范围）。越界会 clamp。
+    pub fn line_range_of(&self, at: usize) -> Range<usize> {
+        let at = self.snap_to_boundary(at);
+        let before = self.slice(0..at);
+        let start = before.rfind('\n').map_or(0, |i| i + 1);
+        let rest = self.slice(at..self.len());
+        let end = rest.find('\n').map_or(at + rest.len(), |i| at + i);
+        start..end
+    }
+
+    /// 字节偏移 `at` 所在的**词**范围（CJK 感知；空区间表示不在词内）。
+    ///
+    /// 词的定义（用于双击选中/词级移动）：
+    /// - ASCII 词 = 连续的 `[0-9A-Za-z_'-]`；
+    /// - CJK 词 = 连续的中日韩表意文字/假名/谚文；
+    /// - 其它符号各自成词（单击标点只选中它自己）；
+    /// - 落在两个词之间的空白返回空区间 `at..at`。
+    pub fn word_range_at(&self, at: usize) -> Range<usize> {
+        let at = self.snap_to_boundary(at);
+        let line = self.line_range_of(at);
+        if at < line.start || at > line.end {
+            return at..at;
+        }
+        let local = at - line.start;
+        let text = self.slice(line.clone());
+        let bounds = word_bounds(&text, local);
+        line.start + bounds.start..line.start + bounds.end
+    }
+
     /// 从字节偏移向前（左）移动**一个字符**，落在字符边界上。
     pub fn prev_char_boundary(&self, byte: usize) -> usize {
         if byte == 0 {
@@ -421,6 +453,76 @@ impl Document {
         let doc_len = self.text.len_bytes();
         ChangeSummary { affected, doc_len }
     }
+}
+
+/// 单行文本内，字节偏移 `at` 处的**词范围**（CJK 感知）。
+///
+/// 约定：
+/// - 光标左右任一侧挨着词字符 → 返回该词（优先左侧，符合"光标停在词尾属于该词"）；
+/// - 两侧都是空白/标点 → 返回空区间 `at..at`（不把单个标点当词）；
+/// - ASCII 词与 CJK 词互不粘连（`abc你好` 会被切成 `abc` 与 `你好`）。
+fn word_bounds(line: &str, at: usize) -> Range<usize> {
+    let left = line.get(..at).and_then(|s| s.chars().next_back());
+    let right = line.get(at..).and_then(|s| s.chars().next());
+    let anchor = match (left, right) {
+        (Some(l), _) if is_word_char(l) => l,
+        (_, Some(r)) if is_word_char(r) => r,
+        _ => return at..at,
+    };
+
+    // 基准字符决定"同类"：ASCII 词只吃 ASCII 词字符，CJK 只吃 CJK
+    let same_class = |c: char| {
+        if is_ascii_word(anchor) {
+            is_ascii_word(c)
+        } else {
+            is_cjk(c)
+        }
+    };
+
+    let mut start = at;
+    for (i, c) in line.get(..at).unwrap_or_default().char_indices().rev() {
+        if same_class(c) {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    let mut end = at;
+    for (i, c) in line.get(at..).unwrap_or_default().char_indices() {
+        if same_class(c) {
+            end = at + i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    start..end
+}
+
+/// 是否 ASCII 词字符（`[0-9A-Za-z_'-]`）。
+fn is_ascii_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '\'')
+}
+
+/// 是否 CJK 表意/假名/谚文字符（按 Unicode 区段粗略判断）。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x2E80..=0x2EFF   // 部首补充
+        | 0x3000..=0x303F // CJK 符号与标点
+        | 0x3040..=0x30FF // 平/片假名
+        | 0x3100..=0x312F // 注音
+        | 0x3130..=0x318F // 谚文兼容
+        | 0x3400..=0x4DBF // 扩展 A
+        | 0x4E00..=0x9FFF // 基本区
+        | 0xA960..=0xA97F // 谚文扩展
+        | 0xAC00..=0xD7FF // 谚文音节
+        | 0xF900..=0xFAFF // 兼容表意
+        | 0x20000..=0x2FA1F // 扩展 B..F + 兼容补充
+    )
+}
+
+/// 是否词字符（ASCII 词或 CJK）。
+fn is_word_char(c: char) -> bool {
+    is_ascii_word(c) || is_cjk(c)
 }
 
 #[cfg(test)]
@@ -966,5 +1068,78 @@ mod tests {
         })
         .unwrap();
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn line_range_of_basic() {
+        let d = doc("a\nbb\n");
+        assert_eq!(d.line_range_of(0), 0..1); // 第一行
+        assert_eq!(d.line_range_of(1), 0..1); // 换行符位置归前一行
+        assert_eq!(d.line_range_of(2), 2..4); // 第二行
+        assert_eq!(d.line_range_of(4), 2..4); // 行尾换行符位置归前一行
+        assert_eq!(d.line_range_of(5), 5..5); // 文档末尾的空行（光标所在）
+        assert_eq!(d.line_range_of(99), 5..5); // 越界 clamp 到末尾空行
+    }
+
+    #[test]
+    fn line_range_of_no_trailing_newline() {
+        let d = doc("a\nbb");
+        assert_eq!(d.line_range_of(3), 2..4);
+    }
+
+    #[test]
+    fn word_range_ascii() {
+        let d = doc("hello world");
+        assert_eq!(d.word_range_at(7), 6..11); // world 中间
+        assert_eq!(d.word_range_at(6), 6..11); // 词首
+        assert_eq!(d.word_range_at(11), 6..11); // 词尾（光标在右侧空白前）
+        assert_eq!(d.word_range_at(2), 0..5); // hello
+        assert_eq!(d.word_range_at(5), 0..5, "光标在词尾仍命中该词");
+        assert_eq!(d.word_range_at(0), 0..5);
+    }
+
+    #[test]
+    fn word_range_on_space_is_empty() {
+        let d = doc("a   b"); // 三个空格，取正中间那个
+        assert_eq!(d.word_range_at(2), 2..2, "两侧皆空白 → 无词");
+        assert_eq!(d.word_range_at(1), 0..1, "紧贴词右侧 → 归该词");
+        assert_eq!(d.word_range_at(4), 4..5, "紧贴词左侧 → 归该词");
+    }
+
+    #[test]
+    fn word_range_cjk() {
+        let d = doc("你好世界");
+        assert_eq!(d.word_range_at(0), 0..12, "整个 CJK 连续段是一个词");
+        assert_eq!(d.word_range_at(3), 0..12);
+        assert_eq!(d.word_range_at(6), 0..12);
+    }
+
+    #[test]
+    fn word_range_mixed_ascii_and_cjk_split() {
+        let d = doc("abc你好def");
+        assert_eq!(d.word_range_at(1), 0..3, "ASCII 段");
+        assert_eq!(d.word_range_at(6), 3..9, "CJK 段");
+        assert_eq!(d.word_range_at(7), 3..9, "多字节中部偏移会被吸附到词");
+        assert_eq!(d.word_range_at(10), 9..12, "后段 ASCII");
+    }
+
+    #[test]
+    fn word_range_punctuation_is_empty() {
+        let d = doc("a * b");
+        assert_eq!(d.word_range_at(2), 2..2, "标点不当词");
+        assert_eq!(d.word_range_at(3), 3..3);
+    }
+
+    #[test]
+    fn word_range_multiline_stays_in_line() {
+        let d = doc("aa\nbbb");
+        assert_eq!(d.word_range_at(1), 0..2, "第一行");
+        assert_eq!(d.word_range_at(4), 3..6, "第二行不越界");
+    }
+
+    #[test]
+    fn word_range_empty_text() {
+        let d = doc("");
+        assert_eq!(d.word_range_at(0), 0..0);
     }
 }
