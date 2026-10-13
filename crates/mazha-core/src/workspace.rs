@@ -91,7 +91,7 @@ mod tests {
         let doc = Document::new("# 标题\n正文");
         ws.save(&dp("a.md"), &doc).unwrap();
 
-        let opened = ws.open(&dp("a.md")).unwrap();
+        let mut opened = ws.open(&dp("a.md")).unwrap();
         assert_eq!(opened.text(), "# 标题\n正文");
         // 投影可用
         assert_eq!(opened.projection().lines[0].display_text(), "标题");

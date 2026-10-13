@@ -30,6 +30,92 @@ impl Projection {
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
+
+    /// 增量刷新投影（SPEC §6.1 "增量重建" 的投影侧）。
+    ///
+    /// `old_range` / `new_range` 是同一次编辑在**旧/新文本**中的字节范围（插入时
+    /// `old_range` 为空区间）；`blocks` 是调用方已增量维护好的新块森林。
+    ///
+    /// 策略（正确性优先）：
+    /// 1. 定位编辑在旧投影中的起止行 `[first, last]`；
+    /// 2. 按"保留同样多的尾部行"反推新文本中的窗口末行 `new_last`；
+    /// 3. 样式对新文本**全量**重算（O(lines)，只读块森林，代价低），
+    ///    只对窗口 `[first, new_last]` 的行重建 runs/`OffsetMap`；
+    /// 4. 窗口前的旧行原样保留，窗口后的旧行只做源坐标平移 ([`ProjectedLine::shifted`])。
+    ///
+    /// 任何异常情况（空投影、窗口为空）都退化为**全量重建**，保证不错。
+    pub fn refresh(
+        &mut self,
+        source: &str,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        blocks: &[Block],
+    ) {
+        // delta = 新文本相对旧文本的长度变化
+        let delta = len_delta(&old_range, &new_range);
+        if self.lines.is_empty() {
+            *self = build_from(source, blocks);
+            return;
+        }
+
+        // 1. 旧行定位
+        let last_line = self.lines.len() - 1;
+        let first = line_index_of(&self.lines, old_range.start);
+        let last = line_index_of(&self.lines, old_range.end.max(old_range.start)).min(last_line);
+        let tail_keep = last_line - last; // 编辑点之后需要保留的旧行数
+
+        // 2. 新文本行切分 + 窗口末行
+        let all = split_lines(source);
+        if all.is_empty() {
+            self.lines.clear();
+            return;
+        }
+        let keep = tail_keep.min(all.len() - 1);
+        let new_last = all.len() - 1 - keep;
+        if new_last < first {
+            // 删除导致窗口消失：兜底全量
+            *self = build_from(source, blocks);
+            return;
+        }
+
+        // 3. 样式全量重算 + 片段收集；只重建窗口行
+        let mut styles: Vec<BlockStyle> = vec![BlockStyle::default(); all.len()];
+        let ctx = StyleCtx::default();
+        for b in blocks {
+            assign_style(b, &ctx, &all, &mut styles);
+        }
+        let mut spans: Vec<SyntaxSpan> = Vec::new();
+        for b in blocks {
+            collect_spans(b, &mut spans);
+        }
+        let mut window: Vec<ProjectedLine> = (first..=new_last)
+            .map(|i| build_line(source, &all[i], styles[i].clone(), &spans))
+            .collect();
+
+        // 4. 拼接
+        let mut out = Vec::with_capacity(self.lines.len());
+        out.extend(self.lines[..first].iter().cloned());
+        out.append(&mut window);
+        out.extend(self.lines[last + 1..].iter().map(|l| l.shifted(delta)));
+        self.lines = out;
+    }
+}
+
+/// 编辑带来的文本长度变化：`new_range.len() - old_range.len()`。
+fn len_delta(old_range: &Range<usize>, new_range: &Range<usize>) -> isize {
+    let old_len = old_range.end.saturating_sub(old_range.start);
+    let new_len = new_range.end.saturating_sub(new_range.start);
+    isize::try_from(new_len).unwrap_or(isize::MAX) - isize::try_from(old_len).unwrap_or(isize::MAX)
+}
+
+/// 源偏移 `pos` 落在哪一行（超出末尾则返回最后一行）。
+///
+/// 行区间不含行尾换行；`pos` 恰好等于某行终点时归该行（使"删行尾换行"这类编辑
+/// 仍能把两行都纳入重算窗口）。
+fn line_index_of(lines: &[ProjectedLine], pos: usize) -> usize {
+    lines
+        .partition_point(|l| l.source_range.end < pos)
+        .min(lines.len().saturating_sub(1))
 }
 
 /// 一行的投影。
@@ -56,6 +142,34 @@ impl ProjectedLine {
         }
         s
     }
+
+    /// 行内容未变、仅源坐标整体平移 `delta` 时，产出一行平移后的副本。
+    ///
+    /// 可见文本、显示位置、样式均不变；只平移行区间、片段区间与
+    /// [`OffsetMap`] 内的源偏移。
+    pub(crate) fn shifted(&self, delta: isize) -> Self {
+        let mut line = self.clone();
+        line.source_range = shift_range(line.source_range, delta);
+        for run in &mut line.runs {
+            run.source_range = shift_range(run.source_range.clone(), delta);
+        }
+        for widget in &mut line.widgets {
+            widget.source_range = shift_range(widget.source_range.clone(), delta);
+        }
+        line.offset_map.shift(delta);
+        line
+    }
+}
+
+/// 平移区间两端（正值右移、负值左移，饱和运算）。
+fn shift_range(r: Range<usize>, delta: isize) -> Range<usize> {
+    let step = delta.unsigned_abs();
+    let (s, e) = if delta >= 0 {
+        (r.start.saturating_add(step), r.end.saturating_add(step))
+    } else {
+        (r.start.saturating_sub(step), r.end.saturating_sub(step))
+    };
+    s..e
 }
 
 /// 块样式：一行所属的块级语义（容器样式可叠加，如"引用中的列表项"）。

@@ -197,6 +197,20 @@ impl OffsetMap {
     pub fn display_len(&self) -> usize {
         self.display_len
     }
+
+    /// 把所有可落点源偏移平移 `delta`（增量投影刷新后用于未重算的行）。
+    ///
+    /// 显示位置与显示宽度都**不变**——平移只针对源坐标。
+    pub(crate) fn shift(&mut self, delta: isize) {
+        let step = delta.unsigned_abs();
+        for m in &mut self.src_marks {
+            *m = if delta >= 0 {
+                m.saturating_add(step)
+            } else {
+                m.saturating_sub(step)
+            };
+        }
+    }
 }
 
 #[cfg(test)]

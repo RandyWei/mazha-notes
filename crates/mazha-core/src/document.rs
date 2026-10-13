@@ -44,6 +44,37 @@ pub struct Document {
     /// 块森林缓存（与 `text` 保持一致：每次编辑后增量重解析）。
     /// 供 [`Document::projection`] 与 [`Document::blocks`] 复用，避免重复全量解析。
     blocks: Vec<mazha_md::Block>,
+    /// 渲染投影缓存（与 `text` 保持一致：编辑后按脏行增量刷新）。
+    /// 供 [`Document::projection`] 复用，避免每次渲染都重建全部行。
+    projection: Option<crate::Projection>,
+}
+
+/// 编辑在**旧文本**坐标中的字节范围（增量重解析/投影刷新定位脏区用）。
+///
+/// 注意 [`Edit::source_range`] 对插入返回的是**新文本**坐标（`at..at+len`），
+/// 不能直接用于旧坐标定位；这里给出严格的旧坐标版本：插入为空区间。
+fn old_range_of(edit: &Edit) -> Range<usize> {
+    match edit {
+        Edit::Insert { at, .. } => *at..*at,
+        Edit::Delete { range }
+        | Edit::Replace { range, .. }
+        | Edit::ToggleInline { range, .. }
+        | Edit::ToggleBlock { range, .. } => range.clone(),
+    }
+}
+
+/// 编辑在新文本坐标中的字节范围（供投影/缓存增量刷新计算脏区）。
+///
+/// 与 [`old_range_of`] 成对使用：
+/// 插入时旧区间为空、新区间为插入内容；删除时反之。
+fn new_range_of(edit: &Edit) -> Range<usize> {
+    match edit {
+        Edit::Insert { at, text } => *at..at.saturating_add(text.len()),
+        Edit::Delete { range } => range.start..range.start,
+        Edit::Replace { range, text } => range.start..range.start.saturating_add(text.len()),
+        // 高层命令在 apply 前已解析成基础编辑，这里不直接出现
+        Edit::ToggleInline { range, .. } | Edit::ToggleBlock { range, .. } => range.clone(),
+    }
 }
 
 impl Document {
@@ -55,6 +86,7 @@ impl Document {
             redo_stack: Vec::new(),
             max_history: DEFAULT_MAX_HISTORY,
             blocks: mazha_md::parse(text),
+            projection: None,
         }
     }
 
@@ -79,10 +111,25 @@ impl Document {
         &self.blocks
     }
 
-    /// 生成整篇渲染投影（隐藏语法标记，供 UI 直接渲染）。
-    pub fn projection(&self) -> crate::Projection {
-        let text = self.text.to_string();
-        crate::projection::build_from(&text, &self.blocks)
+    /// 生成/获取整篇渲染投影（隐藏语法标记，供 UI 直接渲染）。
+    ///
+    /// 返回缓存引用（UI 逐帧渲染无需拷贝）：编辑后缓存会被**增量刷新**
+    /// （只重建编辑影响的行），因此不会因多次读取而重复付出全量代价。
+    ///
+    /// Note: 需要 `&mut self` 以填充/刷新缓存；纯读取场景请先复制
+    /// （`doc.projection().clone()`）。
+    ///
+    /// # Panics
+    /// 内部不变式：缓存填充后即为 `Some`。该 expect 不应触发。
+    pub fn projection(&mut self) -> &crate::Projection {
+        if self.projection.is_none() {
+            // 暂借块缓存，构建完立刻还回，避免与 self.text 的借用打架
+            let blocks = std::mem::take(&mut self.blocks);
+            let text = self.text.to_string();
+            self.projection = Some(crate::projection::build_from(&text, &blocks));
+            self.blocks = blocks;
+        }
+        self.projection.as_ref().expect("投影缓存刚被填充")
     }
 
     /// 返回字节范围 `range` 内的文本（`Cow`：连续 chunk 时零拷贝借用，否则拷贝）。
@@ -323,19 +370,24 @@ impl Document {
     }
 
     /// 直接对文本应用编辑（不触碰任何历史栈），返回变更摘要。
-    /// 应用编辑并增量刷新块缓存（apply/undo/redo 的统一入口）。
+    /// 应用编辑并增量刷新缓存（apply/undo/redo 的统一入口）。
     ///
-    /// 与 [`Document::apply_raw`] 的区别：apply 后按本次编辑的源范围做
-    /// **增量重解析**（[`mazha_md::reparse`]），使 `self.blocks` 与 `self.text` 保持同步。
+    /// 依次维护两份缓存，使二者始终与 `self.text` 同步：
+    /// 1. 块森林：按本次编辑的源范围做 **增量重解析**（[`mazha_md::reparse`]）；
+    /// 2. 投影：按本次编辑的脏行做 **增量刷新**（[`crate::Projection::refresh`]）。
     fn apply_and_refresh(&mut self, edit: &Edit) -> ChangeSummary {
         let old_len = self.text.len_bytes();
-        let affected = edit.source_range();
+        let affected_old = old_range_of(edit);
+        let affected_new = new_range_of(edit);
         let summary = self.apply_raw(edit);
-        // 增量重解析：把旧块森林迁移到新文本上。
-        // 取走缓存避免与 self.text 的借用冲突。
+        // 暂借块缓存，避免与 self.text 的借用冲突
         let blocks = std::mem::take(&mut self.blocks);
         let text = self.text.to_string();
-        self.blocks = mazha_md::reparse(&text, old_len, &blocks, affected);
+        self.blocks = mazha_md::reparse(&text, old_len, &blocks, affected_old.clone());
+        // 投影缓存若存在，按脏行增量刷新（不存在则下次读取时懒构建）
+        if let Some(proj) = self.projection.as_mut() {
+            proj.refresh(&text, affected_old, affected_new, &self.blocks);
+        }
         summary
     }
 
@@ -707,7 +759,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.text(), crdt.text());
-        let d2 = crdt_to_document(&crdt);
+        let mut d2 = crdt_to_document(&crdt);
         assert_eq!(d2.text(), d.text());
         assert_eq!(d2.projection().lines.len(), d.projection().lines.len());
     }
@@ -785,6 +837,122 @@ mod tests {
         // 投影应看到 3 个代码内容行
         let proj = d.projection();
         assert!(proj.lines.iter().any(|l| l.block.code_block));
+    }
+
+    /// 断言缓存投影与全量投影完全一致（校验增量刷新的正确性）。
+    fn assert_projection_matches(d: &mut Document, step: &str) {
+        let full = crate::build_projection(&d.text());
+        let cached = d.projection();
+        assert_eq!(cached.lines.len(), full.lines.len(), "[{step}] 行数应一致");
+        for (i, (a, b)) in cached.lines.iter().zip(full.lines.iter()).enumerate() {
+            assert_eq!(
+                a.source_range, b.source_range,
+                "[{step}] 第 {i} 行 source_range 不一致"
+            );
+            assert_eq!(a.block, b.block, "[{step}] 第 {i} 行块样式不一致");
+            assert_eq!(
+                a.display_text(),
+                b.display_text(),
+                "[{step}] 第 {i} 行显示文本不一致"
+            );
+            assert_eq!(a.runs, b.runs, "[{step}] 第 {i} 行 runs 不一致");
+            assert_eq!(a.widgets, b.widgets, "[{step}] 第 {i} 行 widgets 不一致");
+            // 映射必须同样工作：与全量投影的双向换算结果完全一致
+            let disp_len = a.display_text().chars().count();
+            for disp in 0..=disp_len {
+                let dp = crate::DisplayPos(disp);
+                assert_eq!(
+                    a.offset_map.display_to_source(dp),
+                    b.offset_map.display_to_source(dp),
+                    "[{step}] 第 {i} 行 display→source 不一致（disp={disp}）"
+                );
+            }
+            for src in a.source_range.clone() {
+                assert_eq!(
+                    a.offset_map.source_to_display(src),
+                    b.offset_map.source_to_display(src),
+                    "[{step}] 第 {i} 行 source→display 不一致（src={src}）"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projection_cache_matches_full_after_edits() {
+        let mut d =
+            doc("# 标题\n\n```rust\nfn a() {}\n```\n\n> 引用\n\n- 列表一\n- 列表二\n\n结尾\n");
+        // 先读取一次以填充缓存，后续编辑都走增量刷新
+        assert_projection_matches(&mut d, "初始");
+
+        // 1) 段内插入（含行内标记）
+        let at = d.text().find("列表一").unwrap();
+        d.apply(Edit::Insert {
+            at,
+            text: "**粗** ".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "插入行内标记");
+
+        // 2) 标题前缀化（样式变化）
+        d.apply(Edit::Insert {
+            at: 0,
+            text: "## ".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "标题降级");
+
+        // 3) 插入换行 → 行数增加
+        let at = d.text().find("列表二").unwrap();
+        d.apply(Edit::Insert {
+            at,
+            text: "\n".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "拆行");
+
+        // 4) 删除整行（行数减少）
+        let text = d.text();
+        let start = text.find("\n\n结尾").unwrap();
+        d.apply(Edit::Delete {
+            range: start..text.len(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "删尾");
+
+        // 5) 代码块内插入
+        let at = d.text().find("fn a() {}").unwrap();
+        d.apply(Edit::Insert {
+            at,
+            text: "fn x() {}\n".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "代码块插行");
+
+        // 6) 撤销/重做
+        d.undo().unwrap();
+        assert_projection_matches(&mut d, "撤销");
+        d.redo().unwrap();
+        assert_projection_matches(&mut d, "重做");
+    }
+
+    #[test]
+    fn projection_cache_handles_cjk_and_offsets() {
+        let mut d = doc("你好**世界**\n\n第二段中文内容\n");
+        assert_projection_matches(&mut d, "初始");
+        let at = d.text().find("第二").unwrap();
+        d.apply(Edit::Insert {
+            at,
+            text: "「引用」".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "中文插入");
+        // 光标映射抽查：显示位置 0 → 源 0；显示末尾 → 行末源边界
+        let proj = d.projection();
+        let last = proj.lines.last().unwrap();
+        assert_eq!(
+            last.offset_map.source_to_display(last.source_range.start),
+            crate::DisplayPos(0)
+        );
     }
 
     #[test]

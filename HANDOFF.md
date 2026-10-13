@@ -20,7 +20,7 @@ cargo test --workspace
 
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
-| `mazha-core` | ✅ Phase 1 主体 + CRDT 桥接 + 增量块缓存 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存增量维护）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射 + `build_projection_from`）、`commands`（toggle_inline/set_block）、`IntentMapper`（回车续列表等）、`Workspace`（open/save/list）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`，字节↔字符安全转换 + 更新帧落盘） | 增量投影（只重建受影响的投影行）、更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
+| `mazha-core` | ✅ Phase 1 主体 + CRDT 桥接 + 增量缓存 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存增量维护）、`Edit`（Insert/Delete/Replace/ToggleInline/ToggleBlock）、`Selection`、`ChangeSummary`、`OffsetMap`（含平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + 每行映射 + `build_projection_from` + **增量 refresh**）、`commands`、`IntentMapper`、`Workspace`、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | 更丰富意图（缩进/自动配对/删除键合并）、`DocId`、序列化往返 |
 | `mazha-md` | ✅ 块级 + 行内 + 序列化 + 增量重解析 | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务）、`parse_inline`、`serialize_source/to_md`、`reparse`（增量：受影响块区间重解析 + range 平移 + 全量兜底） | 完善 serialize 覆盖、表格/callout/wiki-link 等知识库扩展 |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、并发收敛 | 多文档名册、持久化落盘 |
@@ -31,11 +31,11 @@ cargo test --workspace
 
 ## 测试现状
 
-- `mazha-core`：85
+- `mazha-core`：87
 - `mazha-md`：48
 - `mazha-export`：14
 - `mazha-crdt`：8
-- 合计 **170** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **172** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -51,10 +51,10 @@ cargo test --workspace
 
 ## 下一步（建议顺序）
 
-1. `mazha-core` 增量投影（只重建受编辑影响的投影行，`Projection` 缓存 + 脏行重算）
-2. `mazha-md::serialize` 完善覆盖（嵌套列表/转义/图片）与往返一致性测试
-3. `mazha-crdt`：多文档名册、更新帧快照压缩；`mazha-store` 文件监听（`watch`）
-4. `mazha-export`：PDF（Typst）、DOCX/EPUB、模板/主题
+1. `mazha-md::serialize` 完善覆盖（嵌套列表/转义/图片）与往返一致性测试
+2. `mazha-crdt`：多文档名册、更新帧快照压缩；`mazha-store` 文件监听（`watch`）
+3. `mazha-export`：PDF（Typst）、DOCX/EPUB、模板/主题
+4. IntentMapper 增强：缩进、自动配对、删除键合并
 5. Phase 2：桌面 GPUI 只读投影渲染 → WYSIWYG 显隐标记 → IME
 
 ## 提交历史（近期）
