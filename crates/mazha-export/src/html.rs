@@ -10,6 +10,7 @@
 
 use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
 use std::fmt::Write as _;
+use std::ops::Range;
 
 /// 把 Markdown 源文本渲染为 HTML 片段（不含 `<html>` 外壳）。
 pub fn to_html(source: &str) -> String {
@@ -66,6 +67,108 @@ fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool) 
 }
 
 /// 渲染单个块。
+/// 渲染表格：从块片段按**行/单元格**重组 `<table>/<thead>/<tbody>`。
+///
+/// 片段模型里竖线（[`SpanRole::TablePipe`]）是可见文本，单元格内容是普通行内片段；
+/// 分隔行（[`SpanRole::TableDelim`]）整段隐藏。第一行是表头。
+fn render_table(source: &str, block: &Block, align: &[mazha_md::Align], out: &mut String) {
+    let rows = table_rows(source, block);
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str("<table>");
+    for (ri, cells) in rows.iter().enumerate() {
+        if ri == 0 {
+            out.push_str("<thead>");
+        }
+        out.push_str("<tr>");
+        for (ci, cell) in cells.iter().enumerate() {
+            let tag = if ri == 0 { "th" } else { "td" };
+            let _ = write!(out, "<{tag}");
+            match align.get(ci) {
+                Some(mazha_md::Align::Center) => out.push_str(" style=\"text-align:center\""),
+                Some(mazha_md::Align::Right) => out.push_str(" style=\"text-align:right\""),
+                _ => {}
+            }
+            out.push('>');
+            // 单元格内已按行内语法解析过，直接渲染其片段
+            render_spans_html(source, cell, out);
+            let _ = write!(out, "</{tag}>");
+        }
+        out.push_str("</tr>");
+        if ri == 0 {
+            out.push_str("</thead>");
+            // 没有数据行时不开 <tbody>，避免空标签
+            if rows.len() > 1 {
+                out.push_str("<tbody>");
+            }
+        }
+    }
+    if rows.len() > 1 {
+        out.push_str("</tbody>");
+    }
+    out.push_str("</table>");
+}
+
+/// 把一组行内片段渲染为 HTML（不做块级包装）。
+fn render_spans_html(source: &str, spans: &[SyntaxSpan], out: &mut String) {
+    // 复用行内渲染：包一层空 out，再把结果并入
+    let mut inner = String::new();
+    render_inline(source, spans, &mut inner);
+    out.push_str(&inner);
+}
+
+/// 把表格块的片段按行切成"单元格片段组"（首行为表头）。
+///
+/// 分组依据**源文本的行边界**（而非片段顺序），因此不受片段是否严格排序影响。
+fn table_rows(source: &str, block: &Block) -> Vec<Vec<Vec<SyntaxSpan>>> {
+    let bytes = source.as_bytes();
+    let end = block.range.end.min(bytes.len());
+    // 1. 逐行求 [start, end)
+    let mut bounds: Vec<Range<usize>> = Vec::new();
+    let mut start = block.range.start;
+    while start < end {
+        let e = bytes[start..end]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(end, |i| start + i);
+        bounds.push(start..e);
+        start = e + 1;
+    }
+    // 2. 每行按竖线切单元格（分隔行整行跳过 → 得到空行组，需过滤）
+    bounds
+        .iter()
+        .map(|line| cells_of_line(&block.spans, line))
+        .filter(|cells| !cells.is_empty())
+        .collect()
+}
+
+/// 取落在行 `line` 内的片段，按竖线切成若干单元格（去首尾空单元格）。
+fn cells_of_line(spans: &[SyntaxSpan], line: &Range<usize>) -> Vec<Vec<SyntaxSpan>> {
+    let mut cells: Vec<Vec<SyntaxSpan>> = vec![Vec::new()];
+    for sp in spans {
+        if sp.role == SpanRole::TableDelim {
+            continue; // 分隔行不渲染
+        }
+        // 只取起点落在本行内的片段（空片段忽略）
+        if sp.is_empty() || sp.range.start < line.start || sp.range.start >= line.end {
+            continue;
+        }
+        if sp.role == SpanRole::TablePipe {
+            cells.push(Vec::new());
+        } else {
+            cells.last_mut().expect("至少一个单元格").push(sp.clone());
+        }
+    }
+    if cells.first().is_some_and(Vec::is_empty) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(Vec::is_empty) {
+        cells.pop();
+    }
+    cells
+}
+
 fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
     match &block.kind {
         BlockKind::Paragraph => {
@@ -83,6 +186,7 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
             let _ = write!(out, "</h{level}>");
         }
         BlockKind::ThematicBreak => out.push_str("<hr>"),
+        BlockKind::Table { align } => render_table(source, block, align, out),
         BlockKind::CodeBlock { lang, .. } => {
             out.push_str("<pre><code");
             if let Some(lang) = lang {
@@ -379,5 +483,43 @@ mod tests {
     fn html_document_empty_css_omits_style() {
         let doc = to_html_document("x\n", "t", Some(""));
         assert!(!doc.contains("<style>"));
+    }
+
+    #[test]
+    fn html_table() {
+        let html = to_html("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        assert_eq!(
+            html,
+            "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody>\
+             <tr><td>1</td><td>2</td></tr></tbody></table>"
+        );
+    }
+
+    #[test]
+    fn html_table_alignment() {
+        let html = to_html("| a | b | c |\n| :- | :-: | -: |\n| 1 | 2 | 3 |\n");
+        assert!(html.contains("<th style=\"text-align:center\">b</th>"));
+        assert!(html.contains("<th style=\"text-align:right\">c</th>"));
+        // 左对齐不加样式
+        assert!(html.contains("<th>a</th>"));
+    }
+
+    #[test]
+    fn html_table_inline_marks_in_cells() {
+        let html = to_html("| a |\n| - |\n| **粗** |\n");
+        assert!(html.contains("<td><strong>粗</strong></td>"));
+    }
+
+    #[test]
+    fn html_table_escapes_cells() {
+        let html = to_html("| a |\n| - |\n| <b> |\n");
+        assert!(html.contains("<td>&lt;b&gt;</td>"));
+    }
+
+    #[test]
+    fn html_header_only_table() {
+        // 只有表头（无数据行）：仍应产出合法 table/thead
+        let html = to_html("| a |\n| --- |\n");
+        assert_eq!(html, "<table><thead><tr><th>a</th></tr></thead></table>");
     }
 }

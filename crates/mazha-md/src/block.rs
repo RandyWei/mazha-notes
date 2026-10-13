@@ -40,6 +40,22 @@ pub enum BlockKind {
     },
     /// 分割线（`---` / `***` / `___`）。
     ThematicBreak,
+    /// GFM 表格（表头行 + 分隔行 + 若干数据行）。
+    Table {
+        /// 每列的对齐方式（列数 = 该数组长度）。
+        align: Vec<Align>,
+    },
+}
+
+/// 表格列对齐方式（GFM 分隔行 `:--` / `:-:` / `--:` 决定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    /// 左对齐（默认）。
+    Left,
+    /// 居中。
+    Center,
+    /// 右对齐。
+    Right,
 }
 
 /// 一个块。

@@ -7,7 +7,7 @@
 //! MVP 支持的块：ATX/Setext 标题、段落、分割线、围栏/缩进代码块、引用、列表
 //! （有序/无序/任务）。表格、脚注、HTML 块、惰性续行等留待后续迭代。
 
-use crate::block::{Block, BlockKind};
+use crate::block::{Align, Block, BlockKind};
 use crate::span::{SpanRole, SyntaxSpan};
 
 /// 一行（去除换行后）在源文本中的位置。
@@ -369,6 +369,10 @@ fn scan_blocks(source: &str, lines: &[Line]) -> Vec<Block> {
             let (block, next) = build_fenced_code(source, lines, i, ch, len, lang);
             blocks.push(block);
             i = next;
+        } else if let Some((block, next)) = build_table(source, lines, i) {
+            // 表格：表头行 + 分隔行 + 连续数据行
+            blocks.push(block);
+            i = next;
         } else if quote_prefix(rest).is_some() {
             let (block, next) = build_block_quote(source, lines, i);
             blocks.push(block);
@@ -452,6 +456,156 @@ fn build_fenced_code(
     }
     let kind = BlockKind::CodeBlock { lang, fenced: true };
     (Block::leaf(kind, open_line.start..last_end, spans), i)
+}
+
+/// 构造 GFM 表格；不是表格（或只有表头没有分隔行）时返回 `None`。
+///
+/// 表格三要素（缺一不可）：
+/// 1. 表头行：含未转义的 `|`；
+/// 2. 分隔行：`|---|---|` / `| :-: |` 形式，列数决定列数与对齐；
+/// 3. 数据行：后续**连续**的、含 `|` 且不开启其它块的行。
+fn build_table(source: &str, lines: &[Line], start_idx: usize) -> Option<(Block, usize)> {
+    let header = lines[start_idx];
+    if !is_table_row(source, header) {
+        return None;
+    }
+    // 分隔行必须在紧随的下一行
+    let delim = *lines.get(start_idx + 1)?;
+    let cells = delim_cells(source, delim)?;
+
+    let mut spans: Vec<SyntaxSpan> = Vec::new();
+    spans.extend(row_spans(source, header));
+    spans.push(SyntaxSpan::marker(
+        delim.content..delim.end,
+        SpanRole::TableDelim,
+    ));
+
+    // 数据行：连续、含 `|`、且不开启其它块
+    let mut i = start_idx + 2;
+    let mut last_end = delim.end;
+    while i < lines.len() {
+        let l = lines[i];
+        let rest = l.rest(source);
+        if is_blank(rest) || starts_new_block(source, l) || !is_table_row(source, l) {
+            break;
+        }
+        spans.extend(row_spans(source, l));
+        last_end = l.end;
+        i += 1;
+    }
+
+    let align = cells.into_iter().map(|c| c.align()).collect();
+    Some((
+        Block::leaf(BlockKind::Table { align }, header.start..last_end, spans),
+        i,
+    ))
+}
+
+/// 该行是否可作为表格行（含未转义的 `|`，且不是分隔行自身）。
+fn is_table_row(source: &str, line: Line) -> bool {
+    let rest = line.rest(source);
+    rest.contains('|') && !is_table_delimiter(rest)
+}
+
+/// 表格分隔行？形如 `| --- | :-: | --: |`（至少一列，只含 `|-:` 与空白）。
+fn is_table_delimiter(rest: &str) -> bool {
+    let t = rest.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    if inner.is_empty() {
+        return false;
+    }
+    inner.split('|').all(|cell| {
+        let c = cell.trim();
+        !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':') && c.contains('-') && {
+            // 冒号只能在两端
+            let body = c.trim_start_matches(':').trim_end_matches(':');
+            !body.contains(':')
+        }
+    })
+}
+
+/// 解析分隔行列，得到列数与对齐。
+fn delim_cells(source: &str, line: Line) -> Option<Vec<DelimCell>> {
+    let rest = line.rest(source);
+    if !is_table_delimiter(rest) {
+        return None;
+    }
+    let inner = rest.trim();
+    let inner = inner.strip_prefix('|').unwrap_or(inner);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let cells = inner
+        .split('|')
+        .map(|c| DelimCell(c.trim().to_string()))
+        .collect();
+    Some(cells)
+}
+
+/// 分隔行的一个单元格（原样保留，用 `align()` 取对齐）。
+struct DelimCell(String);
+
+impl DelimCell {
+    /// 由 `:--` / `:-:` / `--:` 推出对齐。
+    fn align(&self) -> Align {
+        let left = self.0.starts_with(':');
+        let right = self.0.ends_with(':');
+        match (left, right) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        }
+    }
+}
+
+/// 一行的表格片段：竖线（可见）+ 单元格内容（按行内语法解析）。
+fn row_spans(source: &str, line: Line) -> Vec<SyntaxSpan> {
+    let rest = line.rest(source);
+    let base = line.content;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::new();
+    // 逐段切分：`|` 为可见分隔，段内按行内语法解析
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'|' && (i == 0 || bytes[i - 1] != b'\\') {
+            if seg_start < i {
+                // 去掉单元格两端空白（渲染时不显示）
+                let (s, e) = trim_ascii_ws(bytes, seg_start, i);
+                if s < e {
+                    out.extend(crate::inline::parse_inline(source, base + s..base + e));
+                }
+            }
+            out.push(SyntaxSpan::text(
+                base + i..base + i + 1,
+                SpanRole::TablePipe,
+            ));
+            i += 1;
+            seg_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if seg_start < bytes.len() {
+        let (s, e) = trim_ascii_ws(bytes, seg_start, bytes.len());
+        if s < e {
+            out.extend(crate::inline::parse_inline(source, base + s..base + e));
+        }
+    }
+    out
+}
+
+/// 收缩 `[start, end)` 两侧的 ASCII 空白，返回新的 (start, end)。
+fn trim_ascii_ws(bytes: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (start, end)
 }
 
 /// 构造引用块（仅支持带 `>` 前缀的续行，暂不支持惰性续行）。
@@ -844,5 +998,107 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Heading { level: 3 });
         assert_eq!(blocks[0].spans[0].range, 0..4); // "### "
         assert_eq!(blocks[0].spans[1].range, 4..13); // "大标题" = 9 字节
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use crate::serialize::to_md;
+    use crate::span::SpanKind;
+
+    fn table(src: &str) -> Block {
+        parse(src)
+            .into_iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+            .expect("应解析出表格")
+    }
+
+    #[test]
+    fn simple_table() {
+        let b = table("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        assert_eq!(b.range, 0..33);
+        match b.kind {
+            BlockKind::Table { align } => {
+                assert_eq!(align, vec![Align::Left, Align::Left]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn alignment_from_delimiter() {
+        let b = table("| a | b | c |\n| :- | :-: | -: |\n| 1 | 2 | 3 |\n");
+        match b.kind {
+            BlockKind::Table { align } => {
+                assert_eq!(align, vec![Align::Left, Align::Center, Align::Right]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn no_delimiter_is_not_table() {
+        // 只有表头、没有分隔行 → 维护段落
+        let blocks = parse("| a | b |\n");
+        assert!(
+            blocks
+                .iter()
+                .all(|b| !matches!(b.kind, BlockKind::Table { .. }))
+        );
+        assert!(matches!(blocks[0].kind, BlockKind::Paragraph));
+    }
+
+    #[test]
+    fn cells_parse_inline_marks() {
+        let b = table("| a | b |\n| - | - |\n| **粗** | *斜* |\n");
+        let has_strong = b
+            .spans
+            .iter()
+            .any(|s| s.role == SpanRole::Strong && s.kind == SpanKind::Text);
+        let has_em = b
+            .spans
+            .iter()
+            .any(|s| s.role == SpanRole::Emphasis && s.kind == SpanKind::Text);
+        assert!(has_strong, "单元格内粗体应被行内解析");
+        assert!(has_em, "单元格内斜体应被行内解析");
+    }
+
+    #[test]
+    fn delimiter_row_is_hidden() {
+        let b = table("| a |\n| --- |\n| 1 |\n");
+        // 分隔行是隐藏标记
+        assert!(b.spans.iter().any(|s| s.role == SpanRole::TableDelim));
+        // 竖线是可见文本
+        assert!(
+            b.spans
+                .iter()
+                .any(|s| s.role == SpanRole::TablePipe && s.kind == SpanKind::Text)
+        );
+    }
+
+    #[test]
+    fn table_ends_at_blank_or_other_block() {
+        let b = table("| a |\n| - |\n| 1 |\n\n后续段落\n");
+        assert_eq!(b.range, 0..17); // 到数据行末，不含空行与后续段落
+    }
+
+    #[test]
+    fn table_roundtrip() {
+        for src in [
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n",
+            "| a | b | c |\n| --- | :-: | --: |\n| 1 | 2 | 3 |\n",
+            "| a |\n| --- |\n",
+        ] {
+            let out = to_md(src);
+            assert_eq!(out, src, "规范化表格应逐字节往返");
+        }
+    }
+
+    #[test]
+    fn escaped_pipe_in_cell() {
+        // 单元格内转义竖线不算分隔
+        let b = table("| a | b |\n| - | - |\n| x \\| y | z |\n");
+        assert!(matches!(b.kind, BlockKind::Table { .. }));
     }
 }

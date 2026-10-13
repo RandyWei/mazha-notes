@@ -601,6 +601,7 @@ interface Workspace {
 | 0.1.22 | 2026-10-12 | `mazha-crdt` 新增 `push()`（末尾追加）与 `snapshot()`（快照压缩：CRDT 历史清零、文本保留，把更新帧体积从 O(历史) 收敛到 O(文本)），并明确压缩与远端同步的兼容性代价；3 条新测试（体积显著下降、快照后续编辑、fork 与 snapshot 的历史差异）；crdt 11（总计 194） |
 | 0.1.23 | 2026-10-12 | `Document` 导航助手（供 UI 光标操作/双击选词）：`line_range_of`（逻辑行范围，换行符位置归前一行、EOF 后为空行）与 `word_range_at`（CJK 感知——ASCII 词 `[0-9A-Za-z_'-]`、CJK 连续段成词，两侧词互不粘连，光标紧贴词的一侧归该词，空白/标点处为空区间；多字节中部偏移先吸附）；9 条新测试；core 106（总计 203） |
 | 0.1.24 | 2026-10-12 | ① `Intent::InsertText` 改为携带**选区**（空区间=纯插入，非空=覆盖替换为原子 `Replace`，一次 undo 还原）+ 新增 `Intent::DeleteSelection`；② `Workspace` 文件管理 API：`create`（`read()` 探测存在性，父目录不存在也能建）、`remove`、`rename`、`list_markdown`（只列 `.md`/`.markdown` 文件）、`find_markdown`；8 条新测试；core 114（总计 211） |
+| 0.1.25 | 2026-10-12 | **GFM 表格**支持（方言声明的核心特性补齐）：`BlockKind::Table { align: Vec<Align> }` + `Align`；解析要求"表头行含 `|` + 分隔行 `-`/`:` + 连续数据行"，分隔行决定列数与对齐，单元格按行内语法解析，竖线为可见 `TablePipe`、分隔行为隐藏 `TableDelim`；序列化按对齐重写分隔行（紧跟表头）；HTML 导出真 `<table>/<thead>/<tbody>` + 列对齐样式；投影侧表格行即普通行（竖线可见）；8 + 5 条新测试（含转义竖线、仅表头、字节往返）；md 65 + export 19（总计 224） |
 
 ---
 

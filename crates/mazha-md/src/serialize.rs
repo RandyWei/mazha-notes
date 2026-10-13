@@ -5,7 +5,7 @@
 //! 行内：强调 `*x*`、粗体 `**x**`、删除线 `~~x~~`、行内代码 `` `x` ``、
 //! 链接 `[text](url)`、图片 `![alt](src)`、转义、软/硬换行。
 
-use crate::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
+use crate::{Align, Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
 use std::ops::Range;
 
 /// 将 AST 序列化为 Markdown。
@@ -98,6 +98,22 @@ fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
             }
             s
         }
+        BlockKind::Table { align } => {
+            // 表格：从源文本按行重建（竖线两端补空格）；分隔行紧跟表头重写，
+            // 否则序列化结果不再构成表格。
+            let rows = table_rows(source, b);
+            let delim = delimiter_row(align);
+            let mut s = String::new();
+            for (i, row) in rows.iter().enumerate() {
+                s.push_str(row);
+                s.push('\n');
+                if i == 0 {
+                    s.push_str(&delim);
+                    s.push('\n');
+                }
+            }
+            s
+        }
         // 列表项由 List 分支统一渲染，这里只在异常输入下兜底
         BlockKind::ListItem { .. } => list_item_to_md(source, b, prefix, false, 1),
     }
@@ -171,6 +187,73 @@ fn prefix_lines(body: &str, prefix: &str) -> String {
             out.push_str(prefix);
             out.push_str(line);
         }
+    }
+    out
+}
+
+/// 取出表格的每个数据行（跳过源文本里的分隔行，由调用方按对齐重写）。
+///
+/// 行从源文本按 `|` 切分并 trim 后重建，故单元格内的行内标记（`**粗**` 等）
+/// 会随源文本原样保留。
+fn table_rows(source: &str, b: &Block) -> Vec<String> {
+    let text = &source[b.range.clone()];
+    text.lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| !is_delim_like(l))
+        .map(normalize_row)
+        .collect()
+}
+
+/// 粗略判断是否是分隔行（避免把 `| --- |` 当数据行）。
+fn is_delim_like(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t')) && t.contains('-')
+}
+
+/// 规范化一行表格：切掉首尾竖线后按未转义 `|` 切分，逐单元格 trim。
+fn normalize_row(line: &str) -> String {
+    let t = line.trim();
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let mut out = String::from("|");
+    for cell in split_cells(inner) {
+        out.push(' ');
+        out.push_str(cell.trim());
+        out.push_str(" |");
+    }
+    out
+}
+
+/// 按**未转义**的 `|` 切分单元格。
+fn split_cells(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'|' && (i == 0 || bytes[i - 1] != b'\\') {
+            out.push(&inner[start..i]);
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(&inner[start..]);
+    out
+}
+
+/// 按对齐方式生成分隔行（`| --- | :-: | --: |`）。
+fn delimiter_row(align: &[Align]) -> String {
+    let mut out = String::from("|");
+    for a in align {
+        out.push_str(match a {
+            Align::Left => " --- ",
+            Align::Center => " :-: ",
+            Align::Right => " --: ",
+        });
+        out.push('|');
     }
     out
 }
