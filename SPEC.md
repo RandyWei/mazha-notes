@@ -596,6 +596,7 @@ interface Workspace {
 | 0.1.17 | 2026-10-12 | `mazha-md::reparse` 增量重解析：按旧块森林定位受影响块区间（前后各放宽一块）→ 局部重解析 + 未受影响块 range 平移 `delta`；短文档/高命中比例/区间非法时退化为全量；8 条"增量==全量"对照测试（CJK、删空行合并、代码块内插入、标题前缀、末尾追加等）；md 45（总计 165） |
 | 0.1.18 | 2026-10-12 | 增量重解析**健全性加固**并接入 `mazha-core`：① `reparse` 增加裁切点安全校验（tail 前必须是空行、区域末块不能是未闭合围栏），不安全时整段重解析到 EOF——修复"插入破坏围栏导致构造延伸"的错误结构；② `Document` 维护块缓存（编辑后经 `reparse` 增量刷新，`blocks()`/`projection()` 复用，`projection::build_from`）；③ 2 条块缓存一致性测试 + 10 步编辑序列测试 + 2 条裁切安全性回归测试；core 85 + md 48（总计 170） |
 | 0.1.19 | 2026-10-12 | `Projection::refresh` 增量刷新：定位脏行 → 样式全量重算 + 只重建脏行 runs/`OffsetMap` → 后续旧行整体平移源坐标（`OffsetMap::shift`、`ProjectedLine::shifted`）；`Document` 持有投影缓存，`projection()` 改为 `&mut self -> &Projection` 并随编辑增量刷新；新增内部辅助 `old_range_of`/`new_range_of`（精确旧/新坐标对，修正 `Edit::source_range` 插入语义）；2 条"增量==全量"逐字段比对测试（6 类编辑 + 撤销/重做 + OffsetMap 双向换算逐点一致）；core 87（总计 172） |
+| 0.1.20 | 2026-10-12 | `IntentMapper` 增强：新增 `Intent::Indent`（块级缩进/反缩进——选区扩展到整行，单个原子 `Replace`，一次一级=两空格或一个制表符，无改动则不产出编辑）与 `Intent::DeletePair`（光标位于空配对符号 `()[]{}""''``**__~~` 之间时成对退格）；10 条新测试；core 97（总计 182） |
 
 ---
 

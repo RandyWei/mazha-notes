@@ -37,6 +37,22 @@ pub enum Intent {
         /// 目标样式。
         target: BlockTarget,
     },
+    /// 缩进 / 反缩进（Tab / Shift+Tab）：对选区覆盖的整块行统一加/删两空格。
+    /// 产出**单个** `Replace`（原子操作，只产生一条 undo 记录）。
+    Indent {
+        /// 选区（起止任意，内部会扩展到整行边界）。
+        range: Range<usize>,
+        /// `true` 为反缩进（删除前导空格）。
+        unindent: bool,
+    },
+    /// 智能退格（Backspace）：光标位于空的中文/英文配对符号之间时**成对删除**。
+    ///
+    /// 不再额外触发"在列表项开头退格先删缩进"等复合行为——那类行为交由
+    /// UI 组合多个意图完成，保持 mapper 单一职责。
+    DeletePair {
+        /// 光标位置（成对符号之间的源字节偏移）。
+        at: usize,
+    },
 }
 
 /// 把输入意图翻译为编辑命令。
@@ -65,8 +81,107 @@ impl IntentMapper for DefaultIntentMapper {
                 range: range.clone(),
                 target: target.clone(),
             }],
+            Intent::Indent { range, unindent } => {
+                indent_edit(&doc.text(), range.clone(), *unindent)
+            }
+            Intent::DeletePair { at } => delete_pair_edit(&doc.text(), *at),
         }
     }
+}
+
+/// 缩进/反缩进：把选区扩展到整行后，对每行加/删前导两空格（或一个制表符）。
+///
+/// 返回空 `Vec` 表示无需改动（例如反缩进时没有任何行有前导空格）。
+fn indent_edit(source: &str, range: Range<usize>, unindent: bool) -> Vec<Edit> {
+    let start = line_start_of(source, range.start);
+    let end = line_end_of(source, range.end);
+    if start >= end {
+        return Vec::new();
+    }
+    let region = source.get(start..end).unwrap_or_default();
+
+    let mut out = String::with_capacity(region.len() + 8);
+    let mut changed = false;
+    for (i, line) in region.split('\n').enumerate() {
+        // 兼容 Windows 换行：剥离行尾 \r 后再处理，结束时补回
+        let (body, eol) = match line.strip_suffix('\r') {
+            Some(b) => (b, "\r"),
+            None => (line, ""),
+        };
+        let rewritten = if unindent {
+            // 优先删两个空格；单个制表符也视为一级缩进
+            body.strip_prefix("  ")
+                .or_else(|| body.strip_prefix('\t'))
+                .map_or_else(|| format!("{body}{eol}"), |rest| format!("{rest}{eol}"))
+        } else {
+            format!("  {body}{eol}")
+        };
+        if rewritten != line {
+            changed = true;
+        }
+        out.push_str(&rewritten);
+        if i + 1 < region.split('\n').count() {
+            out.push('\n');
+        }
+    }
+    if !changed {
+        return Vec::new();
+    }
+    vec![Edit::Replace {
+        range: start..end,
+        text: out,
+    }]
+}
+
+/// 光标所在行的行首偏移。
+fn line_start_of(source: &str, at: usize) -> usize {
+    source
+        .get(..at)
+        .and_then(|s| s.rfind('\n'))
+        .map_or(0, |i| i + 1)
+}
+
+/// 光标所在行（或选区末行）的行尾偏移（不含换行符）。
+fn line_end_of(source: &str, at: usize) -> usize {
+    source
+        .get(at..)
+        .and_then(|s| s.find('\n'))
+        .map_or(source.len(), |i| at + i)
+}
+
+/// 智能退格：`at` 前后恰好是一对**成对符号**（中间无内容）时，成对删除。
+fn delete_pair_edit(source: &str, at: usize) -> Vec<Edit> {
+    let (Some(before), Some(rest)) = (source.get(..at), source.get(at..)) else {
+        return Vec::new();
+    };
+    let (Some(open), Some(close)) = (before.chars().next_back(), rest.chars().next()) else {
+        return Vec::new();
+    };
+    if !is_pair(open, close) {
+        return Vec::new();
+    }
+    let start = at - open.len_utf8();
+    let end = at + close.len_utf8();
+    vec![Edit::Replace {
+        range: start..end,
+        text: String::new(),
+    }]
+}
+
+/// 是否为一对可以直接互相闭合的符号（退格时成对删除）。
+fn is_pair(open: char, close: char) -> bool {
+    matches!(
+        (open, close),
+        ('(', ')')
+            | ('[', ']')
+            | ('{', '}')
+            | ('"', '"')
+            | ('\'', '\'')
+            | ('`', '`')
+            | ('*', '*')
+            | ('_', '_')
+            | ('~', '~')
+    )
 }
 
 /// 行首列表标记信息。
@@ -225,5 +340,142 @@ mod tests {
                 mark: InlineMark::Strong
             }]
         );
+    }
+
+    #[test]
+    fn indent_single_line_is_atomic_replace() {
+        let mut doc = Document::new("hello");
+        let edits = mapper().map(
+            &Intent::Indent {
+                range: 2..3,
+                unindent: false,
+            },
+            &doc,
+        );
+        // 单个 Replace 覆盖整行（原子操作 → 一条 undo）
+        assert_eq!(edits.len(), 1);
+        assert!(matches!(&edits[0], Edit::Replace { text, .. } if text == "  hello"));
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "  hello");
+    }
+
+    #[test]
+    fn indent_multiple_lines_at_once() {
+        let mut doc = Document::new("a\nb\nc\n");
+        // 选区从第一行中间到第三行中间 → 三行都缩进
+        let edits = mapper().map(
+            &Intent::Indent {
+                range: 1..5,
+                unindent: false,
+            },
+            &doc,
+        );
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "  a\n  b\n  c\n");
+        // 原子性：只产生一条编辑记录
+        assert!(doc.can_undo());
+    }
+
+    #[test]
+    fn unindent_removes_up_to_two_spaces() {
+        let mut doc = Document::new("    code\n");
+        let edits = mapper().map(
+            &Intent::Indent {
+                range: 4..6,
+                unindent: true,
+            },
+            &doc,
+        );
+        apply(&mut doc, edits);
+        // 每次只删一级（两个空格）
+        assert_eq!(doc.text(), "  code\n");
+    }
+
+    #[test]
+    fn unindent_tab_is_one_level() {
+        let mut doc = Document::new("\tcode\n");
+        let edits = mapper().map(
+            &Intent::Indent {
+                range: 1..3,
+                unindent: true,
+            },
+            &doc,
+        );
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "code\n");
+    }
+
+    #[test]
+    fn unindent_noop_when_no_leading_space() {
+        let doc = Document::new("plain\n- item\n");
+        let edits = mapper().map(
+            &Intent::Indent {
+                range: 0..6,
+                unindent: true,
+            },
+            &doc,
+        );
+        assert!(edits.is_empty(), "没有前导空格时不应产生编辑");
+    }
+
+    #[test]
+    fn unindent_only_touches_selected_lines() {
+        let mut doc = Document::new("  a\n  b\n");
+        // 选区只覆盖第二行：第一行保持不动
+        let edits = mapper().map(
+            &Intent::Indent {
+                range: 5..5,
+                unindent: true,
+            },
+            &doc,
+        );
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "  a\nb\n");
+    }
+
+    #[test]
+    fn delete_pair_removes_both_chars() {
+        let doc = Document::new("(x)");
+        // 光标在 "(" 与 "x" 之间 → 不是空对，不删
+        let edits = mapper().map(&Intent::DeletePair { at: 1 }, &doc);
+        assert!(edits.is_empty());
+
+        let mut doc = Document::new("()");
+        let edits = mapper().map(&Intent::DeletePair { at: 1 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "");
+    }
+
+    #[test]
+    fn delete_pair_marks_and_quotes() {
+        for (open, close) in [
+            ('[', ']'),
+            ('{', '}'),
+            ('"', '"'),
+            ('\'', '\''),
+            ('`', '`'),
+            ('*', '*'),
+            ('~', '~'),
+        ] {
+            let src = format!("{open}{close}");
+            let mut doc = Document::new(&src);
+            let edits = mapper().map(&Intent::DeletePair { at: 1 }, &doc);
+            apply(&mut doc, edits);
+            assert_eq!(doc.text(), "", "{open}{close} 应被成对删除");
+        }
+    }
+
+    #[test]
+    fn delete_pair_unmatched_is_noop() {
+        let doc = Document::new("(]");
+        let edits = mapper().map(&Intent::DeletePair { at: 1 }, &doc);
+        assert!(edits.is_empty(), "不匹配的符号不应成对删除");
+    }
+
+    #[test]
+    fn delete_pair_at_start_is_noop() {
+        let doc = Document::new(")");
+        let edits = mapper().map(&Intent::DeletePair { at: 0 }, &doc);
+        assert!(edits.is_empty());
     }
 }
