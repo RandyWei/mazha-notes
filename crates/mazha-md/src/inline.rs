@@ -14,7 +14,10 @@ use std::ops::Range;
 
 /// 是否可能触发行内语法的特殊字符。
 fn is_special(b: u8) -> bool {
-    matches!(b, b'\\' | b'*' | b'_' | b'~' | b'`' | b'[' | b'!' | b'<')
+    matches!(
+        b,
+        b'\\' | b'*' | b'_' | b'~' | b'`' | b'[' | b'!' | b'<' | b'#'
+    )
 }
 
 /// 解析 `region` 区间内的行内语法，返回**完整覆盖该区间**的片段序列。
@@ -65,10 +68,47 @@ fn try_construct(source: &str, s: &str, base: usize, i: usize) -> Option<(usize,
         b'[' if bytes.get(i + 1) == Some(&b'[') => wiki_link(source, base, bytes, i),
         b'[' => link(source, base, bytes, i),
         b'<' => autolink(base, s, i),
+        b'#' => tag(base, bytes, i),
         b'~' if bytes.get(i + 1) == Some(&b'~') => strike(source, base, bytes, i),
         b'*' | b'_' => emphasis(source, base, bytes, i),
         _ => None,
     }
+}
+
+/// 标签：`#tag` / `#nested/tag` / `#标签`（支持 CJK）。
+///
+/// `#` 后必须紧跟字母或数字（Unicode）；标签字符集为字母/数字/`-`/`_`/`/`。
+/// 前一字符为字母数字时不算标签（避免 `a#b` 误判）。
+fn tag(base: usize, bytes: &[u8], i: usize) -> Option<(usize, Vec<SyntaxSpan>)> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    // 前一字符不能是字母数字（标签需在词首/空白后）
+    if i > 0 {
+        let prev_char = s[..i].chars().last()?;
+        if prev_char.is_alphanumeric() || prev_char == '-' || prev_char == '_' {
+            return None;
+        }
+    }
+    // `#` 后必须是字母或数字（Unicode，支持 CJK）
+    let after_hash = &s[i + 1..];
+    let first = after_hash.chars().next()?;
+    if !first.is_alphanumeric() {
+        return None;
+    }
+    // 扫描标签字符集（按字符而非字节）
+    let mut end = i + 1 + first.len_utf8();
+    for c in after_hash.chars().skip(1) {
+        if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    // 末尾不能是 `/`（不允许以斜杠结尾）
+    if s[..end].ends_with('/') {
+        return None;
+    }
+    let spans = vec![SyntaxSpan::text(base + i..base + end, SpanRole::Tag)];
+    Some((end - i, spans))
 }
 
 /// 转义：`\` + ASCII 标点 → 反斜杠为标记，标点为普通文本。
@@ -605,5 +645,70 @@ mod tests {
         // 前缀 Normal + wiki-link 3 段 + 后缀 Normal
         assert!(spans.iter().any(|s| s.role == SpanRole::WikiLinkMarker));
         assert!(spans.iter().any(|s| s.role == SpanRole::WikiLinkTarget));
+    }
+
+    #[test]
+    fn tag_simple() {
+        let src = "#标签";
+        let spans = parse_inline(src, 0..src.len());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].role, SpanRole::Tag);
+        assert_eq!(spans[0].kind, SpanKind::Text, "标签可见");
+        assert_eq!(&src[spans[0].range.clone()], "#标签");
+    }
+
+    #[test]
+    fn tag_nested() {
+        let src = "#nested/tag";
+        let spans = parse_inline(src, 0..src.len());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&src[spans[0].range.clone()], "#nested/tag");
+    }
+
+    #[test]
+    fn tag_with_dash_underscore() {
+        let src = "#my-tag_2";
+        let spans = parse_inline(src, 0..src.len());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&src[spans[0].range.clone()], "#my-tag_2");
+    }
+
+    #[test]
+    fn tag_not_after_word_char() {
+        // `a#b` 不算标签
+        let src = "a#b";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().all(|s| s.role != SpanRole::Tag));
+    }
+
+    #[test]
+    fn tag_hash_alone_not_tag() {
+        // `#` 后无字母数字
+        let src = "# hello";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().all(|s| s.role != SpanRole::Tag));
+    }
+
+    #[test]
+    fn tag_trailing_slash_rejected() {
+        // 末尾 `/` 不算
+        let src = "#tag/";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().all(|s| s.role != SpanRole::Tag));
+    }
+
+    #[test]
+    fn tag_mixed_with_text() {
+        let src = "前缀 #标签 后缀";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().any(|s| s.role == SpanRole::Tag));
+    }
+
+    #[test]
+    fn tag_escaped_not_tag() {
+        // `\#tag` 转义后不算标签
+        let src = "\\#tag";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().all(|s| s.role != SpanRole::Tag));
     }
 }

@@ -51,6 +51,8 @@ pub enum SpanRole {
     WikiLinkTarget,
     /// Wiki-link 显示别名（`[[Page|Alias]]` 的 Alias，可见）。
     WikiLinkText,
+    /// 标签 `#tag`（可见）。
+    Tag,
     /// 列表项 `-`/`1.` 前缀。
     ListMarker,
     /// 任务列表复选框 `[ ]`/`[x]`。

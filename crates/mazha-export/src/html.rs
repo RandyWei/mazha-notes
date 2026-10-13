@@ -273,6 +273,16 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String) {
     let mut i = 0usize;
     while i < spans.len() {
         let sp = &spans[i];
+        // 标签：包一层 <span class="tag">
+        if sp.kind == SpanKind::Text && sp.role == SpanRole::Tag {
+            let _ = write!(
+                out,
+                "<span class=\"tag\">{}</span>",
+                escape_text(&source[sp.range.clone()])
+            );
+            i += 1;
+            continue;
+        }
         // 可见文本一律直接转义输出（样式由成对 Marker 开合）
         if sp.kind == SpanKind::Text {
             out.push_str(&escape_text(&source[sp.range.clone()]));
@@ -621,5 +631,17 @@ mod tests {
         // front-matter 是元数据，导出时不渲染
         let html = to_html("---\ntitle: x\n---\n正文\n");
         assert_eq!(html, "<p>正文</p>");
+    }
+
+    #[test]
+    fn html_tag() {
+        let html = to_html("#标签\n");
+        assert_eq!(html, "<p><span class=\"tag\">#标签</span></p>");
+    }
+
+    #[test]
+    fn html_tag_nested() {
+        let html = to_html("#nested/tag\n");
+        assert!(html.contains("<span class=\"tag\">#nested/tag</span>"));
     }
 }
