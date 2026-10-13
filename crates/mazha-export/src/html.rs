@@ -326,6 +326,24 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 // `](` 中间标记、`>` 收尾：忽略
                 _ => {}
             },
+            SpanRole::WikiLinkMarker => match source.as_bytes().get(sp.range.start) {
+                Some(b'[') => {
+                    // `[[`：向前找隐藏的目标页名作为 href
+                    let target = spans[i..]
+                        .iter()
+                        .find(|s| s.role == SpanRole::WikiLinkTarget)
+                        .map(|s| source[s.range.clone()].to_string())
+                        .unwrap_or_default();
+                    let _ = write!(
+                        out,
+                        "<a href=\"{}\" class=\"wikilink\">",
+                        escape_attr(&target)
+                    );
+                }
+                Some(b']') => out.push_str("</a>"),
+                // `|` 忽略
+                _ => {}
+            },
             SpanRole::SoftBreak => out.push('\n'),
             SpanRole::HardBreak => out.push_str("<br>"),
             // 其余标记（标题/引用/列表/围栏/转义/链接目标等）导出时隐藏
@@ -573,5 +591,25 @@ mod tests {
     fn html_quote_without_marker_is_blockquote() {
         let html = to_html("> 普通引用\n");
         assert!(html.contains("<blockquote>"));
+    }
+
+    #[test]
+    fn html_wikilink_no_alias() {
+        let html = to_html("[[Page]]\n");
+        assert_eq!(html, "<p><a href=\"Page\" class=\"wikilink\">Page</a></p>");
+    }
+
+    #[test]
+    fn html_wikilink_with_alias() {
+        let html = to_html("[[Page|别名]]\n");
+        assert_eq!(html, "<p><a href=\"Page\" class=\"wikilink\">别名</a></p>");
+    }
+
+    #[test]
+    fn html_wikilink_escapes_target() {
+        // 目标含 `"`：href 中转义为 &quot;（两个引号都在 [[ ]] 之间）
+        let html = to_html("[[Page\"x\"]]\n");
+        assert!(html.contains("href=\"Page&quot;x&quot;\""));
+        assert!(html.contains("class=\"wikilink\""));
     }
 }

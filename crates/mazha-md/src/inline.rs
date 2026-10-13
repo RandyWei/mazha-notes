@@ -62,6 +62,7 @@ fn try_construct(source: &str, s: &str, base: usize, i: usize) -> Option<(usize,
         b'\\' => escape(base, bytes, i),
         b'`' => code_span(base, bytes, i),
         b'!' if bytes.get(i + 1) == Some(&b'[') => image(source, base, bytes, i),
+        b'[' if bytes.get(i + 1) == Some(&b'[') => wiki_link(source, base, bytes, i),
         b'[' => link(source, base, bytes, i),
         b'<' => autolink(base, s, i),
         b'~' if bytes.get(i + 1) == Some(&b'~') => strike(source, base, bytes, i),
@@ -143,6 +144,81 @@ fn image(source: &str, base: usize, bytes: &[u8], i: usize) -> Option<(usize, Ve
         role: SpanRole::ImageMarker,
     }];
     Some((total, spans))
+}
+
+/// Wiki-link：`[[Target]]` 或 `[[Target|Alias]]`。
+///
+/// 无别名时目标页名可见（`WikiLinkTarget` 为 Text）；有别名时别名可见
+/// （`WikiLinkText` 为 Text）、目标隐藏（`WikiLinkTarget` 为 Marker）。
+fn wiki_link(
+    source: &str,
+    base: usize,
+    bytes: &[u8],
+    i: usize,
+) -> Option<(usize, Vec<SyntaxSpan>)> {
+    // 跳过 `[[`
+    let content_start = i + 2;
+    // 找 `]]`
+    let close = find_close(bytes, content_start)?;
+    let content = &source[base + content_start..base + close];
+    if content.is_empty() {
+        return None;
+    }
+    let mut spans = vec![SyntaxSpan::marker(
+        base + i..base + i + 2,
+        SpanRole::WikiLinkMarker,
+    )];
+    // 按第一个 `|` 分目标与别名
+    match content.find('|') {
+        Some(p) => {
+            let target = &content[..p];
+            let alias = &content[p + 1..];
+            if target.is_empty() || alias.is_empty() {
+                return None;
+            }
+            // 目标页名（隐藏）
+            spans.push(SyntaxSpan::marker(
+                base + content_start..base + content_start + target.len(),
+                SpanRole::WikiLinkTarget,
+            ));
+            // `|`（隐藏）
+            spans.push(SyntaxSpan::marker(
+                base + content_start + target.len()..base + content_start + target.len() + 1,
+                SpanRole::WikiLinkMarker,
+            ));
+            // 别名（可见）
+            spans.push(SyntaxSpan::text(
+                base + content_start + target.len() + 1..base + close,
+                SpanRole::WikiLinkText,
+            ));
+        }
+        None => {
+            // 无别名：目标页名可见
+            spans.push(SyntaxSpan::text(
+                base + content_start..base + close,
+                SpanRole::WikiLinkTarget,
+            ));
+        }
+    }
+    // `]]`（隐藏）
+    spans.push(SyntaxSpan::marker(
+        base + close..base + close + 2,
+        SpanRole::WikiLinkMarker,
+    ));
+    let total = close + 2 - i;
+    Some((total, spans))
+}
+
+/// 从 `from` 起找 `]]` 的起始位置（字节偏移，相对 `bytes`）。
+fn find_close(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut j = from;
+    while j + 1 < bytes.len() {
+        if bytes[j] == b']' && bytes[j + 1] == b']' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
 }
 
 /// 链接：`[text](dest)`；text 递归解析，URL 隐藏。
@@ -477,5 +553,57 @@ mod tests {
         let spans = parse("**粗**体");
         let runs = crate::span::visible_runs(&spans);
         assert_eq!(runs, vec![2..5, 7..10]); // 粗、体（各 3 字节）
+    }
+
+    #[test]
+    fn wikilink_no_alias() {
+        let src = "[[Page]]";
+        let spans = parse_inline(src, 0..src.len());
+        // `[[` 标记 + 目标（可见 Text）+ `]]` 标记
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].role, SpanRole::WikiLinkMarker);
+        assert_eq!(spans[0].kind, SpanKind::Marker);
+        assert_eq!(spans[1].role, SpanRole::WikiLinkTarget);
+        assert_eq!(spans[1].kind, SpanKind::Text, "无别名时目标可见");
+        assert_eq!(&src[spans[1].range.clone()], "Page");
+        assert_eq!(spans[2].role, SpanRole::WikiLinkMarker);
+    }
+
+    #[test]
+    fn wikilink_with_alias() {
+        let src = "[[Page|别名]]";
+        let spans = parse_inline(src, 0..src.len());
+        // `[[` + 目标（隐藏）+ `|` + 别名（可见）+ `]]`
+        assert_eq!(spans.len(), 5);
+        assert_eq!(spans[1].role, SpanRole::WikiLinkTarget);
+        assert_eq!(spans[1].kind, SpanKind::Marker, "有别名时目标隐藏");
+        assert_eq!(spans[3].role, SpanRole::WikiLinkText);
+        assert_eq!(spans[3].kind, SpanKind::Text, "别名可见");
+        assert_eq!(&src[spans[3].range.clone()], "别名");
+    }
+
+    #[test]
+    fn wikilink_empty_rejected() {
+        // ` [[] ` 空内容不构成 wiki-link
+        let src = "[[]]";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().all(|s| s.role != SpanRole::WikiLinkMarker));
+    }
+
+    #[test]
+    fn wikilink_empty_alias_rejected() {
+        // `[[Page|]]` 空别名不构成
+        let src = "[[Page|]]";
+        let spans = parse_inline(src, 0..src.len());
+        assert!(spans.iter().all(|s| s.role != SpanRole::WikiLinkMarker));
+    }
+
+    #[test]
+    fn wikilink_inline_mixed_with_text() {
+        let src = "前缀 [[Page]] 后缀";
+        let spans = parse_inline(src, 0..src.len());
+        // 前缀 Normal + wiki-link 3 段 + 后缀 Normal
+        assert!(spans.iter().any(|s| s.role == SpanRole::WikiLinkMarker));
+        assert!(spans.iter().any(|s| s.role == SpanRole::WikiLinkTarget));
     }
 }

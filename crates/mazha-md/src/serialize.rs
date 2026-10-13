@@ -344,6 +344,13 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
                     _ => {}
                 }
             }
+            (SpanKind::Marker, SpanRole::WikiLinkMarker) => {
+                // 仅在 `[[`（起始标记）处重建；`|`/`]]` 由重建过程整体消费
+                if source.as_bytes().get(sp.range.start) == Some(&b'[') {
+                    pos = reconstruct_wiki_link(source, spans, pos, &mut out);
+                    continue;
+                }
+            }
             (SpanKind::Widget, SpanRole::ImageMarker) => {
                 out.push_str(&slice(source, &sp.range));
             }
@@ -352,6 +359,53 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
         pos += 1;
     }
     out
+}
+
+/// 从 `pos`（`[[` 标记处）重建 wiki-link 并写入 `out`；返回 `]]` 之后的 `pos`。
+fn reconstruct_wiki_link(
+    source: &str,
+    spans: &[SyntaxSpan],
+    pos: usize,
+    out: &mut String,
+) -> usize {
+    let mut target: Option<String> = None;
+    let mut alias: Option<String> = None;
+    let mut k = pos + 1;
+    while k < spans.len() {
+        let item = &spans[k];
+        if item.kind == SpanKind::Marker
+            && item.role == SpanRole::WikiLinkMarker
+            && source.as_bytes().get(item.range.start) == Some(&b']')
+        {
+            break; // `]]`
+        }
+        if item.role == SpanRole::WikiLinkTarget {
+            target = Some(slice(source, &item.range));
+        }
+        if item.role == SpanRole::WikiLinkText {
+            alias = Some(slice(source, &item.range));
+        }
+        k += 1;
+    }
+    out.push_str("[[");
+    out.push_str(&target.unwrap_or_default());
+    if let Some(a) = alias {
+        out.push('|');
+        out.push_str(&a);
+    }
+    out.push_str("]]");
+    // 跳到 `]]` 之后
+    while k < spans.len() {
+        let item = &spans[k];
+        if item.kind == SpanKind::Marker
+            && item.role == SpanRole::WikiLinkMarker
+            && source.as_bytes().get(item.range.start) == Some(&b']')
+        {
+            return k + 1;
+        }
+        k += 1;
+    }
+    k
 }
 
 fn serialize_block(_block: &Block, _out: &mut String) {}
@@ -523,5 +577,34 @@ mod roundtrip {
         // 保证 BlockKind 在测试中被引用（无死代码告警）
         let b = parse("- [ ] x\n").pop().unwrap();
         assert!(matches!(b.kind, BlockKind::List { .. }));
+    }
+
+    #[test]
+    fn wikilink_roundtrip_no_alias() {
+        let src = "[[Page]]\n";
+        let out = to_md(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn wikilink_roundtrip_with_alias() {
+        let src = "[[Page|别名]]\n";
+        let out = to_md(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn wikilink_roundtrip_mixed() {
+        let src = "前缀 [[Page]] 后缀\n";
+        let out = to_md(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn wikilink_idempotent() {
+        let src = "[[Page|别名]]\n";
+        let once = to_md(src);
+        let twice = to_md(&once);
+        assert_eq!(once, twice);
     }
 }

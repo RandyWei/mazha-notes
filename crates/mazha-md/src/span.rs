@@ -45,6 +45,12 @@ pub enum SpanRole {
     QuoteMarker,
     /// 提示块标记 `[!NOTE]`（渲染时隐藏）。
     CalloutMarker,
+    /// Wiki-link 标记 `[[` / `]]` / `|`（渲染时隐藏）。
+    WikiLinkMarker,
+    /// Wiki-link 目标页名（无别名时可见，有别名时隐藏）。
+    WikiLinkTarget,
+    /// Wiki-link 显示别名（`[[Page|Alias]]` 的 Alias，可见）。
+    WikiLinkText,
     /// 列表项 `-`/`1.` 前缀。
     ListMarker,
     /// 任务列表复选框 `[ ]`/`[x]`。

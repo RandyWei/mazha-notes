@@ -604,6 +604,7 @@ interface Workspace {
 | 0.1.25 | 2026-10-12 | **GFM 表格**支持（方言声明的核心特性补齐）：`BlockKind::Table { align: Vec<Align> }` + `Align`；解析要求"表头行含 `|` + 分隔行 `-`/`:` + 连续数据行"，分隔行决定列数与对齐，单元格按行内语法解析，竖线为可见 `TablePipe`、分隔行为隐藏 `TableDelim`；序列化按对齐重写分隔行（紧跟表头）；HTML 导出真 `<table>/<thead>/<tbody>` + 列对齐样式；投影侧表格行即普通行（竖线可见）；8 + 5 条新测试（含转义竖线、仅表头、字节往返）；md 65 + export 19（总计 224） |
 | 0.1.26 | 2026-10-12 | 表格投影验证：`Document` 层补 2 条测试——① 表格投影显示文本为可见片段拼接（竖线可见、分隔行整行隐藏为空、单元格内容 trim 后无空格）；② 追加表格行后增量刷新投影与全量重建逐字段一致（`assert_projection_matches`）。core 116（总计 226） |
 | 0.1.27 | 2026-10-13 | **Callout（提示块）**知识库扩展：`BlockKind::Callout { kind: CalloutKind, title: Option<String> }` + `CalloutKind`（Note/Tip/Important/Warning/Caution + Custom）；解析识别 `> [!TYPE]` 标记（大小写不敏感，空名 `[!]` 仍为普通引用），`CalloutMarker` 隐藏片段，自定义标题单独存储；序列化 `> [!TYPE]` + 标题 + 子块 `> ` 前缀；HTML 导出 `<div class="callout callout-{type}">` + 标题 + 内容；投影按引用深度（quote_depth）；15 条新测试（md 9 + export 5 + core 1）；md 74 + export 24 + core 117（总计 241） |
+| 0.1.28 | 2026-10-13 | **Wiki-link** 知识库扩展：`SpanRole::{WikiLinkMarker, WikiLinkTarget, WikiLinkText}`；行内解析 `[[Page]]`（目标可见）/ `[[Page|Alias]]`（别名可见、目标隐藏），空内容/空别名不构成；序列化 `[[Target]]`/`[[Target|Alias]]` 重建（`reconstruct_wiki_link`）；HTML 导出 `<a href="目标" class="wikilink">显示文本</a>`（href 转义）；12 条新测试（md 9 + export 3）；md 83 + export 27（总计 253） |
 
 ---
 
