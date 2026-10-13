@@ -24,7 +24,7 @@ cargo test --workspace
 | `mazha-md` | ✅ 块级 + 行内 + 序列化 + 增量重解析 + GFM 表格 + callout + wiki-link + front-matter + tags | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**表格**、**提示块**、**front-matter**）、`parse_inline`（含 **wiki-link**、**tags** `#tag`/`#nested/tag`/CJK）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | —（方言特性已齐） |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、并发收敛 | 多文档名册、持久化落盘 |
-| `mazha-export` | 🟡 HTML 完成 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/**提示块（callout div + 标题 + 类型）**/列表/任务/围栏代码/分割线/**GFM 表格（table/thead/tbody + 列对齐 + 单元格行内 + 转义）**/行内强调/粗体/删除线/代码/链接/**wiki-link（a.wikilink + href=目标）**/自动链接/图片/换行 | PDF（Typst）、DOCX/EPUB、模板/主题 |
+| `mazha-export` | 🟡 HTML + Typst 标记 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/**提示块（callout div + 标题 + 类型）**/列表/任务/围栏代码/分割线/**GFM 表格（table/thead/tbody + 列对齐 + 单元格行内 + 转义）**/行内强调/粗体/删除线/代码/链接/**wiki-link（a.wikilink + href=目标）**/自动链接/图片/换行；`to_typst`（Markdown→Typst 标记：标题/段落/行内/列表/代码块/引用/表格/提示块/wiki-link/标签/图片/删除线，**编译 PDF 字节需 Typst World，后续补**） | PDF 编译（Typst World）、DOCX/EPUB、模板/主题 |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -33,9 +33,9 @@ cargo test --workspace
 
 - `mazha-core`：119
 - `mazha-md`：99
-- `mazha-export`：30
+- `mazha-export`：46
 - `mazha-crdt`：11
-- 合计 **274** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **290** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 

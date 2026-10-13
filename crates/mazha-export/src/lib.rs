@@ -6,8 +6,10 @@
 //! 当前已实现 **HTML**（[`to_html`]），基于 `mazha-md` 的块/片段模型渲染。
 
 mod html;
+mod typst;
 
 pub use html::{DEFAULT_CSS, to_html, to_html_document};
+pub use typst::to_typst;
 
 /// 支持的导出目标格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

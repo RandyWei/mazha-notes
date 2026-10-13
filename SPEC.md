@@ -608,6 +608,7 @@ interface Workspace {
 | 0.1.29 | 2026-10-13 | **Front-matter** 知识库扩展：`BlockKind::FrontMatter { content: String }`（原始 YAML 文本）；解析仅识别文档首行恰为 `---`（无前导空格）且后续有闭合 `---`/`...`，否则按分割线/段落处理；序列化 `---` + 原文 + `---`（末尾不带换行，由 `serialize_source` 补）；HTML 导出隐藏（元数据不渲染）；投影为无片段空行；10 条新测试（md 8 + export 1 + core 1）；md 91 + export 28 + core 118（总计 263） |
 | 0.1.30 | 2026-10-13 | **全管线集成测试**：`full_pipeline_all_features`——单文档覆盖 front-matter/标题/段落（含全部行内语法+wiki-link）/提示块/引用/列表/任务/表格/代码块/分割线/图片；验证①块种类齐全 ②序列化逐字节往返 ③追加段落后增量投影与全量一致。core 119（总计 264） |
 | 0.1.31 | 2026-10-13 | **Tags** 知识库扩展（方言特性补齐）：`SpanRole::Tag`（可见）；行内解析 `#tag`/`#nested/tag`/CJK 标签（Unicode 字母数字 + `-`/`_`/`/`），词中 `a#b` 不误判、末尾 `/` 拒绝、`\#` 转义排除；序列化 Text 片段自动往返；HTML 导出 `<span class="tag">`；10 条新测试（md 8 + export 2）；md 99 + export 30（总计 274） |
+| 0.1.32 | 2026-10-13 | **Typst 标记导出**（PDF 管线第一步）：`mazha-export::to_typst`——Markdown→Typst 标记纯文本转换（标题 `=`/段落/行内 `*`/`_`/`` ` ``/`#link`/`#strike`/列表 `-`/`+`/代码块围栏/引用 `#quote`/表格 `#table`+对齐/提示块 `#block`/wiki-link 可见文本/标签 `#text(fill: blue)`/图片 `#image`）；**编译 PDF 字节需 Typst `World` 实现（后续补）**；16 条新测试；export 46（总计 290） |
 
 ---
 
