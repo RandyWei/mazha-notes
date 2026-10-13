@@ -11,11 +11,14 @@ use std::ops::Range;
 /// 用户输入意图。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
-    /// 插入文本。
+    /// 输入文本（可覆盖选区）。
+    ///
+    /// `range` 为当前选区：空区间表示纯插入（光标），非空则表示"用 `text`
+    /// 替换选区内容"——这是"选中后打字"的标准语义。
     InsertText {
-        /// 插入位置（源字节偏移）。
-        at: usize,
-        /// 文本内容。
+        /// 选区（源字节范围）；空区间 = 纯插入点。
+        range: Range<usize>,
+        /// 要输入的文本。
         text: String,
     },
     /// 回车换行（在列表项中续行、空项则退出列表）。
@@ -53,6 +56,11 @@ pub enum Intent {
         /// 光标位置（成对符号之间的源字节偏移）。
         at: usize,
     },
+    /// 删除选区内容（Delete / Backspace 且有选区时）。
+    DeleteSelection {
+        /// 选区（源字节范围）。
+        range: Range<usize>,
+    },
 }
 
 /// 把输入意图翻译为编辑命令。
@@ -68,9 +76,23 @@ pub struct DefaultIntentMapper;
 impl IntentMapper for DefaultIntentMapper {
     fn map(&self, intent: &Intent, doc: &Document) -> Vec<Edit> {
         match intent {
-            Intent::InsertText { at, text } => vec![Edit::Insert {
-                at: *at,
-                text: text.clone(),
+            Intent::InsertText { range, text } => {
+                if range.is_empty() {
+                    // 空选区 = 纯插入（不在选区上做替换）
+                    vec![Edit::Insert {
+                        at: range.start,
+                        text: text.clone(),
+                    }]
+                } else {
+                    // 有选区 = 覆盖输入
+                    vec![Edit::Replace {
+                        range: range.clone(),
+                        text: text.clone(),
+                    }]
+                }
+            }
+            Intent::DeleteSelection { range } => vec![Edit::Delete {
+                range: range.clone(),
             }],
             Intent::Newline { at } => vec![newline_edit(&doc.text(), *at)],
             Intent::ToggleInline { range, mark } => vec![Edit::ToggleInline {
@@ -269,7 +291,7 @@ mod tests {
         let doc = Document::new("ab");
         let edits = mapper().map(
             &Intent::InsertText {
-                at: 1,
+                range: 1..1,
                 text: "X".into(),
             },
             &doc,
@@ -281,6 +303,52 @@ mod tests {
                 text: "X".into()
             }]
         );
+    }
+
+    #[test]
+    fn insert_text_over_selection_replaces() {
+        let mut doc = Document::new("hello world");
+        let edits = mapper().map(
+            &Intent::InsertText {
+                range: 6..11, // 选中 "world"
+                text: "世界".into(),
+            },
+            &doc,
+        );
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "hello 世界");
+    }
+
+    #[test]
+    fn insert_text_over_selection_is_atomic() {
+        let mut doc = Document::new("abcdef");
+        let edits = mapper().map(
+            &Intent::InsertText {
+                range: 1..4, // 选中 "bcd"
+                text: "Z".into(),
+            },
+            &doc,
+        );
+        // 单条 Replace → 一次 undo 即可还原
+        assert_eq!(edits.len(), 1);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "aZef");
+        doc.undo().unwrap();
+        assert_eq!(doc.text(), "abcdef");
+    }
+
+    #[test]
+    fn delete_selection_removes_range() {
+        let mut doc = Document::new("hello world");
+        let edits = mapper().map(
+            &Intent::DeleteSelection {
+                range: 5..11, // " world"
+            },
+            &doc,
+        );
+        assert_eq!(edits, vec![Edit::Delete { range: 5..11 }]);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "hello");
     }
 
     #[test]
