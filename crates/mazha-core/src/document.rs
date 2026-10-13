@@ -1190,4 +1190,71 @@ mod tests {
         let last = proj.lines.last().expect("至少一行");
         assert_eq!(last.display_text(), "正文");
     }
+
+    /// 全语法特性集成：解析 → 投影一致 → 编辑后仍一致 → 序列化往返。
+    #[test]
+    fn full_pipeline_all_features() {
+        let src = concat!(
+            "---\ntitle: 集成\n---\n",
+            "# 标题\n\n",
+            "段落 **粗** *斜* ~~删~~ `码` [链接](https://x.com) [[Page|别名]]\n\n",
+            "> [!NOTE]\n> 提示内容\n\n",
+            "> 普通引用\n\n",
+            "- 列表项\n- [x] 任务\n\n",
+            "1. 有序\n\n",
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n",
+            "```rust\nfn main() {}\n```\n\n",
+            "---\n\n",
+            "![图](img.png)\n",
+        );
+        let mut d = doc(src);
+        assert_projection_matches(&mut d, "全特性初始");
+
+        // 验证块种类齐全
+        let blocks = mazha_md::parse(src);
+        let kinds: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b.kind {
+                mazha_md::BlockKind::FrontMatter { .. } => "front-matter",
+                mazha_md::BlockKind::Heading { .. } => "heading",
+                mazha_md::BlockKind::Paragraph => "paragraph",
+                mazha_md::BlockKind::Callout { .. } => "callout",
+                mazha_md::BlockKind::BlockQuote => "quote",
+                mazha_md::BlockKind::List { .. } => "list",
+                mazha_md::BlockKind::Table { .. } => "table",
+                mazha_md::BlockKind::CodeBlock { .. } => "code",
+                mazha_md::BlockKind::ThematicBreak => "hr",
+                mazha_md::BlockKind::ListItem { .. } => "list-item",
+            })
+            .collect();
+        for expected in [
+            "front-matter",
+            "heading",
+            "paragraph",
+            "callout",
+            "quote",
+            "list",
+            "table",
+            "code",
+            "hr",
+        ] {
+            assert!(
+                kinds.contains(&expected),
+                "应包含 {expected} 块，实际 {kinds:?}"
+            );
+        }
+
+        // 序列化往返（结构保持）
+        let roundtrip = mazha_md::to_md(src);
+        assert_eq!(roundtrip, src, "全特性序列化应逐字节往返");
+
+        // 在末尾追加段落 → 增量投影仍与全量一致
+        let at = d.len();
+        d.apply(Edit::Insert {
+            at,
+            text: "\n追加段落".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "全特性追加");
+    }
 }

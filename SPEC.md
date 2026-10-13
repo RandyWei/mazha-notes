@@ -606,6 +606,7 @@ interface Workspace {
 | 0.1.27 | 2026-10-13 | **Callout（提示块）**知识库扩展：`BlockKind::Callout { kind: CalloutKind, title: Option<String> }` + `CalloutKind`（Note/Tip/Important/Warning/Caution + Custom）；解析识别 `> [!TYPE]` 标记（大小写不敏感，空名 `[!]` 仍为普通引用），`CalloutMarker` 隐藏片段，自定义标题单独存储；序列化 `> [!TYPE]` + 标题 + 子块 `> ` 前缀；HTML 导出 `<div class="callout callout-{type}">` + 标题 + 内容；投影按引用深度（quote_depth）；15 条新测试（md 9 + export 5 + core 1）；md 74 + export 24 + core 117（总计 241） |
 | 0.1.28 | 2026-10-13 | **Wiki-link** 知识库扩展：`SpanRole::{WikiLinkMarker, WikiLinkTarget, WikiLinkText}`；行内解析 `[[Page]]`（目标可见）/ `[[Page|Alias]]`（别名可见、目标隐藏），空内容/空别名不构成；序列化 `[[Target]]`/`[[Target|Alias]]` 重建（`reconstruct_wiki_link`）；HTML 导出 `<a href="目标" class="wikilink">显示文本</a>`（href 转义）；12 条新测试（md 9 + export 3）；md 83 + export 27（总计 253） |
 | 0.1.29 | 2026-10-13 | **Front-matter** 知识库扩展：`BlockKind::FrontMatter { content: String }`（原始 YAML 文本）；解析仅识别文档首行恰为 `---`（无前导空格）且后续有闭合 `---`/`...`，否则按分割线/段落处理；序列化 `---` + 原文 + `---`（末尾不带换行，由 `serialize_source` 补）；HTML 导出隐藏（元数据不渲染）；投影为无片段空行；10 条新测试（md 8 + export 1 + core 1）；md 91 + export 28 + core 118（总计 263） |
+| 0.1.30 | 2026-10-13 | **全管线集成测试**：`full_pipeline_all_features`——单文档覆盖 front-matter/标题/段落（含全部行内语法+wiki-link）/提示块/引用/列表/任务/表格/代码块/分割线/图片；验证①块种类齐全 ②序列化逐字节往返 ③追加段落后增量投影与全量一致。core 119（总计 264） |
 
 ---
 
