@@ -4,9 +4,9 @@
 > 单一事实来源是 `SPEC.md`；本文件只做"当前进度 / 下一步"的归总，不替代 SPEC。
 
 - 最近更新：2026-10-14
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 已起步**（桌面只读投影渲染可运行）
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 进行中**（桌面只读投影渲染 + 光标/点击定位 + WYSIWYG 标记显隐）
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）
-- 分支：`main`，HEAD `e14e14f`（本次提交前；提交后见下方"提交历史"）
+- 分支：`main`（当前提交见下方"提交历史"）
 
 ## 门禁（提交前必须全绿）
 
@@ -37,7 +37,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现 | 待办 |
 |------|------|--------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 起步 | **只读投影渲染**：`mazha-desktop` 读 `.md`（或内置示例）→ `Document`/`Projection` → 逐行绘制（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；`cargo run -- [path/to/file.md]` | 自写 Element + `shape_line`（命中/光标）、WYSIWYG 标记显隐、IME、编辑命令接入 |
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 起步 | **只读投影渲染**（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；**光标/点击定位 + WYSIWYG 标记显隐**：点击用 `TextLayout::index_for_position` 命中（显示字符索引 → `OffsetMap::display_to_source` → 源偏移），光标行渲染原始 Markdown（`#`/`**`/`-` 可见），其余行投影（隐藏），方向键/Home/End 移动，光标竖线用 `canvas` + `paint_quad`；`cargo run -- [path/to/file.md]` | 自写 Element + `shape_line`（多行连续布局/选区/多光标）、IME（`EntityInputHandler`）、编辑命令接入 |
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6/8/7 |
 
 ## 测试现状
@@ -70,7 +70,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. Phase 2 继续：WYSIWYG 标记显隐（光标所在行才显示 `#`/`**`/`-` 等）→ 自写 Element + `shape_line`（命中测试/光标绘制）→ IME（`EntityInputHandler`）
+1. Phase 2 继续：自写 Element + `shape_line`（多行连续布局 → 选区/多光标）→ IME（`EntityInputHandler`）
 2. 把 `export_pdf` 接到桌面 UI（导出命令/菜单）与 FFI 契约（`mazha-ffi` 占位）
 3. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
 4. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
@@ -79,6 +79,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 27 条；本次提交待下次同步）
 
 ```
+13e0295 feat(desktop): Phase 2 起步——GPUI 只读投影渲染（可运行）
 e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线第二步）
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 b028dad feat(export): Typst 标记导出（PDF 管线第一步）
