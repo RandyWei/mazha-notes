@@ -3,10 +3,10 @@
 > 每次提交代码时**同步更新本文件**（约定，见 `AGENTS.md`）。
 > 单一事实来源是 `SPEC.md`；本文件只做"当前进度 / 下一步"的归总，不替代 SPEC。
 
-- 最近更新：2026-10-13
-- 当前阶段：**Phase 1（共享核心）已完成**；桌面 MVP 尚未开始（Phase 2）
+- 最近更新：2026-10-14
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 已起步**（桌面只读投影渲染可运行）
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）
-- 分支：`main`，HEAD `d60189c`（本次提交前；提交后见下方"提交历史"）
+- 分支：`main`，HEAD `e14e14f`（本次提交前；提交后见下方"提交历史"）
 
 ## 门禁（提交前必须全绿）
 
@@ -14,6 +14,8 @@
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# 桌面端（独立 workspace，见下文平台进度）
+cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && cargo build
 ```
 
 > rustc 需 **≥ 1.92**（workspace `rust-version`，Typst 0.15 的 MSRV），工具链见 `rust-toolchain.toml`（stable）。
@@ -30,6 +32,13 @@ cargo test --workspace
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
+
+## 平台进度（`platforms/*`，各自独立 workspace）
+
+| 平台 | 状态 | 已实现 | 待办 |
+|------|------|--------|------|
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 起步 | **只读投影渲染**：`mazha-desktop` 读 `.md`（或内置示例）→ `Document`/`Projection` → 逐行绘制（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；`cargo run -- [path/to/file.md]` | 自写 Element + `shape_line`（命中/光标）、WYSIWYG 标记显隐、IME、编辑命令接入 |
+| `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6/8/7 |
 
 ## 测试现状
 
@@ -61,15 +70,16 @@ cargo test --workspace
 
 ## 下一步（建议顺序）
 
-1. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
-2. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
-3. 把 `export_pdf` 接到 FFI 契约与桌面 UI（`mazha-ffi` 占位、Phase 2 管线）
-4. Phase 2：桌面 GPUI 只读投影渲染 → WYSIWYG 显隐标记 → IME
+1. Phase 2 继续：WYSIWYG 标记显隐（光标所在行才显示 `#`/`**`/`-` 等）→ 自写 Element + `shape_line`（命中测试/光标绘制）→ IME（`EntityInputHandler`）
+2. 把 `export_pdf` 接到桌面 UI（导出命令/菜单）与 FFI 契约（`mazha-ffi` 占位）
+3. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
+4. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 5. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
 
-## 提交历史（近期，共 26 条；本次提交待下次同步）
+## 提交历史（近期，共 27 条；本次提交待下次同步）
 
 ```
+e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线第二步）
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 b028dad feat(export): Typst 标记导出（PDF 管线第一步）
 90a4c25 feat(md): Tags 知识库扩展（解析 + 导出；方言特性补齐）

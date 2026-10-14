@@ -1,0 +1,15 @@
+[package]
+name = "mazha-desktop"
+version = "0.1.0"
+edition = "2024"
+# 与根工作区一致（Typst/编译依赖的 MSRV 约束）
+rust-version = "1.92"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "码札桌面端（GPUI + gpui-kit，见 SPEC §7.1）"
+
+[dependencies]
+# 共享核心：源文本真相 + 投影（路径依赖，独立于根 workspace 构建）
+mazha-core = { path = "../../crates/mazha-core" }
+# 只声明 gpui-kit：GPUI 由它锁定版本/快照，避免两份 GPUI 类型不兼容（SPEC §7.1）
+gpui-kit = "0.7"

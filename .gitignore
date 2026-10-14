@@ -12,6 +12,7 @@ Cargo.lock.orig
 *.iml
 
 # 平台构建产物（见 SPEC §4.4）
+/platforms/desktop/target/
 /platforms/desktop/build/
 /platforms/ios/build/
 /platforms/ios/DerivedData/

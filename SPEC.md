@@ -381,8 +381,8 @@ interface Workspace {
 
 ### 7.1 桌面（macOS / Windows 优先，Linux 后）— GPUI + gpui-kit
 
-- UI 框架：**GPUI**（Zed 自研，Apache-2.0）+ **gpui-kit 0.7**（组件/主题/Dock/表格/只读 Markdown 渲染）。
-- GPUI 为 **git-only 依赖**，gpui-kit 锁定对应 GPUI 快照；升级需同步。可选 `gpui-fast` 保留渲染特性（`[待确认]`是否启用）。
+- UI 框架：**GPUI**（Zed 自研，Apache-2.0；现以 `gpui-pre` 家族发布在 crates.io）+ **gpui-kit 0.7**（组件/主题/Dock/表格/只读 Markdown 渲染）。
+- GPUI 版本由 gpui-kit 锁定（`gpui-pre` 0.3.x 快照），应用只声明 `gpui-kit`，升级需同步；可选 `gpui-fast` 保留渲染特性（`[待确认]`是否启用）。
 - 编辑器实现要点（沿用现有开源实践 `zorite/gpui-editor`、`velotype`）：
   - 自写 `Element` + `shape_line` 绘制投影；实现 `EntityInputHandler`（键盘 + IME）。
   - 语法标记隐藏：光标不在该行时不绘制标记，光标进入/离开时切换显隐。
@@ -611,6 +611,7 @@ interface Workspace {
 | 0.1.31 | 2026-10-13 | **Tags** 知识库扩展（方言特性补齐）：`SpanRole::Tag`（可见）；行内解析 `#tag`/`#nested/tag`/CJK 标签（Unicode 字母数字 + `-`/`_`/`/`），词中 `a#b` 不误判、末尾 `/` 拒绝、`\#` 转义排除；序列化 Text 片段自动往返；HTML 导出 `<span class="tag">`；10 条新测试（md 8 + export 2）；md 99 + export 30（总计 274） |
 | 0.1.32 | 2026-10-13 | **Typst 标记导出**（PDF 管线第一步）：`mazha-export::to_typst`——Markdown→Typst 标记纯文本转换（标题 `=`/段落/行内 `*`/`_`/`` ` ``/`#link`/`#strike`/列表 `-`/`+`/代码块围栏/引用 `#quote`/表格 `#table`+对齐/提示块 `#block`/wiki-link 可见文本/标签 `#text(fill: blue)`/图片 `#image`）；**编译 PDF 字节需 Typst `World` 实现（后续补）**；16 条新测试；export 46（总计 290） |
 | 0.1.33 | 2026-10-13 | **PDF 编译**（PDF 管线第二步，D25）：`mazha-export::to_pdf`/`PdfExporter`——`ExportWorld` 实现 `typst::World`（虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体）→ `typst::compile` → `typst_pdf::pdf`，返回 `PdfDocument{bytes,warnings}`；`PdfExportOptions{base_dir,system_fonts}`、`PdfError::{Compile,Export}`；标记侧修复 4 处可编译性问题——表格改 `align:` 数组 + 逗号分隔实参、图片 alt 改命名字符串参数、块间空行、Markdown 反斜杠转义需二次转义（新增 `escape_typst`/`escape_typst_string`）；workspace `rust-version` 1.85→1.92（typst MSRV），修 rustc 1.98 新增 `collapsible_if`；14 条新测试（export 60，总计 **304**） |
+| 0.1.34 | 2026-10-14 | **Phase 2 起步：桌面只读投影渲染**（§7.1）：新建 `platforms/desktop`（独立 workspace，`gpui-kit` 0.7 锁定 GPUI 快照，`mazha-core` 路径依赖）→ `mazha-desktop`：读 `.md`（或内置示例）→ `Document`/`Projection` → 逐行绘制（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色跟随深浅色；`cargo run -- [path.md]` 可直接打开文件；§7.1 依赖形态按现状修正为 crates.io `gpui-pre` 家族（由 gpui-kit 锁定）；fmt/clippy/build 门禁覆盖该 crate |
 
 ---
 
