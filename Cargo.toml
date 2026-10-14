@@ -15,7 +15,8 @@ exclude = ["platforms"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Typst 0.15 要求 rustc ≥ 1.92（依赖 MSRV），故工作区 MSRV 与之对齐
+rust-version = "1.92"
 license = "AGPL-3.0-or-later"
 authors = ["RandyWei <weizhengheng@chinahrt.com>"]
 repository = ""

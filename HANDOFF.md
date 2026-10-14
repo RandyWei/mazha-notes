@@ -6,7 +6,7 @@
 - 最近更新：2026-10-13
 - 当前阶段：**Phase 1（共享核心）已完成**；桌面 MVP 尚未开始（Phase 2）
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）
-- 分支：`main`，HEAD `b028dad`
+- 分支：`main`，HEAD `d60189c`（本次提交前；提交后见下方"提交历史"）
 
 ## 门禁（提交前必须全绿）
 
@@ -16,6 +16,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+> rustc 需 **≥ 1.92**（workspace `rust-version`，Typst 0.15 的 MSRV），工具链见 `rust-toolchain.toml`（stable）。
+
 ## crate 进度
 
 | crate | 状态 | 已实现 | 待办 |
@@ -24,7 +26,7 @@ cargo test --workspace
 | `mazha-md` | ✅ Phase 1 完成（方言特性全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**GFM 表格**、**Callout 提示块**、**Front-matter**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/**wiki-link**/**tags**）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | — |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace/push`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、`snapshot`（快照压缩，O(历史)→O(文本)）、并发收敛 | 多文档名册 |
-| `mazha-export` | 🟡 HTML + Typst 标记 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/提示块/列表/任务/围栏代码/分割线/GFM 表格/行内全套/链接/wiki-link/标签/图片；`to_typst`（Markdown→Typst 标记纯文本：标题/段落/行内/列表/代码块/引用/表格/提示块/wiki-link/标签/图片/删除线） | PDF 编译（Typst World）、DOCX/EPUB、模板/主题 |
+| `mazha-export` | ✅ HTML + **PDF** 可用 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/提示块/列表/任务/围栏代码/分割线/GFM 表格/行内全套/链接/wiki-link/标签/图片；`to_typst`（Markdown→Typst 标记：含 `escape_typst` 特殊字符转义、表格 `align:` + 逗号实参、图片 `alt:` 命名参数、动态围栏）；**`to_pdf`/`PdfExporter`**（`ExportWorld` 实现 `typst::World`：虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体 → `typst::compile` → `typst_pdf::pdf`；`PdfDocument{bytes,warnings}`、`PdfError::{Compile,Export}`、`PdfExportOptions{base_dir,system_fonts}`） | DOCX/EPUB、模板/主题、字体子集（Web） |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -33,15 +35,16 @@ cargo test --workspace
 
 - `mazha-core`：119
 - `mazha-md`：99
-- `mazha-export`：46
+- `mazha-export`：60
 - `mazha-crdt`：11
-- 合计 **290** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **304** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
 - D1–D22：重写、GPUI+gpui-kit、纯 Rust 核心、源文本真相、GFM+知识库方言、yrs CRDT、WASM 插件、AGPL-3.0 等。
 - D23：Markdown **自研行扫描**（块级+行内，精确字节偏移），`pulldown-cmark` 降为 dev 依赖做对照。见 [`docs/ADR/ADR-001`](docs/ADR/ADR-001-self-authored-markdown-parser.md)。
 - D24：`StorageProvider` 采用**同步**接口（本地文件系统为唯一 MVP Provider），异步/流式/文件监听推迟到 Phase 5。
+- D25：PDF 编译走 `to_typst` + 自实现 `ExportWorld`（`typst::World`：虚拟主文件 / `base_dir` 资源根 / `typst-kit` 字体），`typst::compile` + `typst_pdf::pdf`；workspace `rust-version` 提到 1.92（typst 0.15 MSRV）。
 
 ## 依赖方向（不可违反）
 
@@ -58,15 +61,16 @@ cargo test --workspace
 
 ## 下一步（建议顺序）
 
-1. PDF 编译：Typst `World` 实现 + `typst` crate（`to_typst` 已就绪，缺编译器接入）
-2. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
-3. `mazha-export`：DOCX/EPUB、模板/主题
+1. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
+2. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
+3. 把 `export_pdf` 接到 FFI 契约与桌面 UI（`mazha-ffi` 占位、Phase 2 管线）
 4. Phase 2：桌面 GPUI 只读投影渲染 → WYSIWYG 显隐标记 → IME
 5. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
 
-## 提交历史（近期，共 25 条）
+## 提交历史（近期，共 26 条；本次提交待下次同步）
 
 ```
+d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 b028dad feat(export): Typst 标记导出（PDF 管线第一步）
 90a4c25 feat(md): Tags 知识库扩展（解析 + 导出；方言特性补齐）
 e956e3a test(core): 全管线集成测试（全语法特性）

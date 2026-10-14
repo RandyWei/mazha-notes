@@ -9,6 +9,11 @@ authors.workspace = true
 
 [dependencies]
 mazha-md = { path = "../mazha-md" }
+# PDF 编译管线（决策 D21）：typst 编译器 + 布局/导出 + 工具集（内嵌字体 / 系统字体扫描）
+typst = "0.15"
+typst-layout = "0.15"
+typst-pdf = "0.15"
+typst-kit = { version = "0.15", features = ["embedded-fonts", "scan-fonts"] }
 
 [lints]
 workspace = true

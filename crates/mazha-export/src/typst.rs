@@ -1,11 +1,45 @@
 //! Markdown → Typst 标记转换（PDF 导出管线的第一步）。
 //!
-//! 把 [`mazha-md`] 的块/片段模型转换为 Typst 标记文本。编译为 PDF 字节
-//! 需要 Typst 编译器（`World` 实现），作为后续步骤；本模块只做纯文本转换，
-//! 不引入编译器依赖。见 `SPEC.md` §8、D21。
+//! 把 [`mazha-md`] 的块/片段模型转换为 Typst 标记文本；编译为 PDF 字节由
+//! 同 crate 的 `pdf` 模块（Typst `World` 实现）完成。见 `SPEC.md` §8、D21。
+//!
+//! 关键约束：输出必须是**可编译的 Typst 标记**——可见文本里的标记特殊字符
+//! 必须转义（见 [`escape_typst`]），块与块之间必须留空行（Typst 用空行分段）。
 
 use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
 use std::fmt::Write as _;
+
+/// Typst 标记模式中具有结构含义、必须转义的字符。
+///
+/// 覆盖：`\`（转义符自身）、`#`（代码表达式）、`[`/`]`（内容块）、
+/// `` ` ``（行内原始文本）、`$`（数学）、`*`/`_`（强调）、`<`/`>`（标签与行首引用）、
+/// `@`（引用，如邮箱会被误判）、`/`（`//`、`/*` 注释）、
+/// `~`（不间断空格简写）、`=`（行首会被当成标题）。
+const MARKUP_SPECIAL: &[char] = &[
+    '\\', '#', '[', ']', '`', '$', '*', '_', '<', '>', '@', '/', '~', '=',
+];
+
+/// 把可见文本转义成 Typst 标记安全的文本。
+///
+/// Typst 中「`\` + 任意非空白字符」的求值结果就是该字符本身，因此逐字符
+/// 转义即可无损还原；空白字符绝不转义（行尾单独一个 `\` 表示换行符）。
+fn escape_typst(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if MARKUP_SPECIAL.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 转义 Typst **代码模式字符串**内部的文本（如 `#link("…")` 的 URL）。
+///
+/// 字符串字面量里只有 `"` 与 `\` 有特殊含义，其余字符原样保留。
+fn escape_typst_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
 /// 把 Markdown 源文本转换为 Typst 标记。
 pub fn to_typst(source: &str) -> String {
@@ -16,10 +50,13 @@ pub fn to_typst(source: &str) -> String {
 }
 
 /// 递归转换一组块。
+///
+/// 块之间用**空行**分隔：Typst 以空行分段，单换行只是段内空格，否则
+/// 两个段落会被合并成一段。
 fn blocks_to_typst(source: &str, blocks: &[Block], out: &mut String) {
     for b in blocks {
         block_to_typst(source, b, out);
-        out.push('\n');
+        out.push_str("\n\n");
     }
 }
 
@@ -42,7 +79,9 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
             inline_to_typst(source, &b.spans, out);
         }
         BlockKind::ThematicBreak => {
-            out.push_str("---");
+            // `---` 在 Typst 标记里是破折号简写（em dash），不是分隔线，
+            // 因此显式画一条 100% 宽的横线
+            out.push_str("#line(length: 100%)");
         }
         BlockKind::BlockQuote => {
             out.push_str("#quote[");
@@ -50,8 +89,8 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
             out.push(']');
         }
         BlockKind::Callout { kind, title } => {
-            // 提示块 → Typst block + 醒目标题
-            let heading = title.as_deref().unwrap_or_else(|| kind.as_str());
+            // 提示块 → Typst block + 醒目标题（标题是可见文本，需转义）
+            let heading = escape_typst(title.as_deref().unwrap_or_else(|| kind.as_str()));
             let _ = write!(out, "#block(fill: luma(240), inset: 10pt, radius: 4pt)[");
             let _ = write!(out, "*{heading}*\n\n");
             blocks_to_typst(source, &b.children, out);
@@ -77,13 +116,17 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
         }
         BlockKind::CodeBlock { lang, .. } => {
             let lang_tag = lang.as_deref().unwrap_or("");
-            let _ = writeln!(out, "```{lang_tag}");
+            let mut content = String::new();
             for sp in &b.spans {
                 if sp.role == SpanRole::CodeContent {
-                    out.push_str(&source[sp.range.clone()]);
+                    content.push_str(&source[sp.range.clone()]);
                 }
             }
-            out.push_str("\n```");
+            // 围栏取「内容中最长反引号串 + 1（至少 3）」，避免内容自带 ``` 时提前闭合
+            let fence = "`".repeat(longest_backtick_run(&content).max(2) + 1);
+            let _ = writeln!(out, "{fence}{lang_tag}");
+            out.push_str(&content);
+            let _ = write!(out, "\n{fence}");
         }
         BlockKind::Table { align } => {
             table_to_typst(source, b, align, out);
@@ -107,12 +150,38 @@ fn list_item_to_typst(source: &str, item: &Block, out: &mut String) {
         }
         match &child.kind {
             BlockKind::Paragraph => inline_to_typst(source, &child.spans, out),
+            // 嵌套列表：Typst 以缩进表达层级，统一缩进两空格
+            BlockKind::List { .. } => {
+                let mut nested = String::new();
+                block_to_typst(source, child, &mut nested);
+                for line in nested.lines() {
+                    let _ = writeln!(out, "  {line}");
+                }
+            }
             _ => block_to_typst(source, child, out),
         }
     }
 }
 
+/// 计算文本中最长的连续反引号长度（用于决定围栏长度）。
+fn longest_backtick_run(text: &str) -> usize {
+    let mut best = 0usize;
+    let mut cur = 0usize;
+    for ch in text.chars() {
+        if ch == '`' {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
+}
+
 /// 表格 → Typst `#table`。
+///
+/// Typst 的函数实参必须用逗号分隔，且对齐走 `align:` 参数（可传对齐数组），
+/// 单元格直接写成内容块 `[..]`——比逐格 `table.cell(...)` 更简洁也更符合习惯。
 fn table_to_typst(source: &str, b: &Block, align: &[mazha_md::Align], out: &mut String) {
     let rows = table_rows_typst(source, b);
     if rows.is_empty() {
@@ -121,18 +190,24 @@ fn table_to_typst(source: &str, b: &Block, align: &[mazha_md::Align], out: &mut 
     let cols = align.len().max(rows.first().map_or(0, Vec::len));
     out.push_str("#table(\n");
     let _ = writeln!(out, "  columns: {cols},");
+    // 逐列对齐：align 接受与列等长的数组，缺省按左对齐处理
+    let alignments: Vec<&str> = (0..cols)
+        .map(|ci| match align.get(ci) {
+            Some(mazha_md::Align::Center) => "center",
+            Some(mazha_md::Align::Right) => "right",
+            _ => "left",
+        })
+        .collect();
+    let _ = writeln!(out, "  align: ({}),", alignments.join(", "));
     for row in &rows {
-        for (ci, cell) in row.iter().enumerate() {
-            let a = match align.get(ci) {
-                Some(mazha_md::Align::Center) => "center",
-                Some(mazha_md::Align::Right) => "right",
-                _ => "left",
-            };
-            let _ = write!(out, "  table.cell(align: {a})[{cell}]");
+        for cell in row {
+            // 单元格是标记内容块，可见文本必须转义
+            let cell = escape_typst(cell);
+            let _ = write!(out, "  [{cell}],");
         }
         out.push('\n');
     }
-    out.push(']');
+    out.push(')');
 }
 
 /// 把表格块按行切成"单元格可见文本"（跳过分隔行）。
@@ -164,7 +239,8 @@ fn table_rows_typst(source: &str, b: &Block) -> Vec<Vec<String>> {
             }
             if sp.role == SpanRole::TablePipe {
                 cells.push(String::new());
-            } else {
+            } else if sp.kind == SpanKind::Text {
+                // 只取可见文本片段，跳过 `**`、链接括号等行内标记
                 cells
                     .last_mut()
                     .expect("至少一个单元格")
@@ -198,12 +274,13 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
         match (sp.kind, sp.role) {
             // 标签：单独样式（须在通用 Text 之前）
             (SpanKind::Text, SpanRole::Tag) => {
-                let _ = write!(out, "#text(fill: blue)[{}]", &source[sp.range.clone()]);
+                let text = escape_typst(&source[sp.range.clone()]);
+                let _ = write!(out, "#text(fill: blue)[{text}]");
                 i += 1;
             }
-            // 可见文本一律输出内容（样式由成对 Marker 开合）
+            // 可见文本一律输出内容（样式由成对 Marker 开合），特殊字符转义
             (SpanKind::Text, _) => {
-                out.push_str(&source[sp.range.clone()]);
+                out.push_str(&escape_typst(&source[sp.range.clone()]));
                 i += 1;
             }
             (SpanKind::Marker, SpanRole::Strong) => {
@@ -230,11 +307,11 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
             (SpanKind::Marker, SpanRole::LinkMarker) => {
                 let ch = source.as_bytes().get(sp.range.start).copied();
                 if ch == Some(b'[') {
-                    // 找目标 URL
+                    // 找目标 URL（写进代码模式字符串，按字符串规则转义）
                     let dest = spans[i..]
                         .iter()
                         .find(|s| s.role == SpanRole::LinkDest)
-                        .map(|s| source[s.range.clone()].to_string())
+                        .map(|s| escape_typst_string(&source[s.range.clone()]))
                         .unwrap_or_default();
                     let _ = write!(out, "#link(\"{dest}\")[");
                 } else if ch == Some(b')') {
@@ -243,9 +320,16 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 i += 1;
             }
             (SpanKind::Widget, SpanRole::ImageMarker) => {
-                // 图片：#image("src")[alt]
+                // 图片：#image("src", alt: "…") —— Typst 的 alt 是字符串参数，
+                // 不是尾随内容块（传内容块会报 unexpected argument）
                 if let Some((alt, dest)) = parse_image_typst(&source[sp.range.clone()]) {
-                    let _ = write!(out, "#image(\"{dest}\")[{alt}]");
+                    let dest = escape_typst_string(&dest);
+                    if alt.is_empty() {
+                        let _ = write!(out, "#image(\"{dest}\")");
+                    } else {
+                        let alt = escape_typst_string(&alt);
+                        let _ = write!(out, "#image(\"{dest}\", alt: \"{alt}\")");
+                    }
                 }
                 i += 1;
             }
@@ -258,9 +342,10 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 i += 1;
             }
             (SpanKind::Marker, SpanRole::EscapeMarker) => {
-                // 转义反斜杠后的标点：Typst 里直接输出标点
+                // Markdown 的反斜杠只说明"这是字面量"，落到 Typst 还得重新转义，
+                // 否则 `#`、`[`、`*` 等会被 Typst 当语法再次解析
                 if let Some(next) = spans.get(i + 1) {
-                    out.push_str(&source[next.range.clone()]);
+                    out.push_str(&escape_typst(&source[next.range.clone()]));
                     i += 2;
                 } else {
                     i += 1;
@@ -346,6 +431,7 @@ mod tests {
         let t = to_typst("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
         assert!(t.contains("#table("));
         assert!(t.contains("columns: 2,"));
+        assert!(t.contains("align: ("), "{t}");
         assert!(t.contains("[a]"));
         assert!(t.contains("[b]"));
         assert!(t.contains("[1]"));
@@ -354,8 +440,53 @@ mod tests {
 
     #[test]
     fn typst_thematic_break() {
+        // `---` 在 Typst 是破折号简写，必须显式画横线
         let t = to_typst("---\n");
-        assert!(t.contains("---"));
+        assert!(t.contains("#line(length: 100%)"));
+        assert!(!t.contains("---"));
+    }
+
+    #[test]
+    fn typst_escapes_markup_specials() {
+        // Markdown 里用反斜杠拿到"字面量特殊字符"，输出时必须再转义回 Typst 安全文本
+        let t =
+            to_typst("价 \\#100 \\[方括号\\] a\\_b \\*星\\* <标签> x@y.z 斜杠//注释 \\~波浪 =号\n");
+        assert!(t.contains("\\#100"), "{t}");
+        assert!(t.contains("\\[方括号\\]"), "{t}");
+        assert!(t.contains("a\\_b"), "{t}");
+        assert!(t.contains("\\*星\\*"), "{t}");
+        assert!(t.contains("\\<标签\\>"), "{t}");
+        assert!(t.contains("x\\@y.z"), "{t}");
+        assert!(t.contains("\\/\\/"), "{t}");
+        assert!(t.contains("\\~波浪"), "{t}");
+        assert!(t.contains("\\=号"), "{t}");
+    }
+
+    #[test]
+    fn typst_escapes_string_literals() {
+        let t = to_typst("[点这里](https://x.com/a\"b)\n");
+        assert!(t.contains("#link(\"https://x.com/a\\\"b\")"), "{t}");
+    }
+
+    #[test]
+    fn typst_blocks_separated_by_blank_line() {
+        let t = to_typst("第一段\n\n第二段\n");
+        assert!(t.contains("第一段\n\n第二段"), "{t}");
+    }
+
+    #[test]
+    fn typst_nested_list_indented() {
+        let t = to_typst("- 甲\n  - 乙\n");
+        assert!(t.contains("\n  - 乙"), "{t}");
+    }
+
+    #[test]
+    fn typst_code_fence_longer_than_content() {
+        // 内容里含 ``` 时围栏要加长，否则提前闭合
+        let src = "````\n```rust\nfn main() {}\n```\n````\n";
+        let t = to_typst(src);
+        assert!(t.contains("````\n"), "{t}");
+        assert!(t.contains("```rust"), "{t}");
     }
 
     #[test]
@@ -381,7 +512,7 @@ mod tests {
     #[test]
     fn typst_image() {
         let t = to_typst("![图](img.png)\n");
-        assert!(t.contains("#image(\"img.png\")"));
+        assert!(t.contains("#image(\"img.png\", alt: \"图\")"), "{t}");
     }
 
     #[test]

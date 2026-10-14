@@ -434,7 +434,7 @@ interface Workspace {
 | 插件运行时 | `wasmtime`（桌面）/ `wasmi`（移动） | Component Model + WIT |
 | 公式 | `ratex-parser/layout/render/svg` + `ratex-gpui` | KaTeX 移植 |
 | 图表 | `mermaid-rs-renderer` | 纯 Rust → SVG/PNG |
-| PDF 导出 | Typst | 纯 Rust；排版质量优先（已确认） |
+| PDF 导出 | Typst 0.15（`typst` / `typst-layout` / `typst-pdf` / `typst-kit`）→ [`mazha-export::to_typst`] + [`mazha-export::to_pdf`] | 纯 Rust；排版质量优先（D21，接入方式见 D25）：`to_typst` 产出标记，`ExportWorld` 实现 `typst::World` 后 `compile` + `typst_pdf::pdf` 出字节；字体走 `typst-kit`（内置 + 系统扫描） |
 | HTML 导出 | 基于 `mazha-md` 块/片段模型自研渲染（[`mazha-export::to_html`]） | 纯 Rust；与编辑器同源（D23 后 `pulldown-cmark` 仅 dev 对照） |
 | DOCX/EPUB | `[待确认]` `docx-rs` / Zip+XHTML | 后续 Phase |
 | 字体/中文字形 | `[待确认]` 系统字体 + 内置 CJK 子集 | Web/wasm 需内置 |
@@ -534,7 +534,7 @@ interface Workspace {
 | R5 | 移动端触摸交互与 Typora 键盘模型差异 | 一致性目标 | 单独定义移动端交互规范 `[待确认]` |
 | R6 | CRDT 下结构性并发编辑语义 | 数据不丢但可能错乱 | 块级锁定/冲突提示策略 `[待确认]` |
 | R7 | WASM 插件在 iOS/移动端运行时限制 | 插件可用性 | 移动端用 `wasmi` 无 JIT `[待确认]` |
-| R8 | 纯 Rust PDF 导出的排版质量 | 导出观感 | `[待确认]` 引擎选型；必要时引入 Typst |
+| R8 | 纯 Rust PDF 导出的排版质量 | 导出观感 | 已选 Typst 0.15（D21/D25，接入已通）；残留风险为中文字体覆盖与标记转义完备性，需真实文档回归 |
 | R9 | 中文字体在 Web 端需内置 | 体积/一致 | 字体子集化 `[待确认]` |
 
 **待确认清单**：第 7.1（gpui-fast 是否启用）、7.3（Web 方案）、7.4 与 8（DOCX/EPUB 引擎、中文字体子集）、6.3（插件分发与清单）、6.5（并发编辑语义）、9（移动端交互规范）。
@@ -569,6 +569,7 @@ interface Workspace {
 | D22 | 仓库可见性 | GitHub 私有，发布后转公开（AGPL-3.0） | 确认 |
 | D23 | Markdown 解析实现 | 自研行扫描（块级）+ 自研行内扫描，精确字节偏移；`pulldown-cmark` 降为 dev 依赖（测试对照/后续 HTML 导出参考） | 确认（见 `docs/ADR/ADR-001`） |
 | D24 | 存储接口同步/异步 | MVP 采用**同步** `StorageProvider`（本地文件系统为唯一 Provider）；异步/流式与文件监听推迟到 Phase 5 | 确认 |
+| D25 | PDF 编译接入方式 | Typst 0.15 走 `to_typst` 标记 + 自实现 `ExportWorld`（`typst::World`）：虚拟主文件、资源根 `base_dir`（`Project` 根才允许相对路径，拒绝包根）、字体经 `typst-kit`（内置 + 可选系统扫描），`typst::compile` → `typst_pdf::pdf`；workspace `rust-version` 随 typst MSRV 提升至 **1.92** | 确认（见 SPEC §8） |
 
 ---
 
@@ -609,6 +610,7 @@ interface Workspace {
 | 0.1.30 | 2026-10-13 | **全管线集成测试**：`full_pipeline_all_features`——单文档覆盖 front-matter/标题/段落（含全部行内语法+wiki-link）/提示块/引用/列表/任务/表格/代码块/分割线/图片；验证①块种类齐全 ②序列化逐字节往返 ③追加段落后增量投影与全量一致。core 119（总计 264） |
 | 0.1.31 | 2026-10-13 | **Tags** 知识库扩展（方言特性补齐）：`SpanRole::Tag`（可见）；行内解析 `#tag`/`#nested/tag`/CJK 标签（Unicode 字母数字 + `-`/`_`/`/`），词中 `a#b` 不误判、末尾 `/` 拒绝、`\#` 转义排除；序列化 Text 片段自动往返；HTML 导出 `<span class="tag">`；10 条新测试（md 8 + export 2）；md 99 + export 30（总计 274） |
 | 0.1.32 | 2026-10-13 | **Typst 标记导出**（PDF 管线第一步）：`mazha-export::to_typst`——Markdown→Typst 标记纯文本转换（标题 `=`/段落/行内 `*`/`_`/`` ` ``/`#link`/`#strike`/列表 `-`/`+`/代码块围栏/引用 `#quote`/表格 `#table`+对齐/提示块 `#block`/wiki-link 可见文本/标签 `#text(fill: blue)`/图片 `#image`）；**编译 PDF 字节需 Typst `World` 实现（后续补）**；16 条新测试；export 46（总计 290） |
+| 0.1.33 | 2026-10-13 | **PDF 编译**（PDF 管线第二步，D25）：`mazha-export::to_pdf`/`PdfExporter`——`ExportWorld` 实现 `typst::World`（虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体）→ `typst::compile` → `typst_pdf::pdf`，返回 `PdfDocument{bytes,warnings}`；`PdfExportOptions{base_dir,system_fonts}`、`PdfError::{Compile,Export}`；标记侧修复 4 处可编译性问题——表格改 `align:` 数组 + 逗号分隔实参、图片 alt 改命名字符串参数、块间空行、Markdown 反斜杠转义需二次转义（新增 `escape_typst`/`escape_typst_string`）；workspace `rust-version` 1.85→1.92（typst MSRV），修 rustc 1.98 新增 `collapsible_if`；14 条新测试（export 60，总计 **304**） |
 
 ---
 

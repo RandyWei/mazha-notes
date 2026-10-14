@@ -798,10 +798,10 @@ fn build_list_item(
             break;
         }
         // 同级或更浅的列表标记 → 下一个项；否则视为续行
-        if let Some(m) = list_marker(nrest) {
-            if m.indent <= marker.indent {
-                break;
-            }
+        if let Some(m) = list_marker(nrest)
+            && m.indent <= marker.indent
+        {
+            break;
         }
         // 续行：保留其余部分（缩进已在 content 中被后续扫描处理）
         let stripped = indent(nrest).min(nl.content + marker.len);
