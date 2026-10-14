@@ -18,7 +18,7 @@
 //! 一次整篇命中即可换算源偏移；软换行留待后续用 `shape_text` 的 `wrap_boundaries`
 //! 折算成"块内显示行"再映射。
 //!
-//! 尚未实现：IME（`EntityInputHandler`）、软换行、多光标。
+//! 尚未实现：多光标。
 
 use std::ops::Range;
 use std::panic::Location;
@@ -29,7 +29,8 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, DisplayPos, Document, OffsetMap, ProjectedLine, RunStyle, TextRun as DocTextRun,
+    BlockStyle, DisplayPos, Document, Edit, OffsetMap, ProjectedLine, RunStyle,
+    TextRun as DocTextRun,
 };
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -185,6 +186,10 @@ struct DocView {
     ///
     /// 选区 = 锚点到光标的有序区间；锚点等于光标即塌缩为光标。
     anchor: Option<usize>,
+    /// IME 组合文本（未提交的 marked text）对应的源字节范围；`None` = 无组合输入。
+    ///
+    /// 组合期间该区间视为"将被替换"，提交时整体替换、取消时还原。
+    marked: Option<Range<usize>>,
     /// 是否正在拖拽选区（鼠标左键按下未松开）。
     selecting: bool,
     /// 最近一次渲染的布局几何（供鼠标命中测试读取）。
@@ -215,6 +220,7 @@ impl DocView {
             doc: Document::new(&text),
             caret: 0,
             anchor: None,
+            marked: None,
             selecting: false,
             layout: None,
             focus: cx.focus_handle(),
@@ -300,6 +306,177 @@ impl DocView {
             self.anchor = None; // 不按 Shift → 选区塌缩为光标
         }
         self.caret = self.doc.snap_to_boundary(new_caret);
+    }
+
+    /// 应用一次编辑到源文本（唯一修改入口），并把光标移到编辑后的新位置。
+    ///
+    /// `new_caret` 是编辑**完成后**希望光标落在的源字节偏移（会被 `snap_to_boundary` 校正）。
+    /// 编辑失败（非法边界等）时保持文档与光标不变。成功后塌缩选区并清空 IME 组合区。
+    fn apply_edit(&mut self, edit: Edit, new_caret: usize, cx: &mut Context<Self>) {
+        if self.doc.apply(edit).is_ok() {
+            self.anchor = None;
+            self.marked = None;
+            self.caret = self.doc.snap_to_boundary(new_caret);
+            cx.notify();
+        }
+    }
+
+    /// 撤销/重做等"绕过 `apply_edit`"的变更之后，统一收敛光标/选区状态并重绘。
+    ///
+    /// undo/redo 会改变文档长度，光标可能越界，必须重新 `snap_to_boundary`；
+    /// 选区锚点与 IME 组合区在文档结构变化后不再可信，一律清空。
+    fn after_doc_mutation(&mut self, cx: &mut Context<Self>) {
+        self.caret = self.doc.snap_to_boundary(self.caret);
+        self.anchor = None;
+        self.marked = None;
+        cx.notify();
+    }
+
+    /// 删除选区（或光标左侧一个字符，即退格）。返回是否发生了删除。
+    fn delete_backward(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(sel) = self.selection() {
+            let caret = sel.start;
+            self.apply_edit(Edit::Delete { range: sel }, caret, cx);
+            return true;
+        }
+        let prev = self.doc.prev_char_boundary(self.caret);
+        if prev == self.caret {
+            return false; // 已在文档开头
+        }
+        self.apply_edit(Edit::Delete { range: prev..self.caret }, prev, cx);
+        true
+    }
+
+    /// 删除光标右侧一个字符（即 Delete 键）。返回是否发生了删除。
+    fn delete_forward(&mut self, cx: &mut Context<Self>) -> bool {
+        let range = self.selection().unwrap_or_else(|| {
+            let next = self.doc.next_char_boundary(self.caret);
+            self.caret..next
+        });
+        if range.is_empty() {
+            return false; // 已在文档末尾
+        }
+        let caret = range.start;
+        self.apply_edit(Edit::Delete { range }, caret, cx);
+        true
+    }
+
+    /// Enter：插入换行。有选区则先删除选区。
+    fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        let at = range.start;
+        self.apply_edit(
+            Edit::Replace {
+                range,
+                text: "\n".into(),
+            },
+            at + 1,
+            cx,
+        );
+    }
+
+    /// 插入一个制表符（Tab）。有选区则先删除选区。
+    fn insert_tab(&mut self, cx: &mut Context<Self>) {
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        let at = range.start;
+        self.apply_edit(
+            Edit::Replace {
+                range,
+                text: "    ".into(),
+            },
+            at + 4,
+            cx,
+        );
+    }
+
+    /// 插入一个普通字符（IME 提交/直接按键）。有选区则先删除选区。
+    fn insert_char(&mut self, ch: char, cx: &mut Context<Self>) {
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        let at = range.start;
+        let mut text = String::new();
+        text.push(ch);
+        let new_caret = at + text.len();
+        self.apply_edit(Edit::Replace { range, text }, new_caret, cx);
+    }
+
+    /// 用 `text` 替换指定区间 `target`（不先取当前选区）；IME 的内部替换原语。
+    ///
+    /// 与 [`Self::replace_selection_with`] 的区别：后者以"当前选区"为目标，
+    /// 本方法以调用方给定的 `target` 为目标（IME 常传入 marked 区间）。
+    fn replace_selection_with_inner(
+        &mut self,
+        target: Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let start = self.doc.snap_to_boundary(target.start);
+        let end = self.doc.snap_to_boundary(target.end);
+        let range = start.min(end)..start.max(end);
+        let new_caret = range.start + text.len();
+        self.apply_edit(
+            Edit::Replace {
+                range,
+                text: text.to_string(),
+            },
+            new_caret,
+            cx,
+        );
+    }
+
+    /// UTF-8 字节区间 → UTF-16 单元区间（IME 选区查询用）。
+    ///
+    /// 越界时钳到文档末尾；保证 `lo <= hi`。
+    fn utf16_range(&self, start: usize, end: usize) -> (usize, usize) {
+        let text = self.doc.text();
+        let bytes = text.as_bytes();
+        let clamp = |b: usize| -> usize {
+            let b = b.min(bytes.len());
+            // 钳到最近的字符边界，避免切在多字节序列中间
+            let mut i = b;
+            while i > 0 && i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                i -= 1;
+            }
+            i
+        };
+        let (s, e) = (clamp(start), clamp(end));
+        let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+        let u16_lo = text[..lo].encode_utf16().count();
+        let u16_hi = text[..hi].encode_utf16().count();
+        (u16_lo, u16_hi)
+    }
+
+    /// UTF-16 单元区间 → UTF-8 字节区间（IME 设置选区用）。
+    ///
+    /// 线性扫描每个字符的 UTF-16 宽度，累加得到目标单元边界对应的字节偏移。
+    /// `u_target` 为 `None` 表示未到达该边界（钳到文档末）。
+    fn source_range_from_utf16(&self, range: Range<usize>) -> Option<(usize, usize)> {
+        let text = self.doc.text();
+        let total_u16 = text.encode_utf16().count();
+        let clamp = |u: usize| u.min(total_u16);
+        let (u_lo, u_hi) = (clamp(range.start), clamp(range.end));
+        let (u_lo, u_hi) = if u_lo <= u_hi { (u_lo, u_hi) } else { (u_hi, u_lo) };
+
+        // 第一遍：找 u_lo 对应的字节起点
+        let mut u_acc = 0usize;
+        let mut lo_byte = text.len();
+        for (b, ch) in text.char_indices() {
+            if u_acc >= u_lo {
+                lo_byte = b;
+                break;
+            }
+            u_acc += ch.len_utf16();
+        }
+        // 第二遍：找 u_hi 对应的字节终点
+        let mut u_acc = 0usize;
+        let mut hi_byte = text.len();
+        for (b, ch) in text.char_indices() {
+            if u_acc >= u_hi {
+                hi_byte = b;
+                break;
+            }
+            u_acc += ch.len_utf16();
+        }
+        Some((lo_byte, hi_byte))
     }
 
     /// 上/下移动公共实现：`step` 为 -1（上）或 +1（下）。
@@ -430,13 +607,204 @@ impl Render for DocView {
     }
 }
 
-/// 键盘事件 → 光标移动 + Shift 扩选。
+/// IME / 文本输入契约：把 macOS/系统 IME 的组合、提交、选区查询桥接到源文本模型。
+///
+/// 偏移约定：GPUI 传入的 `Range<usize>` 是 **UTF-8 字节偏移**（相对整篇文档），
+/// 与本视图 `caret`/`anchor`/`Document::apply` 的表示一致，无需转换。
+/// 选区查询（`selected_text_range`/`text_for_range`）需转成 UTF-16 供 AppKit。
+impl EntityInputHandler for DocView {
+    /// 查询 `range`（UTF-8 字节）对应的文本，供 IME 剪贴/转换使用。
+    ///
+    /// `adjusted_range` 回填"实际取用"的区间（IME 据此调整 marked text）。
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let start = self.doc.snap_to_boundary(range.start);
+        let end = self.doc.snap_to_boundary(range.end);
+        let snapped = start.min(end)..start.max(end);
+        let text = self.doc.try_slice(snapped.clone()).ok()?.into_owned();
+        *adjusted_range = Some(snapped);
+        Some(text)
+    }
+
+    /// 当前选区（UTF-16 表示）；`reversed` 表示锚点在区间末端（反向选区）。
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let (start, end, reversed) = match self.anchor {
+            Some(anchor) if anchor != self.caret => {
+                let (lo, hi) = if anchor < self.caret {
+                    (anchor, self.caret)
+                } else {
+                    (self.caret, anchor)
+                };
+                (lo, hi, anchor > self.caret)
+            }
+            _ => (self.caret, self.caret, false),
+        };
+        let (u16_start, u16_end) = self.utf16_range(start, end);
+        Some(UTF16Selection {
+            range: u16_start..u16_end,
+            reversed,
+        })
+    }
+
+    /// IME 组合文本（marked text）对应的源字节范围；`None` = 无组合。
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked.clone()
+    }
+
+    /// IME 取消组合：删除 marked 区间文本，光标回到组合起点。
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(marked) = self.marked.take() {
+            let at = marked.start;
+            self.apply_edit(Edit::Delete { range: marked }, at, cx);
+        }
+    }
+
+    /// 用 `text` 替换 `range`（`None` = 当前选区）。IME 每次提交字符都走这里。
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = range.unwrap_or_else(|| self.selection().unwrap_or(self.caret..self.caret));
+        self.replace_selection_with_inner(target, text, cx);
+    }
+
+    /// 替换并进入组合状态：写入 `new_text`，把该区间标记为 marked，并设定组合内选区。
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = range.unwrap_or_else(|| self.selection().unwrap_or(self.caret..self.caret));
+        let start = target.start;
+        self.replace_selection_with_inner(target, new_text, cx);
+        let marked_end = start + new_text.len();
+        self.marked = (marked_end > start).then_some(start..marked_end);
+        // 组合内选区：相对 marked 起点的 UTF-8 偏移，转成绝对源偏移
+        if let Some(rel) = new_selected_range {
+            let abs_start = self.doc.snap_to_boundary(start + rel.start);
+            let abs_end = self.doc.snap_to_boundary(start + rel.end);
+            self.anchor = Some(abs_start);
+            self.caret = abs_end;
+        }
+        cx.notify();
+    }
+
+    /// IME 需要在屏幕上高亮某个 UTF-16 区间时（如组合下划线），换算成屏幕矩形。
+    ///
+    /// 用最近一次渲染缓存的块几何（`layout`）定位；无几何时返回 `None`（跳过高亮）。
+fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let layout = self.layout.as_ref()?;
+        let (start, end) = self.source_range_from_utf16(range_utf16.clone())?;
+        // 找到与 [start, end) 相交的第一个块，用它的几何估算矩形
+        for (idx, block) in layout.blocks.iter().enumerate() {
+            let bs = block.source_range.start;
+            let be = block.source_range.end;
+            if be <= start || end <= bs {
+                continue;
+            }
+            let line_start = start.max(bs);
+            let line_end = end.min(be);
+            let x0 = block.offset_map.source_to_display(line_start).get();
+            let x1 = block.offset_map.source_to_display(line_end).get();
+            let px0 = layout.origin.x + block.indent + block.line.x_for_index(x0);
+            let px1 = layout.origin.x + block.indent + block.line.x_for_index(x1);
+            let row_top = layout.origin.y + layout.line_height * idx as f32;
+            return Some(bounds(
+                point(px0, row_top),
+                size(px1 - px0, layout.line_height),
+            ));
+        }
+        None
+    }
+
+    /// 屏幕点 → 文档 UTF-8 字节偏移（供 IME 判断光标跟随位置）。
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.hit_source(point)
+    }
+
+    /// IME 主动设置选区（UTF-16 区间）；映射回源字节并更新 caret/anchor。
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((start, end)) = self.source_range_from_utf16(range_utf16) {
+            if start == end {
+                self.anchor = None;
+                self.caret = start;
+            } else {
+                self.anchor = Some(start);
+                self.caret = end;
+            }
+            cx.notify();
+        }
+    }
+
+    /// 整篇文档长度（UTF-16 单元数）。
+    fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        let text = self.doc.text();
+        Some(text.encode_utf16().count())
+    }
+}
+
+/// 键盘事件 → 光标移动 / 编辑命令 / 撤销重做 / 全选。
+///
+/// 字符输入主要经 IME（`EntityInputHandler::replace_text_in_range`）送达；
+/// 这里兜底处理无 IME 的 ASCII 直键，以及退格/删除/回车/Tab/撤销/重做/全选。
 fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<DocView>) {
-    // 组合键（Cmd/Ctrl）交给系统，避免误拦截快捷键
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+    let m = &event.keystroke.modifiers;
+    let shift = m.shift;
+
+    // Cmd/Ctrl 组合键：撤销/重做/全选；其余交给系统，避免误拦截
+    if m.control || m.platform {
+        match event.keystroke.key.as_str() {
+            "z" if m.platform => {
+                if shift {
+                    view.doc.redo();
+                } else {
+                    view.doc.undo();
+                }
+                view.after_doc_mutation(cx);
+            }
+            "a" if m.platform => {
+                // 全选：锚点钉在 0，光标到文档末
+                view.anchor = Some(0);
+                view.caret = view.doc.len();
+                cx.notify();
+            }
+            _ => {}
+        }
         return;
     }
-    let shift = event.keystroke.modifiers.shift;
+
     match event.keystroke.key.as_str() {
         "left" => view.move_left(shift),
         "right" => view.move_right(shift),
@@ -444,6 +812,23 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
         "down" => view.move_down(shift),
         "home" => view.move_home(shift),
         "end" => view.move_end(shift),
+        "backspace" => {
+            view.delete_backward(cx);
+        }
+        "delete" => {
+            view.delete_forward(cx);
+        }
+        "enter" | "return" => {
+            view.insert_newline(cx);
+        }
+        "tab" => {
+            view.insert_tab(cx);
+        }
+        // ASCII 直键兜底（IME 未接管时）：仅可打印单字符
+        key if key.chars().count() == 1 && !key.chars().next().unwrap().is_control() => {
+            let ch = key.chars().next().unwrap();
+            view.insert_char(ch, cx);
+        }
         _ => return,
     }
     cx.notify();
@@ -711,7 +1096,7 @@ impl Element for DocElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        element_bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
@@ -770,6 +1155,14 @@ impl Element for DocElement {
                 window.paint_quad(fill(caret_rect, palette.accent));
             }
         }
+
+        // 挂载 IME 输入处理器（需在 paint 阶段调用，传入当前元素 bounds）
+        let view = self.view.clone();
+        window.handle_input(
+            &view.read(cx).focus,
+            ElementInputHandler::new(element_bounds, view),
+            cx,
+        );
     }
 }
 
