@@ -37,7 +37,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现 | 待办 |
 |------|------|--------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 进行中 | **只读投影渲染**（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；**光标/点击定位 + WYSIWYG 标记显隐**：点击用 `TextLayout::index_for_position` 命中（显示字符索引 → `OffsetMap::display_to_source` → 源偏移），光标行渲染原始 Markdown（`#`/`**`/`-` 可见），其余行投影（隐藏），方向键/Home/End 移动，光标竖线用 `canvas` + `paint_quad`；**自写 `Element` + `shape_line`**：逐块连续布局（`DocElement` 记录 `x_for_index`/`closest_index_for_x` 几何）、整篇命中（`DocLayout` 一次换算窗口坐标→源偏移）、**跨行选区**（鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`，块内按重叠区画高亮矩形）；**IME（`EntityInputHandler`）**：`text_for_range`/`selected_text_range`/`marked_text_range`/`unmark_text`/`replace_text_in_range`/`replace_and_mark_text_in_range`/`bounds_for_range`/`character_index_for_point`/`set_selected_text_range`/`text_length_utf16` 全实现，UTF-8↔UTF-16 双向映射，组合文本高亮、提交、取消全支持；**编辑命令（`commands`/`apply_and_sync`）**：行内格式 Cmd+B/I/X/\`（粗/斜/删除线/行内代码），块类型 Cmd+1-6/Shift+8/9/0/-（标题/无序/有序列表/引用/段落），选区/光标位置自动映射到源范围并应用 `toggle_inline`/`set_block`；`cargo run -- [path/to/file.md]` | 多光标 |
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 进行中 | **只读投影渲染**（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；**光标/点击定位 + WYSIWYG 标记显隐**：点击用 `TextLayout::index_for_position` 命中（显示字符索引 → `OffsetMap::display_to_source` → 源偏移），光标行渲染原始 Markdown（`#`/`**`/`-` 可见），其余行投影（隐藏），方向键/Home/End 移动，光标竖线用 `canvas` + `paint_quad`；**自写 `Element` + `shape_line`**：逐块连续布局（`DocElement` 记录 `x_for_index`/`closest_index_for_x` 几何）、整篇命中（`DocLayout` 一次换算窗口坐标→源偏移）、**跨行选区**（鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`，块内按重叠区画高亮矩形）；**IME（`EntityInputHandler`）**：`text_for_range`/`selected_text_range`/`marked_text_range`/`unmark_text`/`replace_text_in_range`/`replace_and_mark_text_in_range`/`bounds_for_range`/`character_index_for_point`/`set_selected_text_range`/`text_length_utf16` 全实现，UTF-8↔UTF-16 双向映射，组合文本高亮、提交、取消全支持；**编辑命令（`commands`/`apply_and_sync`）**：行内格式 Cmd+B/I/X/\`（粗/斜/删除线/行内代码），块类型 Cmd+1-6/Shift+8/9/0/-（标题/无序/有序列表/引用/段落），选区/光标位置自动映射到源范围并应用 `toggle_inline`/`set_block`；**多光标**：Alt+Click 增减光标，方向键/编辑命令同步作用于所有光标，选区独立维护；`cargo run -- [path/to/file.md]` | — |
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6/8/7 |
 
 ## 测试现状
@@ -70,17 +70,17 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. Phase 2 继续：多光标
-2. 把 `export_pdf` 接到桌面 UI（导出命令/菜单）与 FFI 契约（`mazha-ffi` 占位）
-3. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
-4. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
-5. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
+1. 把 `export_pdf` 接到桌面 UI（导出命令/菜单）与 FFI 契约（`mazha-ffi` 占位）
+2. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
+3. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
+4. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
 
-## 提交历史（近期，共 48 条；本次提交为最新一条，待下次同步时补入哈希）
+## 提交历史（近期，共 49 条；本次提交为最新一条，待下次同步时补入哈希）
 
 ```
 <本次提交>
 9e188db feat(desktop): IME 支持 + EntityInputHandler 完整实现
+2a9c1c8 feat(desktop): 编辑命令接入（commands/apply_and_sync）
 13e0295 feat(desktop): Phase 2 起步——GPUI 只读投影渲染（可运行）
 e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线第二步）
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
