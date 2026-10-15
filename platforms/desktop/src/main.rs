@@ -29,8 +29,9 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, DisplayPos, Document, Edit, OffsetMap, ProjectedLine, RunStyle,
-    TextRun as DocTextRun,
+    BlockStyle, BlockTarget, DisplayPos, Document, Edit, InlineMark, OffsetMap, ProjectedLine,
+    RunStyle, TextRun as DocTextRun,
+    commands::{set_block, toggle_inline},
 };
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -330,6 +331,45 @@ impl DocView {
         self.anchor = None;
         self.marked = None;
         cx.notify();
+    }
+
+    /// 应用行内格式命令（粗体/斜体/删除线/行内代码）。
+    ///
+    /// 使用当前选区（或光标位置）作为目标范围，调用 `toggle_inline` 生成编辑，
+    /// 通过 `apply_edit` 应用并自动更新光标/选区。
+    fn apply_inline(&mut self, mark: InlineMark, cx: &mut Context<Self>) {
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        let edit = toggle_inline(&self.doc.text(), range.clone(), mark);
+        let new_caret = match &edit {
+            Edit::Insert { at, text } => at + text.len(),
+            Edit::Replace { range, text } => range.start + text.len(),
+            _ => range.start,
+        };
+        self.apply_edit(edit, new_caret, cx);
+    }
+
+    /// 应用块级样式命令（标题/列表/引用/段落）。
+    ///
+    /// 使用当前选区覆盖的投影行区间（或光标所在行）作为目标，调用 `set_block` 生成编辑。
+    fn apply_block(&mut self, target: BlockTarget, cx: &mut Context<Self>) {
+        let sel = self.selection().unwrap_or(self.caret..self.caret);
+        // 找到选区覆盖的投影行区间（含首尾行）
+        let projection = self.doc.projection();
+        let start_line = projection
+            .lines
+            .iter()
+            .position(|l| l.source_range.end >= sel.start)
+            .unwrap_or(0);
+        let end_line = projection
+            .lines
+            .iter()
+            .position(|l| l.source_range.start >= sel.end)
+            .map_or(projection.lines.len(), |i| i);
+        let range = projection.lines[start_line].source_range.start
+            ..projection.lines[end_line.min(projection.lines.len() - 1)].source_range.end;
+        let edit = set_block(&self.doc.text(), range.clone(), &target);
+        // 块级编辑后光标移到块首
+        self.apply_edit(edit, range.start, cx);
     }
 
     /// 删除选区（或光标左侧一个字符，即退格）。返回是否发生了删除。
@@ -783,7 +823,7 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
 
-    // Cmd/Ctrl 组合键：撤销/重做/全选；其余交给系统，避免误拦截
+    // Cmd/Ctrl 组合键：撤销/重做/全选/格式化/块类型；其余交给系统，避免误拦截
     if m.control || m.platform {
         match event.keystroke.key.as_str() {
             "z" if m.platform => {
@@ -799,6 +839,38 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
                 view.anchor = Some(0);
                 view.caret = view.doc.len();
                 cx.notify();
+            }
+            // 行内格式（Cmd+键）
+            "b" if m.platform => {
+                view.apply_inline(InlineMark::Strong, cx);
+            }
+            "i" if m.platform => {
+                view.apply_inline(InlineMark::Emphasis, cx);
+            }
+            "x" if m.platform && shift => {
+                view.apply_inline(InlineMark::Strikethrough, cx);
+            }
+            "`" if m.platform => {
+                view.apply_inline(InlineMark::Code, cx);
+            }
+            // 块类型（Cmd+数字/Shift+数字）
+            k if m.platform && k.len() == 1 && k.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
+                let level = k.parse::<u8>().unwrap_or(1);
+                if (1..=6).contains(&level) {
+                    view.apply_block(BlockTarget::Heading(level), cx);
+                }
+            }
+            "8" if m.platform && shift => {
+                view.apply_block(BlockTarget::List { ordered: false }, cx);
+            }
+            "9" if m.platform && shift => {
+                view.apply_block(BlockTarget::List { ordered: true }, cx);
+            }
+            "0" if m.platform && shift => {
+                view.apply_block(BlockTarget::BlockQuote, cx);
+            }
+            "-" if m.platform && shift => {
+                view.apply_block(BlockTarget::Paragraph, cx);
             }
             _ => {}
         }

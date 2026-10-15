@@ -9,7 +9,7 @@
 //! 光标/选区 + 边界校验（最小可用内核）。`Projection` / `OffsetMap`
 //! 在本里程碑之后的迭代中实现。
 
-mod commands;
+pub mod commands;
 mod crdt;
 mod document;
 mod edit;
