@@ -33,6 +33,8 @@ use mazha_core::{
     RunStyle, TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
 };
+use mazha_export::{PdfDocument, PdfError, to_pdf};
+use rfd::FileDialog;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
 const SAMPLE: &str = "\
@@ -402,7 +404,7 @@ impl DocView {
     /// 编辑失败（非法边界等）时保持文档与光标不变。成功后塌缩主光标选区并清空 IME 组合区。
     fn apply_edit(&mut self, edit: Edit, new_caret: usize, cx: &mut Context<Self>) {
         if self.doc.apply(edit).is_ok() {
-            let c = self.primary_cursor();
+            let c = self.primary_cursor_mut();
             c.anchor = None;
             c.marked = None;
             c.caret = self.doc.snap_to_boundary(new_caret);
@@ -630,7 +632,7 @@ impl DocView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        let c = self.primary_cursor();
+        let c = self.primary_cursor_mut();
         let start = self.doc.snap_to_boundary(target.start);
         let end = self.doc.snap_to_boundary(target.end);
         let range = start.min(end)..start.max(end);
@@ -710,6 +712,31 @@ impl DocView {
             self.doc
                 .snap_to_boundary(source_offset.min(block.source_range.end)),
         )
+    }
+
+    /// 导出当前文档为 PDF 并保存到文件。
+    fn export_pdf(&mut self, cx: &mut Context<Self>) {
+        let markdown = self.doc.text();
+        let result = to_pdf(&markdown);
+        match result {
+            Ok(pdf_doc) => {
+                // 使用 rfd 弹出保存文件对话框
+                if let Some(path) = FileDialog::new()
+                    .set_title("导出 PDF")
+                    .add_filter("PDF 文件", &["pdf"])
+                    .set_file_name("document.pdf")
+                    .save_file()
+                {
+                    // 写入 PDF 字节
+                    if let Err(e) = std::fs::write(&path, &pdf_doc.bytes) {
+                        eprintln!("导出 PDF 失败：{}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("PDF 编译失败：{}", e);
+            }
+        }
     }
 
     /// Alt+Click：在点击位置添加新光标，或移除已有光标。
@@ -872,7 +899,7 @@ impl EntityInputHandler for DocView {
 
     /// IME 取消组合：删除 marked 区间文本，光标回到组合起点。
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.primary_cursor();
+        let c = self.primary_cursor_mut();
         if let Some(marked) = c.marked.take() {
             let at = marked.start;
             self.apply_edit(Edit::Delete { range: marked }, at, cx);
@@ -904,13 +931,13 @@ impl EntityInputHandler for DocView {
         let start = target.start;
         self.replace_selection_with_inner(target, new_text, cx);
         let marked_end = start + new_text.len();
-        let c = self.primary_cursor();
+        let c = self.primary_cursor_mut();
         c.marked = (marked_end > start).then_some(start..marked_end);
         // 组合内选区：相对 marked 起点的 UTF-8 偏移，转成绝对源偏移
         if let Some(rel) = new_selected_range {
             let abs_start = self.doc.snap_to_boundary(start + rel.start);
             let abs_end = self.doc.snap_to_boundary(start + rel.end);
-            let c = self.primary_cursor();
+            let c = self.primary_cursor_mut();
             c.anchor = Some(abs_start);
             c.caret = abs_end;
         }
@@ -969,7 +996,7 @@ fn bounds_for_range(
         cx: &mut Context<Self>,
     ) {
         if let Some((start, end)) = self.source_range_from_utf16(range_utf16) {
-            let c = self.primary_cursor();
+            let c = self.primary_cursor_mut();
             if start == end {
                 c.anchor = None;
                 c.caret = start;
@@ -1046,6 +1073,9 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             }
             "-" if m.platform && shift => {
                 view.apply_block(BlockTarget::Paragraph, cx);
+            }
+            "e" if m.platform => {
+                view.export_pdf(cx);
             }
             _ => {}
         }

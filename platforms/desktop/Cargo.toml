@@ -11,5 +11,9 @@ description = "码札桌面端（GPUI + gpui-kit，见 SPEC §7.1）"
 [dependencies]
 # 共享核心：源文本真相 + 投影（路径依赖，独立于根 workspace 构建）
 mazha-core = { path = "../../crates/mazha-core" }
+# PDF 导出
+mazha-export = { path = "../../crates/mazha-export" }
+# 文件对话框
+rfd = "0.14"
 # 只声明 gpui-kit：GPUI 由它锁定版本/快照，避免两份 GPUI 类型不兼容（SPEC §7.1）
 gpui-kit = "0.7"
