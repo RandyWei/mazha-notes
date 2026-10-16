@@ -9,7 +9,8 @@
 //! 文本布局、光标、命中测试都以行为单位，故每行一个 [`ProjectedLine`]。一行内的可见区间
 //! 直接喂给 [`OffsetMap`]（隐藏区间=补集），即得该行的显示↔源双向映射。
 
-use crate::offset_map::OffsetMap;
+use crate::offset_map::{DisplayPos, OffsetMap};
+use crate::selection::Selection;
 use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan};
 use std::ops::Range;
 
@@ -98,6 +99,130 @@ impl Projection {
         out.append(&mut window);
         out.extend(self.lines[last + 1..].iter().map(|l| l.shifted(delta)));
         self.lines = out;
+    }
+}
+
+/// 文档坐标：逻辑行号 + 行内**显示列**（可见字符索引，非源字节）。
+///
+/// 与 [`crate::DisplayPos`] 的区别：`DisplayPos` 是**行内**显示位置，`DocPos`
+/// 额外带**行号**，用于跨行场景（选区绘制、点击命中、IME 候选定位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocPos {
+    /// 逻辑行号（0 起）。
+    pub line: usize,
+    /// 行内显示列（可见字符索引，0 起）。
+    pub col: usize,
+}
+
+impl DocPos {
+    /// 文档首（第 0 行第 0 列）。
+    pub const ZERO: DocPos = DocPos { line: 0, col: 0 };
+}
+
+/// 跨行选区落在某一逻辑行上的显示列区间（绘制选区高亮用）。
+///
+/// `cols` 是**显示列**区间（`Range<usize>`，左闭右开）；同一行的多行选区只产出
+/// 一条记录，UI 可直接按 `line` 定位、按 `cols` 画高亮。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineDisplayRange {
+    /// 逻辑行号。
+    pub line: usize,
+    /// 该行被选中的显示列区间。
+    pub cols: Range<usize>,
+}
+
+/// 文档级（跨行）坐标映射：所有命中测试、选区绘制、IME 定位的统一入口
+/// （SPEC §6.1、§11.3）。由每行的 [`OffsetMap`] + 行区间组合而成。
+impl Projection {
+    /// 源字节偏移所在逻辑行号。
+    ///
+    /// 行尾边界（`pos == 某行 source_range.end`）归**该行**，与增量刷新时
+    /// "删行尾换行"类编辑的行归属一致；超出末尾钳到末行。
+    pub fn line_of_source(&self, src: usize) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        self.lines
+            .partition_point(|l| l.source_range.end < src)
+            .min(self.lines.len() - 1)
+    }
+
+    /// 源字节偏移 → 文档坐标（行号 + 显示列）。
+    ///
+    /// 落进隐藏语法标记内部时吸附到**标记起点**（见 [`OffsetMap::source_to_display`]）。
+    /// 空投影返回 [`DocPos::ZERO`]。
+    pub fn source_to_doc_pos(&self, src: usize) -> DocPos {
+        if self.lines.is_empty() {
+            return DocPos::ZERO;
+        }
+        let line = self.line_of_source(src);
+        let col = self.lines[line].offset_map.source_to_display(src).get();
+        DocPos { line, col }
+    }
+
+    /// 文档坐标 → 源字节偏移（点击命中的核心换算）。
+    ///
+    /// 列越界钳到该行末（返回行尾源偏移），行号越界钳到末行；交叉点仍取隐藏
+    /// 标记起点（稳定落点）。空投影返回 `0`。
+    pub fn doc_pos_to_source(&self, pos: DocPos) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        let line = pos.line.min(self.lines.len() - 1);
+        self.lines[line]
+            .offset_map
+            .display_to_source(DisplayPos(pos.col))
+    }
+
+    /// 某一逻辑行的显示宽度（可见字符数）。行号越界钳到末行；空投影返回 `0`。
+    pub fn display_len_at(&self, line: usize) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        self.lines[line.min(self.lines.len() - 1)]
+            .offset_map
+            .display_len()
+    }
+
+    /// 选区覆盖到的每行显示列区间（跨行选区绘制用）。
+    ///
+    /// 空选区（光标）或空投影返回空表。单行选区产出 1 条；跨行时首行
+    /// `起点列..行宽`、中间行 `0..行宽`、末行 `0..终点列`。区间允许为空
+    /// （如整行隐藏或选区恰好落在行尾），交由 UI 决定是否绘制。
+    pub fn selection_display_ranges(&self, sel: Selection) -> Vec<LineDisplayRange> {
+        if sel.is_collapsed() || self.lines.is_empty() {
+            return Vec::new();
+        }
+        let start = self.source_to_doc_pos(sel.start());
+        let end = self.source_to_doc_pos(sel.end());
+
+        // 单行选区
+        if start.line == end.line {
+            return vec![LineDisplayRange {
+                line: start.line,
+                cols: start.col..end.col,
+            }];
+        }
+
+        let mut out = Vec::with_capacity(end.line - start.line + 1);
+        // 首行：起点列 → 行尾
+        out.push(LineDisplayRange {
+            line: start.line,
+            cols: start.col..self.display_len_at(start.line),
+        });
+        // 中间整行
+        for line in (start.line + 1)..end.line {
+            out.push(LineDisplayRange {
+                line,
+                cols: 0..self.display_len_at(line),
+            });
+        }
+        // 末行：行首 → 终点列
+        out.push(LineDisplayRange {
+            line: end.line,
+            cols: 0..end.col,
+        });
+        out
     }
 }
 
@@ -642,5 +767,145 @@ mod tests {
         let l = one("---");
         assert!(l.block.thematic_break);
         assert_eq!(l.display_text(), "");
+    }
+
+    // ---------- 文档级（跨行）坐标映射：SPEC §6.1 / §11.3 ----------
+
+    #[test]
+    fn line_of_source_boundaries() {
+        // "line1\nline2"：line0 0..5，'\n' 在 5，line1 6..11
+        let p = build("line1\nline2");
+        assert_eq!(p.line_of_source(0), 0);
+        assert_eq!(p.line_of_source(5), 0, "行尾边界归前一行");
+        assert_eq!(p.line_of_source(6), 1, "次行起点归本行");
+        assert_eq!(p.line_of_source(11), 1);
+        assert_eq!(p.line_of_source(99), 1, "越界钳到末行");
+    }
+
+    #[test]
+    fn line_of_source_blank_and_trailing_lines() {
+        // "a\n\nb"：line0 0..1、line1 2..2（空行）、line2 3..4
+        let p = build("a\n\nb");
+        assert_eq!(p.lines.len(), 3);
+        assert_eq!(p.line_of_source(1), 0);
+        assert_eq!(p.line_of_source(2), 1);
+        assert_eq!(p.line_of_source(3), 2);
+        // 末尾换行产生空末行
+        let q = build("a\n");
+        assert_eq!(q.lines.len(), 2);
+        assert_eq!(q.line_of_source(2), 1, "EOF 归末尾空行");
+    }
+
+    #[test]
+    fn source_to_doc_pos_hides_markers() {
+        // "# 标题" 单行：隐藏 "# "（0..2），可见 "标题"（2..8）
+        let p = build("# 标题");
+        assert_eq!(p.source_to_doc_pos(2), DocPos { line: 0, col: 0 });
+        assert_eq!(p.source_to_doc_pos(5), DocPos { line: 0, col: 1 });
+        assert_eq!(p.source_to_doc_pos(8), DocPos { line: 0, col: 2 });
+        // 落进隐藏标记内部吸附到标记起点
+        assert_eq!(p.source_to_doc_pos(1), DocPos { line: 0, col: 0 });
+    }
+
+    #[test]
+    fn doc_pos_to_source_is_inverse_on_visible_text() {
+        let p = build("# 标题\n正文**粗**。");
+        // 首行可见列 0..2
+        assert_eq!(p.doc_pos_to_source(DocPos { line: 0, col: 0 }), 2);
+        assert_eq!(p.doc_pos_to_source(DocPos { line: 0, col: 2 }), 8);
+        // 第二行起点（"正文" 的 "正"，行首）
+        let s = p.doc_pos_to_source(DocPos { line: 1, col: 0 });
+        assert_eq!(p.source_to_doc_pos(s), DocPos { line: 1, col: 0 });
+    }
+
+    #[test]
+    fn doc_pos_clamps_column_and_line() {
+        let p = build("ab\ncd");
+        // 列越界钳到行尾（返回该行末的源偏移）
+        assert_eq!(p.doc_pos_to_source(DocPos { line: 0, col: 99 }), 2);
+        // 行越界钳到末行
+        assert_eq!(p.doc_pos_to_source(DocPos { line: 99, col: 0 }), 3);
+        assert_eq!(p.display_len_at(99), 2, "行越界取末行宽度");
+    }
+
+    #[test]
+    fn selection_within_one_line() {
+        let p = build("**粗体**文本");
+        // 可见 "粗体文本"，源 2..8 是 "粗体"
+        let ranges = p.selection_display_ranges(Selection::new(2, 8));
+        assert_eq!(
+            ranges,
+            vec![LineDisplayRange {
+                line: 0,
+                cols: 0..2
+            }]
+        );
+    }
+
+    #[test]
+    fn selection_across_two_lines() {
+        // "ab\ncd"：line0 0..2，line1 3..5
+        let p = build("ab\ncd");
+        let ranges = p.selection_display_ranges(Selection::new(1, 4));
+        assert_eq!(
+            ranges,
+            vec![
+                LineDisplayRange {
+                    line: 0,
+                    cols: 1..2
+                },
+                LineDisplayRange {
+                    line: 1,
+                    cols: 0..1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_across_three_lines_includes_whole_middle() {
+        // "中\n文\n字"：每个 CJK 3 字节，行区间 0..3 / 4..7 / 8..11
+        let p = build("中\n文\n字");
+        assert_eq!(p.lines.len(), 3);
+        let ranges = p.selection_display_ranges(Selection::new(0, 11));
+        assert_eq!(
+            ranges,
+            vec![
+                LineDisplayRange {
+                    line: 0,
+                    cols: 0..1
+                },
+                LineDisplayRange {
+                    line: 1,
+                    cols: 0..1
+                },
+                LineDisplayRange {
+                    line: 2,
+                    cols: 0..1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_reversed_and_collapsed() {
+        let p = build("ab\ncd");
+        // 反向选区与正向等价
+        assert_eq!(
+            p.selection_display_ranges(Selection::new(4, 1)),
+            p.selection_display_ranges(Selection::new(1, 4))
+        );
+        // 空选区（光标）不产出高亮
+        assert!(p.selection_display_ranges(Selection::caret(2)).is_empty());
+    }
+
+    #[test]
+    fn empty_projection_maps_to_zero() {
+        let p = build("");
+        assert_eq!(p.lines.len(), 1, "空文档仍有一行（便于光标落点）");
+        assert_eq!(p.line_of_source(0), 0);
+        assert_eq!(p.source_to_doc_pos(0), DocPos::ZERO);
+        assert_eq!(p.doc_pos_to_source(DocPos::ZERO), 0);
+        assert_eq!(p.display_len_at(0), 0);
     }
 }

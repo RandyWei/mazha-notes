@@ -273,6 +273,26 @@ impl OffsetMap {
     pub fn display_len(&self) -> usize;
 }
 
+/// 文档坐标：逻辑行号 + 行内**显示列**（可见字符索引，非源字节）。
+pub struct DocPos { pub line: usize, pub col: usize }
+
+/// 跨行选区落在某一逻辑行上的显示列区间（绘制选区高亮用）。
+pub struct LineDisplayRange { pub line: usize, pub cols: Range<usize> }
+
+impl Projection {
+    /// 源字节偏移 → 文档坐标（行号 + 显示列）。落进隐藏标记吸附到标记起点；
+    /// 行尾边界归本行（与"删行尾换行"类编辑对齐）。
+    pub fn source_to_doc_pos(&self, src: usize) -> DocPos;
+    /// 文档坐标 → 源字节偏移。列越界钳到行尾，行越界钳到末行。
+    pub fn doc_pos_to_source(&self, pos: DocPos) -> usize;
+    /// 源字节偏移所在逻辑行号（行尾边界归前一行）。
+    pub fn line_of_source(&self, src: usize) -> usize;
+    /// 某一逻辑行的显示宽度（可见字符数）；行号越界钳到末行。
+    pub fn display_len_at(&self, line: usize) -> usize;
+    /// 选区覆盖到的每行显示列区间（跨行选区绘制用）。空选区返回空表。
+    pub fn selection_display_ranges(&self, sel: Selection) -> Vec<LineDisplayRange>;
+}
+
 /// 显示位置：显示文本中的字符索引（newtype）。
 pub struct DisplayPos(pub usize);
 
@@ -304,8 +324,12 @@ pub struct ChangeSummary {
 > `commands` 模块解析为源级编辑）、`Document`（rope + 边界校验 + undo/redo +
 > 字节/字符边界导航 + `projection()` 全量重建）、`Selection`、`ChangeSummary`、
 > `OffsetMap`（src↔display 双向映射 + 稳定落点规则）、`Projection`（按逻辑行投影：
-> `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`）、`IntentMapper`（最小实现：
+> `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`；**文档级跨行坐标映射**
+> `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/
+> `selection_display_ranges`，覆盖跨行选区/命中/IME）、`IntentMapper`（最小实现：
 > 回车列表续行/退出列表 + 切换转发）已落地（Phase 1，见 `crates/mazha-core`）。
+> 桌面端改用该文档级 API（替换 `platforms/desktop` 内联的 `line_index`/选区换算）
+> 为 Phase 3 后续项。
 > `DocId`（待定）、`Projection` 的**增量重建**、
 > 更丰富的意图（缩进/自动配对/删除键合并）为后续迭代项。
 > `Workspace<S: StorageProvider>`（`open`/`save`/`list`，串联存储与文档）已落地。
@@ -622,6 +646,7 @@ interface Workspace {
 | 0.1.37 | 2026-10-16 | **EPUB 导出**（D27）：`mazha-export::to_epub` / `to_epub_with_meta` / `EpubMeta` / `EpubError`——Zip + XHTML 打包 EPUB 3（`mimetype` 首条目且 `Stored` 不压缩、`META-INF/container.xml`、`OEBPS/content.opf`、`nav.xhtml`、`toc.ncx`、`style.css`、单一 `text.xhtml`）；HTML 渲染新增 **XHTML 方言**（`html::to_xhtml_body`，空元素自闭合、布尔属性带值，`to_html` 行为不变），正文与 HTML 导出同源；`dc:identifier` 缺省用 FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳（输出确定）；元数据经 XML 转义。边界：空输入仍为合法 EPUB、空标题/语言回退、任务复选框 XHTML 化、`xmllint` 校验全部 XML 部件良构。15 条新测试；export 88（总计 **332**） |
 | 0.1.38 | 2026-10-16 | **导出主题/模板**（D28）：新增 `mazha-export::theme` 模块——`Theme`（HTML/EPUB 的 CSS：内置 `light`/`dark`/`sepia`，可 `custom`）与 `Template`（PDF/Typst 版式前置：内置 `plain`/`article`，可 `custom`），均为确定性常量。接入：`to_html_themed`（主题 CSS 注入 `<style>`）、`to_epub_themed`（主题作 `style.css`，`EpubMeta` 复用）、`to_typst_with_template`（前置以空行分隔正文）、`PdfExporter::export_with`/`to_pdf_with`（编译带模板标记；`plain` 与旧行为逐字节一致）。`Template::article` 只设页面/字号/段距、不设字体族（保留 CJK 回退）。10 条新测试；export 98（总计 **342**） |
 | 0.1.39 | 2026-10-16 | **PDF 真实文档回归**（风险 R8）：新增集成测试 `tests/pdf_real_doc.rs` + 基线文档（中文技术报告 `tests/data/real_report.md` + SVG 示意图）——验证多页排版（`PdfDocument` 新增 `pages` 字段）、逐字节可复现、标记转义扫描（`#`/`[]`/`` ` ``/`$`/`*_`/`~=`/`//`/`@`/`<>`/中文标点/emoji/组合字符）。回归发现并修复 `to_typst` 行内代码缺陷：内容含反引号时反引号围栏会与内容粘连成更长串导致 `unclosed raw text`，改用 `#raw("…")`；同时行内代码内容不再走 `escape_typst`（Typst raw 不解析标记，原实现会显示出多余反斜杠）。2 条新单测 + 3 条集成测试；export 100 单测 + 3 集成（总计 **347**） |
+| 0.1.40 | 2026-10-16 | **文档级跨行坐标映射**（Phase 3 起步，SPEC §6.1/§11.3）：`mazha-core` 新增 `DocPos{line,col}`、`LineDisplayRange{line,cols}` 与 `Projection` 方法 `line_of_source`（行尾边界归前一行）、`source_to_doc_pos`（落隐藏标记吸附标记起点）、`doc_pos_to_source`（命中换算，列/行越界钳制）、`display_len_at`、`selection_display_ranges`（跨行选区→每行显示列区间，首行到行尾/中间整行/末行到终点）。把原先散落在 `platforms/desktop` 的行归属与选区换算收敛为核心纯 Rust API（桌面端改用留待下一提交）。先测试后实现，10 条新单测（含空投影、CJK 多字节、隐藏标记吸附、反向选区）；core 129（总计 **357**） |
 
 ---
 

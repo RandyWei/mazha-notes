@@ -24,7 +24,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
-| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存**双增量**维护）、`Edit`/`Selection`/`ChangeSummary`、`OffsetMap`（含 `shift` 平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + `build_projection_from` + **增量 refresh**）、`commands`、`IntentMapper`（选区语义/块级缩进/智能成对退格）、导航（`line_range_of`/CJK 感知 `word_range_at`）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | `DocId`、序列化往返 |
+| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存**双增量**维护）、`Edit`/`Selection`/`ChangeSummary`、`OffsetMap`（含 `shift` 平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + `build_projection_from` + **增量 refresh**）、**文档级跨行坐标映射**（`DocPos`/`LineDisplayRange` + `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/`selection_display_ranges`）、`commands`、`IntentMapper`（选区语义/块级缩进/智能成对退格）、导航（`line_range_of`/CJK 感知 `word_range_at`）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | `DocId`、序列化往返 |
 | `mazha-md` | ✅ Phase 1 完成（方言特性全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**GFM 表格**、**Callout 提示块**、**Front-matter**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/**wiki-link**/**tags**）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | — |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace/push`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、`snapshot`（快照压缩，O(历史)→O(文本)）、并发收敛 | 多文档名册 |
@@ -42,11 +42,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 测试现状
 
-- `mazha-core`：119
+- `mazha-core`：129
 - `mazha-md`：99
 - `mazha-export`：100 单测 + 3 集成（`tests/pdf_real_doc.rs`）
 - `mazha-crdt`：11
-- 合计 **347** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **357** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -58,6 +58,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - D27：EPUB 导出走 Zip + XHTML（`zip` 0.5，与 docx-rs 复用同版本），正文复用 HTML 的 **XHTML 方言**（`to_xhtml_body`：空元素自闭合、布尔属性带值），打包为 EPUB 3；`dc:identifier` 用 FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳（输出确定）。
 - D28：导出外观预设拆成 `Theme`（HTML/EPUB 的 CSS：`light`/`dark`/`sepia`）与 `Template`（PDF/Typst 版式前置：`plain`/`article`），均确定性常量、可 `custom`；`Template::article` 不设字体族以保留 CJK 回退。
 - R8（PDF 真实文档回归）：基线文档 `tests/data/real_report.md` + 集成测试验证多页/可复现/转义；修复行内代码含反引号缺陷（改 `#raw("…")`），行内代码内容不再走 `escape_typst`。
+- Phase 3（R2 缓解）：文档级跨行映射收敛进 `mazha-core::Projection`（`DocPos`/`LineDisplayRange` + `selection_display_ranges` 等），先测试后实现；桌面端改用留待下一提交。
 
 ## 依赖方向（不可违反）
 
@@ -74,14 +75,15 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. `mazha-export`：字体子集（Web，Phase 7）
-2. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
-3. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
+1. **Phase 3（进行中）**：桌面端改用核心文档级 API（`platforms/desktop` 替换内联 `line_index`/选区换算）→ 跨行选区高亮 + IME 候选框定位；再块级 widget（表格/图片/代码/公式/图表）
+2. `mazha-export`：字体子集（Web，Phase 7）
+3. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 
-## 提交历史（近期，共 56 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 57 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：test(export): PDF 真实文档回归（R8）+ 修复行内代码反引号>
+<本次提交：feat(core): 文档级跨行坐标映射（DocPos/选区区间，Phase 3）>
+05e8086 test(export): PDF 真实文档回归（R8）+ 修复行内代码反引号
 398f20f feat(export): 导出主题/模板（Theme/Template，D28）
 fc4721f feat(export): EPUB 导出（Zip + XHTML，D27）
 6922f6a feat(export): DOCX 导出（docx-rs，D26）
