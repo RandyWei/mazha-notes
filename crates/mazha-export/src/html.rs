@@ -70,6 +70,11 @@ pub fn to_html_document(source: &str, title: &str, css: Option<&str>) -> String 
     out
 }
 
+/// 用 [`crate::Theme`] 渲染完整 HTML5 文档（等价 [`to_html_document`]，CSS 取自主题）。
+pub fn to_html_themed(source: &str, title: &str, theme: &crate::Theme) -> String {
+    to_html_document(source, title, Some(theme.css.as_str()))
+}
+
 /// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项），`xhtml` 为真时空元素自闭合。
 fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool, xhtml: bool) {
     for b in blocks {
@@ -557,6 +562,16 @@ mod tests {
     fn html_document_empty_css_omits_style() {
         let doc = to_html_document("x\n", "t", Some(""));
         assert!(!doc.contains("<style>"));
+    }
+
+    #[test]
+    fn html_themed_uses_theme_css() {
+        let dark = to_html_themed("x\n", "t", &crate::Theme::dark());
+        assert!(dark.contains("#0d1117"), "深色主题背景缺失");
+        assert!(!dark.contains("#24292f"), "不应含默认浅色主题色");
+
+        let light = to_html_themed("x\n", "t", &crate::Theme::light());
+        assert!(light.contains("#24292f"));
     }
 
     #[test]

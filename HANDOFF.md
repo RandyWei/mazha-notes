@@ -28,7 +28,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | `mazha-md` | ✅ Phase 1 完成（方言特性全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**GFM 表格**、**Callout 提示块**、**Front-matter**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/**wiki-link**/**tags**）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | — |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace/push`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、`snapshot`（快照压缩，O(历史)→O(文本)）、并发收敛 | 多文档名册 |
-| `mazha-export` | ✅ HTML + PDF + DOCX + **EPUB** 可用 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/提示块/列表/任务/围栏代码/分割线/GFM 表格/行内全套/链接/wiki-link/标签/图片；`to_typst`（Markdown→Typst 标记：含 `escape_typst` 特殊字符转义、表格 `align:` + 逗号实参、图片 `alt:` 命名参数、动态围栏）；**`to_pdf`/`PdfExporter`**（`ExportWorld` 实现 `typst::World`：虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体 → `typst::compile` → `typst_pdf::pdf`；`PdfDocument{bytes,warnings}`、`PdfError::{Compile,Export}`、`PdfExportOptions{base_dir,system_fonts}`）；**`to_docx`**（`docx-rs` 1.1 生成 OOXML，不经 HTML 中转：标题直接格式/段落/引用/提示块/列表/任务/GFM 表格/代码块逐行/分割线/行内 粗/斜/删/码/链接「文字 + (URL)」/wiki-link/标签/图片占位；`DocxError`；text 经 `strong-xml` 转义 + `xml:space="preserve"`）；**`to_epub`/`to_epub_with_meta`**（Zip + XHTML 打包 EPUB 3：`mimetype` 首条目 Stored / `container.xml` / `content.opf` / `nav.xhtml` / `toc.ncx` / `style.css` / 单一 `text.xhtml`；正文复用 HTML 的 **XHTML 方言** `to_xhtml_body`（空元素自闭合、布尔属性带值）；`EpubMeta`/`EpubError`；`dc:identifier` FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳） | 模板/主题、字体子集（Web）、PDF 字体覆盖/转义真实文档回归（R8） |
+| `mazha-export` | ✅ HTML + PDF + DOCX + EPUB + **主题/模板** 可用 | `to_html` + `to_html_document` + `to_html_themed`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/提示块/列表/任务/围栏代码/分割线/GFM 表格/行内全套/链接/wiki-link/标签/图片；`to_typst` + `to_typst_with_template`（Markdown→Typst 标记：含 `escape_typst` 特殊字符转义、表格 `align:` + 逗号实参、图片 `alt:` 命名参数、动态围栏）；**`to_pdf`/`to_pdf_with`/`PdfExporter`**（`ExportWorld` 实现 `typst::World`：虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体 → `typst::compile` → `typst_pdf::pdf`；`PdfDocument{bytes,warnings}`、`PdfError::{Compile,Export}`、`PdfExportOptions{base_dir,system_fonts}`、`export_with` 应用模板）；**`to_docx`**（`docx-rs` 1.1 生成 OOXML，不经 HTML 中转：标题直接格式/段落/引用/提示块/列表/任务/GFM 表格/代码块逐行/分割线/行内 粗/斜/删/码/链接「文字 + (URL)」/wiki-link/标签/图片占位；`DocxError`；text 经 `strong-xml` 转义 + `xml:space="preserve"`）；**`to_epub`/`to_epub_with_meta`/`to_epub_themed`**（Zip + XHTML 打包 EPUB 3：`mimetype` 首条目 Stored / `container.xml` / `content.opf` / `nav.xhtml` / `toc.ncx` / `style.css` / 单一 `text.xhtml`；正文复用 HTML 的 **XHTML 方言** `to_xhtml_body`；`EpubMeta`/`EpubError`；`dc:identifier` FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳）；**`Theme`**（HTML/EPUB 的 CSS：`light`/`dark`/`sepia`/`custom`）与 **`Template`**（PDF/Typst 版式前置：`plain`/`article`/`custom`） | 字体子集（Web）、PDF 字体覆盖/转义真实文档回归（R8） |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -44,9 +44,9 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 - `mazha-core`：119
 - `mazha-md`：99
-- `mazha-export`：88
+- `mazha-export`：98
 - `mazha-crdt`：11
-- 合计 **332** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **342** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -56,6 +56,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - D25：PDF 编译走 `to_typst` + 自实现 `ExportWorld`（`typst::World`：虚拟主文件 / `base_dir` 资源根 / `typst-kit` 字体），`typst::compile` + `typst_pdf::pdf`；workspace `rust-version` 提到 1.92（typst 0.15 MSRV）。
 - D26：DOCX 导出走 `docx-rs` 1.1，直接基于 `mazha-md` 块/片段模型生成 OOXML（不经 HTML 中转）；标题用直接格式、链接为「文字 + (URL)」、图片占位。
 - D27：EPUB 导出走 Zip + XHTML（`zip` 0.5，与 docx-rs 复用同版本），正文复用 HTML 的 **XHTML 方言**（`to_xhtml_body`：空元素自闭合、布尔属性带值），打包为 EPUB 3；`dc:identifier` 用 FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳（输出确定）。
+- D28：导出外观预设拆成 `Theme`（HTML/EPUB 的 CSS：`light`/`dark`/`sepia`）与 `Template`（PDF/Typst 版式前置：`plain`/`article`），均确定性常量、可 `custom`；`Template::article` 不设字体族以保留 CJK 回退。
 
 ## 依赖方向（不可违反）
 
@@ -72,14 +73,15 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. `mazha-export`：模板/主题、字体子集（Web）；PDF 字体覆盖/转义的**真实文档回归**（R8）
+1. `mazha-export`：字体子集（Web）；PDF 字体覆盖/转义的**真实文档回归**（R8）
 2. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 3. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
 
-## 提交历史（近期，共 54 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 55 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(export): EPUB 导出（Zip + XHTML）>
+<本次提交：feat(export): 导出主题/模板（Theme/Template）>
+fc4721f feat(export): EPUB 导出（Zip + XHTML，D27）
 6922f6a feat(export): DOCX 导出（docx-rs，D26）
 917d9ce chore: update Cargo.lock for mazha-export + rfd deps
 531bdc7 feat(desktop): PDF 导出（Cmd+E）

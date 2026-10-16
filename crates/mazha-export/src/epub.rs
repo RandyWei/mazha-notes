@@ -88,6 +88,24 @@ pub fn to_epub(source: &str, title: &str) -> Result<Vec<u8>, EpubError> {
 ///
 /// 当 ZIP 打包或底层写入失败时返回 [`EpubError`]。
 pub fn to_epub_with_meta(source: &str, meta: &EpubMeta) -> Result<Vec<u8>, EpubError> {
+    to_epub_impl(source, meta, DEFAULT_CSS)
+}
+
+/// 用 [`crate::Theme`] 打包 EPUB 3：主题 CSS 作为 `OEBPS/style.css`。
+///
+/// # Errors
+///
+/// 当 ZIP 打包或底层写入失败时返回 [`EpubError`]。
+pub fn to_epub_themed(
+    source: &str,
+    meta: &EpubMeta,
+    theme: &crate::Theme,
+) -> Result<Vec<u8>, EpubError> {
+    to_epub_impl(source, meta, &theme.css)
+}
+
+/// EPUB 打包主体；`css` 决定 `OEBPS/style.css` 的内容。
+fn to_epub_impl(source: &str, meta: &EpubMeta, css: &str) -> Result<Vec<u8>, EpubError> {
     // 元数据回退：空标题/空语言/空标识都有确定默认
     let title = if meta.title.trim().is_empty() {
         "未命名"
@@ -130,7 +148,7 @@ pub fn to_epub_with_meta(source: &str, meta: &EpubMeta) -> Result<Vec<u8>, EpubE
     zip.write_all(toc_ncx(title, &identifier).as_bytes())?;
 
     zip.start_file("OEBPS/style.css", deflate)?;
-    zip.write_all(DEFAULT_CSS.as_bytes())?;
+    zip.write_all(css.as_bytes())?;
 
     // 正文最后写入（渲染无关顺序，但语义上放末尾更直观）
     zip.start_file("OEBPS/text.xhtml", deflate)?;
@@ -412,6 +430,13 @@ mod tests {
     fn style_css_is_default() {
         let bytes = to_epub("x\n", "T").expect("导出应成功");
         assert_eq!(entry_text(&bytes, "OEBPS/style.css"), DEFAULT_CSS);
+    }
+
+    #[test]
+    fn themed_epub_uses_theme_css() {
+        let theme = crate::Theme::dark();
+        let bytes = to_epub_themed("x\n", &EpubMeta::new("T"), &theme).expect("导出应成功");
+        assert_eq!(entry_text(&bytes, "OEBPS/style.css"), theme.css);
     }
 
     #[test]

@@ -438,6 +438,7 @@ interface Workspace {
 | HTML 导出 | 基于 `mazha-md` 块/片段模型自研渲染（[`mazha-export::to_html`]） | 纯 Rust；与编辑器同源（D23 后 `pulldown-cmark` 仅 dev 对照） |
 | DOCX 导出 | `docx-rs` 1.1（[`mazha-export::to_docx`]） | 纯 Rust；基于 `mazha-md` 块/片段模型直接生成 OOXML（标题用直接格式、行内 粗/斜/删除线/行内代码、链接「文字 + (URL)」、图片占位、GFM 表格、列表/任务/引用/提示块/代码块/分割线），决策 D26 |
 | EPUB 导出 | Zip + XHTML（复用 `to_html` 同源渲染，[`mazha-export::to_epub`]） | 纯 Rust；EPUB 3 容器（`mimetype` 首条目且不压缩 / `container.xml` / `content.opf` / `nav.xhtml` / `toc.ncx` / XHTML 正文），正文走 XHTML 方言（空元素自闭合、布尔属性带值），决策 D27 |
+| 导出主题/模板 | 自研 [`mazha-export::Theme`]（HTML/EPUB 的 CSS）与 [`mazha-export::Template`]（PDF/Typst 的版式前置） | 纯 Rust；内置主题 `light`/`dark`/`sepia`、模板 `plain`/`article`，均确定性常量，可 `custom`；`Template::article` 不覆盖字体族以保留 CJK 回退，决策 D28 |
 | 字体/中文字形 | `[待确认]` 系统字体 + 内置 CJK 子集 | Web/wasm 需内置 |
 
 ---
@@ -573,6 +574,7 @@ interface Workspace {
 | D25 | PDF 编译接入方式 | Typst 0.15 走 `to_typst` 标记 + 自实现 `ExportWorld`（`typst::World`）：虚拟主文件、资源根 `base_dir`（`Project` 根才允许相对路径，拒绝包根）、字体经 `typst-kit`（内置 + 可选系统扫描），`typst::compile` → `typst_pdf::pdf`；workspace `rust-version` 随 typst MSRV 提升至 **1.92** | 确认（见 SPEC §8） |
 | D26 | DOCX 导出引擎 | `docx-rs` 1.1（纯 Rust）：直接基于 `mazha-md` 块/片段模型生成 OOXML，不经 HTML 中转；标题用直接格式（加粗 + 字号）不依赖样式表，链接渲染为「文字 + (URL)」（docx-rs 的 `Relationship` 不支持 `TargetMode="External"`，无法生成可点击外链），图片仅输出占位文本；文本转义交由 `strong-xml`，一律 `xml:space="preserve"` 保空白 | 确认（见 SPEC §8） |
 | D27 | EPUB 导出引擎 | Zip + XHTML（纯 Rust，`zip` 0.5，与 docx-rs 复用同版本避免重复依赖）：正文复用 HTML 渲染的 **XHTML 方言**（`to_xhtml_body`，空元素自闭合 `<hr/>`/`<br/>`/`<img .../>`/`<input .../>`、布尔属性写 `disabled="disabled"`），打包为 EPUB 3（`mimetype` 首条目且 `Stored` 不压缩、`META-INF/container.xml`、`OEBPS/content.opf`、`nav.xhtml`、`toc.ncx` 兼容回退、`style.css` 复用 `DEFAULT_CSS`、单一 `text.xhtml`）；`dc:identifier` 缺省时用 FNV-1a 内容哈希派生（避免随机/`uuid` 依赖），`dcterms:modified` 用固定时间戳（输出确定） | 确认（见 SPEC §8） |
+| D28 | 导出主题/模板 | 引入 `Theme`（HTML/EPUB 的 CSS）与 `Template`（PDF/Typst 版式前置）两个外观预设；内置 `Theme::{light,dark,sepia}`、`Template::{plain,article}`，均为确定性常量（同输入同输出），支持 `custom`；`to_html_themed`/`to_epub_themed`/`to_pdf_with`/`to_typst_with_template` 接入；`Template::article` 只设页面/字号/段距，**不设字体族**以保留 Typst 的 CJK 字体回退 | 确认（见 SPEC §8、D12/D27） |
 
 ---
 
@@ -618,6 +620,7 @@ interface Workspace {
 | 0.1.35 | 2026-10-14 | **桌面光标/点击定位 + WYSIWYG 标记显隐**（§11.2）：`DocView` 增 `caret: usize`（**源字节偏移**，真相在源文本）+ `FocusHandle`。**点击定位**：每行 `TextLayout::index_for_position` 命中（窗口坐标→显示字符索引，Err 取最近字符边界）→ 光标行经"行首源偏移 + 索引"、非光标行经 `OffsetMap::display_to_source`（交叉点取更小源偏移=隐藏标记起点）→ `Document::snap_to_boundary`；每行均接 `on_click`（含光标行，可跨行跳转）。**标记显隐**（§11.2）：光标所在行渲染 `source[source_range]` **原文**（`#`/`**`/`-`/`>` 等标记可见、不画列表/任务前缀），其余行投影隐藏。**光标竖线**：文本前插零宽 `canvas`，`position_for_index`（返回**绝对窗口坐标**）+ `paint_quad` 画 1.5px 竖线；行内全部子元素先 prepaint 再 paint，故 prepaint 后的 layout 可安全命中。键盘 `left/right/up/down/home/end`（组合键交系统；上下移动按行内相对位置 + `snap_to_boundary`）。门禁：fmt/clippy/build 全绿，`cargo run` 启动无 panic（进程存活、日志为空） |
 | 0.1.36 | 2026-10-16 | **DOCX 导出**（D26）：`mazha-export::to_docx`（基于 `docx-rs` 1.1 生成 OOXML，不经 HTML 中转）——标题（直接格式 加粗+字号）/段落/引用/提示块/列表（有序/无序/嵌套）/任务列表/GFM 表格（含列对齐）/围栏代码块（逐行保留换行）/分割线/行内 粗/斜/删除线/行内代码/链接（「文字 + (URL)」）/自动链接/wiki-link/标签/图片占位；front-matter 隐藏；文本经 `strong-xml` 自动转义 + `xml:space="preserve"`；`DocxError`（`docx::DocxError` 仅 `Debug`，转字符串）。边界处理：空输入仍产出合法 ZIP（`PK\x03\x04`）、代码块按行插换行、span 原样空白保留、块 `range` 越界防御。13 条新测试；export 73（总计 **317**） |
 | 0.1.37 | 2026-10-16 | **EPUB 导出**（D27）：`mazha-export::to_epub` / `to_epub_with_meta` / `EpubMeta` / `EpubError`——Zip + XHTML 打包 EPUB 3（`mimetype` 首条目且 `Stored` 不压缩、`META-INF/container.xml`、`OEBPS/content.opf`、`nav.xhtml`、`toc.ncx`、`style.css`、单一 `text.xhtml`）；HTML 渲染新增 **XHTML 方言**（`html::to_xhtml_body`，空元素自闭合、布尔属性带值，`to_html` 行为不变），正文与 HTML 导出同源；`dc:identifier` 缺省用 FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳（输出确定）；元数据经 XML 转义。边界：空输入仍为合法 EPUB、空标题/语言回退、任务复选框 XHTML 化、`xmllint` 校验全部 XML 部件良构。15 条新测试；export 88（总计 **332**） |
+| 0.1.38 | 2026-10-16 | **导出主题/模板**（D28）：新增 `mazha-export::theme` 模块——`Theme`（HTML/EPUB 的 CSS：内置 `light`/`dark`/`sepia`，可 `custom`）与 `Template`（PDF/Typst 版式前置：内置 `plain`/`article`，可 `custom`），均为确定性常量。接入：`to_html_themed`（主题 CSS 注入 `<style>`）、`to_epub_themed`（主题作 `style.css`，`EpubMeta` 复用）、`to_typst_with_template`（前置以空行分隔正文）、`PdfExporter::export_with`/`to_pdf_with`（编译带模板标记；`plain` 与旧行为逐字节一致）。`Template::article` 只设页面/字号/段距、不设字体族（保留 CJK 回退）。10 条新测试；export 98（总计 **342**） |
 
 ---
 

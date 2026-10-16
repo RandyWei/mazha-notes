@@ -139,8 +139,26 @@ impl PdfExporter {
     /// 返回 [`PdfError::Compile`]（Typst 编译失败，含资源缺失）或
     /// [`PdfError::Export`]（PDF 序列化失败），均带格式化诊断信息。
     pub fn export(&self, markdown: &str) -> Result<PdfDocument, PdfError> {
+        self.compile_typst(to_typst(markdown))
+    }
+
+    /// 用 [`crate::Template`] 版式前置导出 PDF（页面/字号等由模板决定）。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`PdfExporter::export`]。
+    pub fn export_with(
+        &self,
+        markdown: &str,
+        template: &crate::Template,
+    ) -> Result<PdfDocument, PdfError> {
+        self.compile_typst(crate::typst::to_typst_with_template(markdown, template))
+    }
+
+    /// 编译一段已经生成好的 Typst 标记为 PDF（[`export`](Self::export) 的公共内核）。
+    fn compile_typst(&self, typst_source: String) -> Result<PdfDocument, PdfError> {
         // Markdown → Typst 标记（主文件即这段标记，无真实文件系统入口）
-        let source = Source::detached(to_typst(markdown));
+        let source = Source::detached(typst_source);
         let main = source.id();
         let world = ExportWorld {
             exporter: self,
@@ -176,6 +194,17 @@ impl Default for PdfExporter {
 /// 同 [`PdfExporter::export`]。
 pub fn to_pdf(markdown: &str) -> Result<PdfDocument, PdfError> {
     PdfExporter::new().export(markdown)
+}
+
+/// 一次性导出（带 [`crate::Template`] 版式模板）：Markdown → PDF。
+///
+/// 内部新建一个 [`PdfExporter`]，多次导出请复用 [`PdfExporter`]。
+///
+/// # Errors
+///
+/// 同 [`PdfExporter::export`]。
+pub fn to_pdf_with(markdown: &str, template: &crate::Template) -> Result<PdfDocument, PdfError> {
+    PdfExporter::new().export_with(markdown, template)
 }
 
 /// 一次导出对应的 Typst `World`：主文件内容即 Markdown 转出的 Typst 标记，
@@ -417,6 +446,22 @@ fn main() {}
         let exporter = PdfExporter::new();
         let a = exporter.export("# 复现\n\n正文。\n").expect("导出 A");
         let b = exporter.export("# 复现\n\n正文。\n").expect("导出 B");
+        assert_eq!(a.bytes, b.bytes);
+    }
+
+    #[test]
+    fn pdf_export_with_article_template_compiles() {
+        // 模板含中文正文，验证不覆盖字体族 → CJK 仍可回退渲染
+        let doc = to_pdf_with("# 标题\n\n正文**粗体**。\n", &crate::Template::article())
+            .expect("带模板导出");
+        assert!(doc.bytes.starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn pdf_plain_template_matches_default() {
+        // plain 模板无前置，应与不带模板的导出逐字节一致
+        let a = to_pdf("# 复现\n").expect("默认导出");
+        let b = to_pdf_with("# 复现\n", &crate::Template::plain()).expect("plain 模板导出");
         assert_eq!(a.bytes, b.bytes);
     }
 }

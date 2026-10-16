@@ -49,6 +49,22 @@ pub fn to_typst(source: &str) -> String {
     out
 }
 
+/// 用 [`crate::Template`] 版式前置包裹转换结果（PDF 导出用）。
+///
+/// 模板前置为空时等价 [`to_typst`]；非空时置于正文之前并以空行分隔（Typst 用空行分段）。
+pub fn to_typst_with_template(source: &str, template: &crate::Template) -> String {
+    let body = to_typst(source);
+    let preamble = template.preamble.trim_end();
+    if preamble.is_empty() {
+        return body;
+    }
+    let mut out = String::with_capacity(preamble.len() + body.len() + 2);
+    out.push_str(preamble);
+    out.push_str("\n\n");
+    out.push_str(&body);
+    out
+}
+
 /// 递归转换一组块。
 ///
 /// 块之间用**空行**分隔：Typst 以空行分段，单换行只是段内空格，否则
@@ -444,6 +460,24 @@ mod tests {
         let t = to_typst("---\n");
         assert!(t.contains("#line(length: 100%)"));
         assert!(!t.contains("---"));
+    }
+
+    #[test]
+    fn typst_plain_template_is_identity() {
+        let src = "# 标题\n\n正文\n";
+        assert_eq!(
+            to_typst_with_template(src, &crate::Template::plain()),
+            to_typst(src)
+        );
+    }
+
+    #[test]
+    fn typst_template_preamble_prepended() {
+        let t = to_typst_with_template("# 标题\n", &crate::Template::article());
+        assert!(t.starts_with("#set page("), "{t}");
+        assert!(t.contains("#set text(size: 11pt)"));
+        // 正文仍在
+        assert!(t.contains("= 标题"));
     }
 
     #[test]
