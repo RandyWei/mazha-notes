@@ -11,7 +11,7 @@
 
 use crate::offset_map::{DisplayPos, OffsetMap};
 use crate::selection::Selection;
-use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan};
+use mazha_md::{Align, Block, BlockKind, SpanKind, SpanRole, SyntaxSpan};
 use std::ops::Range;
 
 /// 整篇文档的渲染投影。
@@ -19,6 +19,8 @@ use std::ops::Range;
 pub struct Projection {
     /// 按源文本逻辑行排列（含末尾空行，便于光标落点）。
     pub lines: Vec<ProjectedLine>,
+    /// 块级 widget（代码块/表格/分割线…），按源序排列（SPEC §11.5、D30）。
+    pub widgets: Vec<BlockWidget>,
 }
 
 impl Projection {
@@ -69,6 +71,7 @@ impl Projection {
         let all = split_lines(source);
         if all.is_empty() {
             self.lines.clear();
+            self.widgets.clear();
             return;
         }
         let keep = tail_keep.min(all.len() - 1);
@@ -99,6 +102,33 @@ impl Projection {
         out.append(&mut window);
         out.extend(self.lines[last + 1..].iter().map(|l| l.shifted(delta)));
         self.lines = out;
+        // 块级 widget 分组依赖块森林，直接由新块森林全量重算（O(块数)，代价低）。
+        self.widgets = collect_block_widgets(blocks, &all);
+    }
+
+    /// 全部块级 widget（按源序）。
+    pub fn block_widgets(&self) -> &[BlockWidget] {
+        &self.widgets
+    }
+
+    /// 源字节偏移所在的块级 widget（无则 `None`）。
+    ///
+    /// 用于渲染态/编辑态判定：光标落在 widget 的源范围内时 UI 应切到编辑态。
+    /// 边界为左闭右开（`start <= src < end`）。
+    pub fn block_widget_at(&self, src: usize) -> Option<&BlockWidget> {
+        self.widgets
+            .iter()
+            .find(|w| w.source_range.start <= src && src < w.source_range.end)
+    }
+
+    /// 某一逻辑行所属的块级 widget（无则 `None`）。
+    ///
+    /// 比 [`block_widget_at`](Self::block_widget_at) 更稳的判定：即便光标刚好落在
+    /// widget 源范围的边界（如围栏行的行尾），只要在该范围内任一逻辑行上就命中。
+    pub fn block_widget_on_line(&self, line: usize) -> Option<&BlockWidget> {
+        self.widgets
+            .iter()
+            .find(|w| w.line_range.start <= line && line < w.line_range.end)
     }
 }
 
@@ -398,6 +428,39 @@ impl WidgetKind {
     }
 }
 
+/// 块级 widget：整块由 UI 按"渲染态/编辑态"整体绘制（SPEC §11.5、D30）。
+///
+/// 光标不在其任一逻辑行时呈**渲染态**（UI 隐藏围栏/分隔等标记、按块绘制）；
+/// 光标进入其任一行则切回**编辑态**（显示原文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockWidget {
+    /// 覆盖整块的源字节范围（含围栏/分隔行）。
+    pub source_range: Range<usize>,
+    /// 覆盖的逻辑行范围（0 起，半开）。
+    pub line_range: Range<usize>,
+    /// widget 类型。
+    pub kind: BlockWidgetKind,
+}
+
+/// 块级 widget 类型（SPEC §6.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockWidgetKind {
+    /// 代码块（围栏/缩进）：`lang` 为围栏信息串中的语言标识。
+    Code {
+        /// 语言标识（如 `rust`）。
+        lang: Option<String>,
+        /// 是否为围栏代码块（``` 包裹）。
+        fenced: bool,
+    },
+    /// GFM 表格：`align` 为各列对齐方式。
+    Table {
+        /// 每列对齐方式（列数 = 数组长度）。
+        align: Vec<Align>,
+    },
+    /// 分割线（单行）。
+    Rule,
+}
+
 /// 由源文本构造整篇投影。
 pub fn build(source: &str) -> Projection {
     let blocks = mazha_md::parse(source);
@@ -429,8 +492,12 @@ pub fn build_from(source: &str, blocks: &[Block]) -> Projection {
         .enumerate()
         .map(|(i, line)| build_line(source, line, styles[i].clone(), &spans))
         .collect();
+    let widgets = collect_block_widgets(blocks, &lines);
 
-    Projection { lines: projected }
+    Projection {
+        lines: projected,
+        widgets,
+    }
 }
 
 /// 行扫描用的行范围（不含行尾换行）。
@@ -550,6 +617,47 @@ fn collect_spans(block: &Block, out: &mut Vec<SyntaxSpan>) {
     out.extend(block.spans.iter().cloned());
     for c in &block.children {
         collect_spans(c, out);
+    }
+}
+
+/// 收集块森林里的块级 widget（代码块/表格/分割线），按源序排列（SPEC §11.5、D30）。
+///
+/// 只处理叶子块；容器块（引用/列表/提示块）透传，故嵌套在列表项/引用内的代码块/表格
+/// 也会各自产出一个 widget（其 `line_range` 覆盖各自的逻辑行）。块的 `line_range`
+/// 由覆盖的逻辑行推导（首行..末行+1）。
+fn collect_block_widgets(blocks: &[Block], lines: &[Line]) -> Vec<BlockWidget> {
+    let mut out = Vec::new();
+    for b in blocks {
+        collect_block_widgets_into(b, lines, &mut out);
+    }
+    out.sort_by_key(|w| w.source_range.start);
+    out
+}
+
+fn collect_block_widgets_into(block: &Block, lines: &[Line], out: &mut Vec<BlockWidget>) {
+    let kind = match &block.kind {
+        BlockKind::CodeBlock { lang, fenced } => Some(BlockWidgetKind::Code {
+            lang: lang.clone(),
+            fenced: *fenced,
+        }),
+        BlockKind::Table { align } => Some(BlockWidgetKind::Table {
+            align: align.clone(),
+        }),
+        BlockKind::ThematicBreak => Some(BlockWidgetKind::Rule),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        let covered = lines_overlapping(lines, &block.range);
+        if let (Some(&first), Some(&last)) = (covered.first(), covered.last()) {
+            out.push(BlockWidget {
+                source_range: block.range.clone(),
+                line_range: first..last + 1,
+                kind,
+            });
+        }
+    }
+    for c in &block.children {
+        collect_block_widgets_into(c, lines, out);
     }
 }
 
@@ -907,5 +1015,120 @@ mod tests {
         assert_eq!(p.source_to_doc_pos(0), DocPos::ZERO);
         assert_eq!(p.doc_pos_to_source(DocPos::ZERO), 0);
         assert_eq!(p.display_len_at(0), 0);
+    }
+
+    // ---------- 块级 widget：SPEC §11.5 / D30 ----------
+
+    #[test]
+    fn fenced_code_block_is_one_block_widget() {
+        // 开围栏行 + 内容行 + 闭围栏行 = 3 逻辑行，聚成 1 个 Code widget
+        let p = build("```rust\nlet x = 1;\n```\n");
+        assert_eq!(p.widgets.len(), 1);
+        let w = &p.widgets[0];
+        assert_eq!(w.line_range, 0..3, "覆盖含围栏的全部逻辑行");
+        assert_eq!(
+            w.kind,
+            BlockWidgetKind::Code {
+                lang: Some("rust".to_string()),
+                fenced: true,
+            }
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_without_lang() {
+        let p = build("```\nplain\n```\n");
+        assert_eq!(p.widgets.len(), 1);
+        assert_eq!(
+            p.widgets[0].kind,
+            BlockWidgetKind::Code {
+                lang: None,
+                fenced: true,
+            }
+        );
+    }
+
+    #[test]
+    fn table_is_block_widget_with_align() {
+        let p = build("| a | b |\n| :- | -: |\n| 1 | 2 |\n");
+        assert_eq!(p.widgets.len(), 1);
+        let w = &p.widgets[0];
+        assert_eq!(w.line_range, 0..3);
+        assert_eq!(
+            w.kind,
+            BlockWidgetKind::Table {
+                align: vec![Align::Left, Align::Right],
+            }
+        );
+    }
+
+    #[test]
+    fn thematic_break_is_rule_widget() {
+        let p = build("---");
+        assert_eq!(p.widgets.len(), 1);
+        assert_eq!(p.widgets[0].kind, BlockWidgetKind::Rule);
+        assert_eq!(p.widgets[0].line_range, 0..1);
+    }
+
+    #[test]
+    fn widgets_are_source_ordered() {
+        let p = build("```\na\n```\n\n---\n\n```\nb\n```\n");
+        assert_eq!(p.widgets.len(), 3);
+        assert_eq!(
+            p.widgets[0].kind,
+            BlockWidgetKind::Code {
+                lang: None,
+                fenced: true,
+            }
+        );
+        assert_eq!(p.widgets[1].kind, BlockWidgetKind::Rule);
+        assert_eq!(
+            p.widgets[2].kind,
+            BlockWidgetKind::Code {
+                lang: None,
+                fenced: true,
+            }
+        );
+        assert!(p.widgets[0].source_range.start < p.widgets[1].source_range.start);
+        assert!(p.widgets[1].source_range.start < p.widgets[2].source_range.start);
+    }
+
+    #[test]
+    fn plain_paragraph_has_no_block_widget() {
+        let p = build("hello\n\nworld");
+        assert!(p.block_widgets().is_empty());
+        assert!(p.block_widget_at(0).is_none());
+        assert!(p.block_widget_on_line(0).is_none());
+    }
+
+    #[test]
+    fn inline_image_does_not_make_block_widget() {
+        // 图片是**内联**占位（ProjectedLine.widgets），不产生块级 widget
+        let p = build("![alt](x.png)");
+        assert!(p.block_widgets().is_empty());
+        assert_eq!(p.lines[0].widgets.len(), 1);
+    }
+
+    #[test]
+    fn block_widget_lookup_by_source_and_line() {
+        let p = build("```rust\nlet x = 1;\n```\n");
+        // 源偏移 0（开围栏起点）落在 widget 内；末偏移等于 range.end 视为外部
+        assert!(p.block_widget_at(0).is_some());
+        assert!(p.block_widget_at(p.widgets[0].source_range.end).is_none());
+        // 逻辑行 1（内容行）与 0（开围栏行）都属于 widget
+        assert!(p.block_widget_on_line(0).is_some());
+        assert!(p.block_widget_on_line(1).is_some());
+    }
+
+    #[test]
+    fn code_block_inside_quote_is_block_widget() {
+        // 容器（引用）透传，内部的围栏代码块仍产出 1 个 widget
+        let p = build("> ```rust\n> let x = 1;\n> ```\n");
+        assert!(
+            p.widgets
+                .iter()
+                .any(|w| matches!(&w.kind, BlockWidgetKind::Code { .. })),
+            "引用内的代码块应产出 Code widget"
+        );
     }
 }

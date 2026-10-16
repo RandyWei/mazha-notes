@@ -946,6 +946,7 @@ mod tests {
         let full = crate::build_projection(&d.text());
         let cached = d.projection();
         assert_eq!(cached.lines.len(), full.lines.len(), "[{step}] 行数应一致");
+        assert_eq!(cached.widgets, full.widgets, "[{step}] 块级 widget 不一致");
         for (i, (a, b)) in cached.lines.iter().zip(full.lines.iter()).enumerate() {
             assert_eq!(
                 a.source_range, b.source_range,

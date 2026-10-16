@@ -220,6 +220,7 @@ pub trait IntentMapper {
 /// 渲染投影：UI 只消费它，不再自己解析 Markdown（按源文本逻辑行 + 末尾空行）
 pub struct Projection {
     pub lines: Vec<ProjectedLine>,
+    pub widgets: Vec<BlockWidget>,   // 块级 widget（代码块/表格/分割线…），按源序排列
 }
 
 pub struct ProjectedLine {
@@ -252,6 +253,20 @@ pub struct Widget {                  // 内联占位（源文本隐藏，UI 绘�
     pub source_range: Range<usize>,
     pub display_col: usize,
     pub kind: WidgetKind,            // Image { alt } …
+}
+
+/// 块级 widget：整块由 UI 按"渲染态/编辑态"整体绘制（SPEC §11.5）。
+/// 光标不在其任一逻辑行时呈渲染态（隐藏围栏/分隔等标记），光标进入则切回编辑态（显示原文）。
+pub struct BlockWidget {
+    pub source_range: Range<usize>,  // 覆盖整块的源字节范围（含围栏/分隔行）
+    pub line_range: Range<usize>,    // 覆盖的逻辑行（0 起，半开）
+    pub kind: BlockWidgetKind,
+}
+
+pub enum BlockWidgetKind {
+    Code { lang: Option<String>, fenced: bool },  // 代码块（围栏/缩进）
+    Table { align: Vec<Align> },                  // GFM 表格（列对齐）
+    Rule,                                         // 分割线（单行）
 }
 
 /// 显示偏移 ↔ 源偏移 双向映射（WYSIWYG 最关键的数据结构）
@@ -291,6 +306,12 @@ impl Projection {
     pub fn display_len_at(&self, line: usize) -> usize;
     /// 选区覆盖到的每行显示列区间（跨行选区绘制用）。空选区返回空表。
     pub fn selection_display_ranges(&self, sel: Selection) -> Vec<LineDisplayRange>;
+    /// 全部块级 widget（按源序）。
+    pub fn block_widgets(&self) -> &[BlockWidget];
+    /// 源字节偏移所在的块级 widget（无则 None；用于"渲染态/编辑态"判定）。
+    pub fn block_widget_at(&self, src: usize) -> Option<&BlockWidget>;
+    /// 某一逻辑行所属的块级 widget（无则 None）。
+    pub fn block_widget_on_line(&self, line: usize) -> Option<&BlockWidget>;
 }
 
 /// 显示位置：显示文本中的字符索引（newtype）。
@@ -326,7 +347,9 @@ pub struct ChangeSummary {
 > `OffsetMap`（src↔display 双向映射 + 稳定落点规则）、`Projection`（按逻辑行投影：
 > `BlockStyle`/`TextRun`/`Widget` + 每行 `OffsetMap`；**文档级跨行坐标映射**
 > `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/
-> `selection_display_ranges`，覆盖跨行选区/命中/IME）、`IntentMapper`（最小实现：
+> `selection_display_ranges`，覆盖跨行选区/命中/IME）、**块级 widget**（`BlockWidget`/
+> `BlockWidgetKind`：代码块/表格/分割线，含源范围与逻辑行范围，供 UI 做渲染态/编辑态切换）、
+> `IntentMapper`（最小实现：
 > 回车列表续行/退出列表 + 切换转发）已落地（Phase 1，见 `crates/mazha-core`）。
 > **桌面端已接入**该文档级 API（`platforms/desktop` 的行归属 `line_of_source`、上下移动
 > 保留显示列 `source_to_doc_pos`/`doc_pos_to_source`、选区高亮 `selection_display_ranges`、
@@ -603,6 +626,7 @@ interface Workspace {
 | D27 | EPUB 导出引擎 | Zip + XHTML（纯 Rust，`zip` 0.5，与 docx-rs 复用同版本避免重复依赖）：正文复用 HTML 渲染的 **XHTML 方言**（`to_xhtml_body`，空元素自闭合 `<hr/>`/`<br/>`/`<img .../>`/`<input .../>`、布尔属性写 `disabled="disabled"`），打包为 EPUB 3（`mimetype` 首条目且 `Stored` 不压缩、`META-INF/container.xml`、`OEBPS/content.opf`、`nav.xhtml`、`toc.ncx` 兼容回退、`style.css` 复用 `DEFAULT_CSS`、单一 `text.xhtml`）；`dc:identifier` 缺省时用 FNV-1a 内容哈希派生（避免随机/`uuid` 依赖），`dcterms:modified` 用固定时间戳（输出确定） | 确认（见 SPEC §8） |
 | D28 | 导出主题/模板 | 引入 `Theme`（HTML/EPUB 的 CSS）与 `Template`（PDF/Typst 版式前置）两个外观预设；内置 `Theme::{light,dark,sepia}`、`Template::{plain,article}`，均为确定性常量（同输入同输出），支持 `custom`；`to_html_themed`/`to_epub_themed`/`to_pdf_with`/`to_typst_with_template` 接入；`Template::article` 只设页面/字号/段距，**不设字体族**以保留 Typst 的 CJK 字体回退 | 确认（见 SPEC §8、D12/D27） |
 | D29 | 桌面端坐标/选区实现 | `platforms/desktop` 不再自行维护行归属与偏移换算：行归属用 `Projection::line_of_source`、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮用 `selection_display_ranges` 折成每行显示列、IME 候选框用 `source_to_doc_pos` 定位；行内命中仍用缓存 `BlockGeom` 的 `OffsetMap`（只读路径无法借 `&mut` 取投影）。删除桌面端内联 `line_index`/`ranges_overlap`/`apply_edit_all` 等死代码与借用冲突（诸如 `cursors_mut(&mut self)` 触及整 `self` 导致的连锁借用错误） | 确认（见 SPEC §6.1/§11.3） |
+| D30 | 块级 widget 建模位置 | 块级 widget（代码块/表格/分割线…）作为**核心投影**的一部分：`Projection.widgets: Vec<BlockWidget>` + `block_widget_at`/`block_widget_on_line` 查询；每个 widget 记 `source_range`（整块）+ `line_range`（逻辑行）。核心只给"分组与范围"，具体绘制（面板/网格/高亮）留在 UI；"光标进入才可编辑"由 UI 用 `block_widget_on_line(光标行)` 判定。理由：分组/范围是可无 UI 单测的纯逻辑，且被多端（桌面/移动/Web）复用；公式/图表待解析器支持后再加 `BlockWidgetKind` 变体 | 确认（见 SPEC §6.1/§11.5） |
 
 ---
 
@@ -652,6 +676,7 @@ interface Workspace {
 | 0.1.39 | 2026-10-16 | **PDF 真实文档回归**（风险 R8）：新增集成测试 `tests/pdf_real_doc.rs` + 基线文档（中文技术报告 `tests/data/real_report.md` + SVG 示意图）——验证多页排版（`PdfDocument` 新增 `pages` 字段）、逐字节可复现、标记转义扫描（`#`/`[]`/`` ` ``/`$`/`*_`/`~=`/`//`/`@`/`<>`/中文标点/emoji/组合字符）。回归发现并修复 `to_typst` 行内代码缺陷：内容含反引号时反引号围栏会与内容粘连成更长串导致 `unclosed raw text`，改用 `#raw("…")`；同时行内代码内容不再走 `escape_typst`（Typst raw 不解析标记，原实现会显示出多余反斜杠）。2 条新单测 + 3 条集成测试；export 100 单测 + 3 集成（总计 **347**） |
 | 0.1.40 | 2026-10-16 | **文档级跨行坐标映射**（Phase 3 起步，SPEC §6.1/§11.3）：`mazha-core` 新增 `DocPos{line,col}`、`LineDisplayRange{line,cols}` 与 `Projection` 方法 `line_of_source`（行尾边界归前一行）、`source_to_doc_pos`（落隐藏标记吸附标记起点）、`doc_pos_to_source`（命中换算，列/行越界钳制）、`display_len_at`、`selection_display_ranges`（跨行选区→每行显示列区间，首行到行尾/中间整行/末行到终点）。把原先散落在 `platforms/desktop` 的行归属与选区换算收敛为核心纯 Rust API（桌面端改用留待下一提交）。先测试后实现，10 条新单测（含空投影、CJK 多字节、隐藏标记吸附、反向选区）；core 129（总计 **357**） |
 | 0.1.41 | 2026-10-16 | **桌面端接入核心文档级 API + 修复历史编译债**（D29，Phase 3 后续）：`platforms/desktop` 改用 `Projection::{line_of_source, source_to_doc_pos, doc_pos_to_source, selection_display_ranges}`——行归属、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮在 prepaint 折成每行显示列（paint 直接按列画，删除源码→显示二次换算）、光标竖线改存 `caret_col`、IME 候选框用 `source_to_doc_pos` 定位（跨行覆盖到终点所在行）。**修复历史编译债**：`platforms/*` 独立 workspace 不在 `cargo --workspace` 门禁内，此前多光标/PDF 导出提交未过 `cargo build`，桌面端一度**无法编译**（1 处 `crate::Projection` 未解析 + 20 处借用冲突，均因 `cursors_mut(&mut self)` 借用整个 `self` 与 `self.doc` 相交）。改为按字段借用（`&mut self.cursors`）、先算后写；删除死代码（`line_index`/`primary_line_index`/`cursors_mut`/`has_selection`/`apply_edit_all`/`ranges_overlap`）。**同步独立 `Cargo.lock`**：`zip 0.5` 全系被 yank，桌面端独立解析失败，补齐 `docx`/`zip`/`strong-xml` 等缺失锁定项（含 yanked 版本锁定）。门禁：根 workspace fmt/clippy/test 全绿（357），桌面端 `fmt`/`clippy -D warnings`/`build` 全绿 |
+| 0.1.42 | 2026-10-16 | **块级 widget 模型**（Phase 3，SPEC §6.1/§11.5，D30）：`mazha-core` 的 `Projection` 新增 `widgets: Vec<BlockWidget>`——把代码块/表格/分割线聚成**整块**模型（`source_range` 整块 + `line_range` 逻辑行 + `BlockWidgetKind::{Code{lang,fenced}, Table{align}, Rule}`），供 UI 按"光标不在块内=渲染态、进入=编辑态"整体绘制。新增查询 `block_widgets()`/`block_widget_at(src)`/`block_widget_on_line(line)`；`build_from`/`refresh` 均重算 widgets（refresh 由新块森林全量重算，O(块数)）；core 新增导出 `BlockWidget`/`BlockWidgetKind` 及 `Align`（复用解析层类型）。先测试后实现，9 条新单测（围栏代码块/无语言/表格对齐/分割线/源序/普通段落无 widget/内联图片不产块级 widget/lookup/引用内代码块）；`assert_projection_matches` 增加 widgets 一致性断言；core 138（总计 **366**）。桌面端渲染待下一提交 |
 
 ---
 

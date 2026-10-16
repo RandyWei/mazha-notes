@@ -27,11 +27,15 @@ pub use error::{EditError, Result};
 pub use intent::{DefaultIntentMapper, Intent, IntentMapper};
 pub use offset_map::{DisplayPos, OffsetMap, OffsetMapError};
 pub use projection::{
-    BlockStyle, Bullet, DocPos, LineDisplayRange, ProjectedLine, Projection, RunStyle, TextRun,
-    Widget, WidgetKind, build as build_projection, build_from as build_projection_from,
+    BlockStyle, BlockWidget, BlockWidgetKind, Bullet, DocPos, LineDisplayRange, ProjectedLine,
+    Projection, RunStyle, TextRun, Widget, WidgetKind, build as build_projection,
+    build_from as build_projection_from,
 };
 pub use selection::Selection;
 pub use workspace::{Workspace, WorkspaceError, WorkspaceResult};
+
+// 复用解析层的公共类型（供 UI 消费投影，无需直接依赖 mazha-md）
+pub use mazha_md::Align;
 
 // CRDT 桥接（core → mazha-crdt）
 pub use crdt::{

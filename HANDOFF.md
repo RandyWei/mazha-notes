@@ -24,7 +24,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
-| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存**双增量**维护）、`Edit`/`Selection`/`ChangeSummary`、`OffsetMap`（含 `shift` 平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + `build_projection_from` + **增量 refresh**）、**文档级跨行坐标映射**（`DocPos`/`LineDisplayRange` + `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/`selection_display_ranges`）、`commands`、`IntentMapper`（选区语义/块级缩进/智能成对退格）、导航（`line_range_of`/CJK 感知 `word_range_at`）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | `DocId`、序列化往返 |
+| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存**双增量**维护）、`Edit`/`Selection`/`ChangeSummary`、`OffsetMap`（含 `shift` 平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + `build_projection_from` + **增量 refresh** + **块级 widget** `BlockWidget`/`BlockWidgetKind::{Code,Table,Rule}` 与 `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标映射**（`DocPos`/`LineDisplayRange` + `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/`selection_display_ranges`）、`commands`、`IntentMapper`（选区语义/块级缩进/智能成对退格）、导航（`line_range_of`/CJK 感知 `word_range_at`）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | `DocId`、序列化往返 |
 | `mazha-md` | ✅ Phase 1 完成（方言特性全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**GFM 表格**、**Callout 提示块**、**Front-matter**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/**wiki-link**/**tags**）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | — |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace/push`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、`snapshot`（快照压缩，O(历史)→O(文本)）、并发收敛 | 多文档名册 |
@@ -42,11 +42,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 测试现状
 
-- `mazha-core`：129
+- `mazha-core`：138
 - `mazha-md`：99
 - `mazha-export`：100 单测 + 3 集成（`tests/pdf_real_doc.rs`）
 - `mazha-crdt`：11
-- 合计 **357** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **366** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -61,6 +61,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - D29：桌面端坐标/选区统一走核心文档级 API（`platforms/desktop` 的行归属/上下移动保列/选区高亮/IME 定位改用 `mazha-core::Projection`，删除内联换算与死代码；行内命中仍用缓存 `BlockGeom` 的 `OffsetMap`——只读路径无法借 `&mut` 取投影）。同次修复桌面端历史编译债（独立 workspace 未纳入门禁）与独立 `Cargo.lock`（`zip 0.5` yank）。
 - R10：`platforms/*` 为独立 workspace，**不在** `cargo --workspace` 门禁内 → 曾有提交未过 `cargo build`。触碰 `platforms/*` 必须按 `HANDOFF.md` 顶部门禁单独 `fmt`/`clippy -D warnings`/`build`。
 - Phase 3（R2 缓解）：文档级跨行映射收敛进 `mazha-core::Projection`（`DocPos`/`LineDisplayRange` + `selection_display_ranges` 等），先测试后实现；**桌面端已于 0.1.41 接入**（D29）。
+- D30：块级 widget 建模在**核心投影**——`Projection.widgets: Vec<BlockWidget>`（`source_range` 整块 + `line_range` 逻辑行 + `BlockWidgetKind::{Code,Table,Rule}`）+ `block_widget_at`/`block_widget_on_line` 查询；核心只给"分组与范围"，绘制留在 UI；"光标进入才可编辑"由 UI 按光标行判定。公式/图表待解析器支持后再加变体。
 
 ## 依赖方向（不可违反）
 
@@ -77,14 +78,15 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. **Phase 3（进行中）**：桌面端已改用核心文档级 API（0.1.41）→ 下一步块级 widget（表格/图片/代码/公式/图表）；软换行（`shape_text` 的 `wrap_boundaries` → 块内显示行映射）
+1. **Phase 3（进行中）**：块级 widget 核心模型已完成（0.1.42）→ 桌面端渲染块级 widget（代码块面板 + 语言标签、表格单元格网格、分割线真实绘制；"渲染态/编辑态"按光标行切换）+ 块级编辑（表格增删行列）；再软换行（`shape_text` 的 `wrap_boundaries` → 块内显示行映射）
 2. `mazha-export`：字体子集（Web，Phase 7）
 3. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 
-## 提交历史（近期，共 58 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 59 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(desktop): 接入核心文档级 API + 修复历史编译债（D29，Phase 3）>
+<本次提交：feat(core): 块级 widget 模型（BlockWidget/BlockWidgetKind，Phase 3）>
+fdd1252 feat(desktop): 接入核心文档级 API + 修复历史编译债（D29，Phase 3）
 c5d6d72 feat(core): 文档级跨行坐标映射（DocPos/选区区间，Phase 3）
 05e8086 test(export): PDF 真实文档回归（R8）+ 修复行内代码反引号
 398f20f feat(export): 导出主题/模板（Theme/Template，D28）
