@@ -13,6 +13,9 @@
 //! - **跨行选区**（SPEC §11.2）：鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`，
 //!   经核心 `Projection::selection_display_ranges` 折算成每行显示列区间再画高亮。
 //! - **多光标**：Alt+Click 增删光标，编辑命令对所有光标生效。
+//! - **块级 widget**（SPEC §11.5、D30）：代码块/表格/分割线按核心
+//!   `Projection::block_widgets` 聚成整块绘制——代码块面板描边 + 语言标签、表格外框 +
+//!   行分隔线、分割线真实细线；光标进入块内则隐藏装饰（编辑态）。
 //!
 //! 行归属、上下移动（保留显示列）、选区折算、IME 候选定位统一走核心的文档级投影
 //! （`Projection::{line_of_source, source_to_doc_pos, doc_pos_to_source,
@@ -32,8 +35,8 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, BlockTarget, DisplayPos, DocPos, Document, Edit, InlineMark, OffsetMap,
-    ProjectedLine, RunStyle, Selection, TextRun as DocTextRun,
+    BlockStyle, BlockTarget, BlockWidgetKind, DisplayPos, DocPos, Document, Edit, InlineMark,
+    OffsetMap, ProjectedLine, RunStyle, Selection, TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
 };
 use mazha_export::to_pdf;
@@ -162,10 +165,39 @@ struct BlockGeom {
 struct DocLayout {
     /// 块序列（与投影行一一对应，已跳过分割线等无文本块）。
     blocks: Vec<BlockGeom>,
+    /// 块级 widget 的装饰（代码块/表格/分割线；SPEC §11.5、D30）。
+    widgets: Vec<WidgetDecor>,
     /// 内容左上角（窗口坐标）。
     origin: Point<Pixels>,
     /// 统一行高。
     line_height: Pixels,
+}
+
+/// 块级 widget 的绘制装饰（由核心 [`mazha_core::Projection::block_widgets`] 投影而来）。
+#[derive(Clone)]
+struct WidgetDecor {
+    /// 装饰类型（决定画什么）。
+    kind: WidgetDecorKind,
+    /// 覆盖的逻辑行范围（与 `blocks` 下标一致；半开）。
+    line_range: Range<usize>,
+    /// 左侧缩进（与首行块缩进一致）。
+    indent: Pixels,
+    /// 光标是否位于其内（编辑态：不画装饰，露出可编辑内容）。
+    editing: bool,
+}
+
+/// 装饰类型。
+#[derive(Clone)]
+enum WidgetDecorKind {
+    /// 代码块：面板描边 + 右上角语言标签（已 shape，直接 paint）。
+    Code {
+        /// 语言标签（围栏信息串；无则不画）。装箱以避免枚举变体过大。
+        label: Option<Box<ShapedLine>>,
+    },
+    /// 表格：外框 + 行分隔线。
+    Table,
+    /// 分割线：一条水平细线。
+    Rule,
 }
 
 impl DocLayout {
@@ -1276,19 +1308,7 @@ fn build_line_runs(
         runs.push(gp.1);
     }
 
-    // 分割线：用一串水平线字符占位（视觉近似）
-    if line.block.thematic_break {
-        let hr = "─".repeat(40);
-        runs.push(gpui::TextRun {
-            len: hr.len(),
-            font: base_font.clone(),
-            color: palette.border,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        });
-        text.push_str(&hr);
-    }
+    // 分割线：不在此处画字符，改由 `paint` 依块级 widget 画一条真实细线（SPEC §11.5、D30）。
 
     (text.into(), runs)
 }
@@ -1307,6 +1327,36 @@ fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
         x += base;
     }
     x
+}
+
+/// 用四条 1px 矩形描出一个矩形边框（gpui 的 `paint_quad` 只有填充，故四边各画一条）。
+fn paint_rect_border(window: &mut Window, rect: Bounds<Pixels>, color: Hsla, thickness: Pixels) {
+    let Bounds {
+        origin,
+        size: rect_size,
+    } = rect;
+    let w = rect_size.width;
+    let h = rect_size.height;
+    // 上边
+    window.paint_quad(fill(bounds(origin, size(w, thickness)), color));
+    // 下边
+    window.paint_quad(fill(
+        bounds(
+            point(origin.x, origin.y + h - thickness),
+            size(w, thickness),
+        ),
+        color,
+    ));
+    // 左边
+    window.paint_quad(fill(bounds(origin, size(thickness, h)), color));
+    // 右边
+    window.paint_quad(fill(
+        bounds(
+            point(origin.x + w - thickness, origin.y),
+            size(thickness, h),
+        ),
+        color,
+    ));
 }
 
 /// 文档正文的自写元素：逐块 `shape_line` 连续布局 + 绘制，并把几何回存给视图。
@@ -1380,10 +1430,59 @@ impl Element for DocElement {
         let indent_base = BASE;
 
         // update 提供 &mut DocView（投影缓存需惰性建立），闭包返回几何数据避免借用越界
-        let blocks = self.view.update(cx, |view, _| {
-            let caret = view.cursors[view.primary].caret;
+        let (blocks, widgets) = self.view.update(cx, |view, _| {
+            // 需先取所有光标的源偏移，随后 projection() 会可变借用 view.doc（借用不相交）
+            let caret_sources: Vec<usize> = view.cursors.iter().map(|c| c.caret).collect();
             let projection = view.doc.projection();
+            let caret = view.cursors[view.primary].caret;
             let caret_pos = projection.source_to_doc_pos(caret);
+            // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
+            let caret_lines: Vec<usize> = caret_sources
+                .iter()
+                .map(|&s| projection.line_of_source(s))
+                .collect();
+            // 块级 widget 装饰：光标在其内=编辑态（不画装饰），否则=渲染态（画装饰）
+            let widgets: Vec<WidgetDecor> = projection
+                .block_widgets()
+                .iter()
+                .map(|w| {
+                    let editing = caret_lines.iter().any(|&l| w.line_range.contains(&l));
+                    let indent = projection
+                        .lines
+                        .get(w.line_range.start)
+                        .map_or(indent_base, |l| block_indent(l, indent_base));
+                    let kind = match &w.kind {
+                        BlockWidgetKind::Code { lang, .. } => {
+                            // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画
+                            let label = lang.as_ref().map(|l| {
+                                let run = gpui::TextRun {
+                                    len: l.len(),
+                                    font: mono_font.clone(),
+                                    color: palette.muted,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                Box::new(window.text_system().shape_line(
+                                    l.clone().into(),
+                                    mono_size,
+                                    &[run],
+                                    None,
+                                ))
+                            });
+                            WidgetDecorKind::Code { label }
+                        }
+                        BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
+                        BlockWidgetKind::Rule => WidgetDecorKind::Rule,
+                    };
+                    WidgetDecor {
+                        kind,
+                        line_range: w.line_range.clone(),
+                        indent,
+                        editing,
+                    }
+                })
+                .collect();
             // 选区高亮：用核心的文档级映射把每个选区的源区间分解成"每行显示列区间"，
             // 再按行归并（多光标可能同行重叠）。这样 paint 阶段无需再做源→显示换算。
             let mut sel_by_line: Vec<Option<Range<usize>>> = vec![None; projection.lines.len()];
@@ -1424,11 +1523,12 @@ impl Element for DocElement {
                     selection: sel_by_line[idx].clone(),
                 });
             }
-            v
+            (v, widgets)
         });
 
         DocLayout {
             blocks,
+            widgets,
             origin: bounds.origin,
             line_height: LINE_HEIGHT,
         }
@@ -1455,6 +1555,59 @@ impl Element for DocElement {
                 v.layout = Some(layout_for_view);
             });
         });
+
+        // 先画块级 widget 装饰（面板/网格/分割线），再画文本，保证文字在上层。
+        // 渲染态画装饰；编辑态（光标已在块内）不画，露出可编辑内容（SPEC §11.5）。
+        if !layout.widgets.is_empty() {
+            let content_right = element_bounds.origin.x + element_bounds.size.width - BASE;
+            for w in &layout.widgets {
+                let top = layout.origin.y + LINE_HEIGHT * w.line_range.start as f32;
+                let bottom = layout.origin.y + LINE_HEIGHT * w.line_range.end as f32;
+                let left = layout.origin.x + w.indent;
+                let right = content_right.max(left + px(24.));
+                let rect = bounds(point(left, top), size(right - left, bottom - top));
+                match &w.kind {
+                    // 分割线：在行垂直中线画一条细线（取代旧的 "─" 文本占位）
+                    WidgetDecorKind::Rule => {
+                        let y = top + LINE_HEIGHT / 2.;
+                        window.paint_quad(fill(
+                            bounds(point(left, y), size(right - left, px(1.))),
+                            palette.border,
+                        ));
+                    }
+                    // 代码块：整体描边（弱底色由每个代码行 run 自身提供，此处不叠加填充）
+                    // + 右上角语言标签
+                    WidgetDecorKind::Code { label } if !w.editing => {
+                        paint_rect_border(window, rect, palette.border, px(1.));
+                        if let Some(label) = label {
+                            let lx = right - label.width() - px(6.);
+                            let ly = top + px(3.);
+                            let _ = label.paint(
+                                point(lx, ly),
+                                LINE_HEIGHT - px(6.),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    // 表格：弱底填充 + 外框 + 每行之间的水平分隔线
+                    WidgetDecorKind::Table if !w.editing => {
+                        window.paint_quad(fill(rect, palette.subtle));
+                        paint_rect_border(window, rect, palette.border, px(1.));
+                        for row in (w.line_range.start + 1)..w.line_range.end {
+                            let y = layout.origin.y + LINE_HEIGHT * row as f32;
+                            window.paint_quad(fill(
+                                bounds(point(left, y), size(right - left, px(1.))),
+                                palette.border,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // 逐块绘制：选区高亮底 → 文本 → 光标竖线
         for (idx, block) in layout.blocks.iter().enumerate() {
