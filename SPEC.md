@@ -105,7 +105,7 @@
 │      ├── mazha-md      ── Markdown 解析 / 方言 / 增量解析            │
 │      ├── mazha-crdt    ── yrs 封装 / 同步协议 / 合并                 │
 │      ├── mazha-store   ── 存储抽象 / 本地文件 Provider               │
-│      ├── mazha-export  ── HTML / PDF / (DOCX / EPUB) 导出           │
+│      ├── mazha-export  ── HTML / PDF / DOCX / (EPUB) 导出           │
 │      └── mazha-plugin  ── WASM 插件宿主 / 存储插件桥                 │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -168,7 +168,7 @@ mazha-notes-v2/
 | `mazha-md` | Markdown 解析、GFM+知识库方言、增量解析（脏块重解析）、序列化 | GUI | `parse` `SyntaxSpan` `Block` `serialize` |
 | `mazha-crdt` | 用 yrs 维护 `Y.Text`，同步协议、状态向量、合并、持久化更新 | GUI | `CrdtDoc` `SyncMessage` |
 | `mazha-store` | 存储 Provider 抽象 + 本地文件系统实现 + 文件监听 | GUI | `StorageProvider` `FileSystemProvider` |
-| `mazha-export` | 源文本 → HTML/PDF/(DOCX/EPUB) | GUI | `export_html` `export_pdf` |
+| `mazha-export` | 源文本 → HTML / PDF / DOCX / (EPUB) | GUI | `to_html` / `to_pdf` / `to_docx` |
 | `mazha-plugin` | WASM 插件宿主、能力授权、存储插件桥 | GUI | `PluginHost` `Capability` |
 | `mazha-ffi` | UniFFI 接口定义，供 Swift/Kotlin/ArkTS 调用 | GUI | 见 6.4 |
 | `mazha-wasm` | Web 绑定（Phase 7） | GUI | 见 7.3 |
@@ -436,7 +436,8 @@ interface Workspace {
 | 图表 | `mermaid-rs-renderer` | 纯 Rust → SVG/PNG |
 | PDF 导出 | Typst 0.15（`typst` / `typst-layout` / `typst-pdf` / `typst-kit`）→ [`mazha-export::to_typst`] + [`mazha-export::to_pdf`] | 纯 Rust；排版质量优先（D21，接入方式见 D25）：`to_typst` 产出标记，`ExportWorld` 实现 `typst::World` 后 `compile` + `typst_pdf::pdf` 出字节；字体走 `typst-kit`（内置 + 系统扫描） |
 | HTML 导出 | 基于 `mazha-md` 块/片段模型自研渲染（[`mazha-export::to_html`]） | 纯 Rust；与编辑器同源（D23 后 `pulldown-cmark` 仅 dev 对照） |
-| DOCX/EPUB | `[待确认]` `docx-rs` / Zip+XHTML | 后续 Phase |
+| DOCX 导出 | `docx-rs` 1.1（[`mazha-export::to_docx`]） | 纯 Rust；基于 `mazha-md` 块/片段模型直接生成 OOXML（标题用直接格式、行内 粗/斜/删除线/行内代码、链接「文字 + (URL)」、图片占位、GFM 表格、列表/任务/引用/提示块/代码块/分割线），决策 D26 |
+| EPUB 导出 | `[待确认]` Zip + XHTML（复用 `to_html` 同源渲染） | 后续 Phase |
 | 字体/中文字形 | `[待确认]` 系统字体 + 内置 CJK 子集 | Web/wasm 需内置 |
 
 ---
@@ -570,6 +571,7 @@ interface Workspace {
 | D23 | Markdown 解析实现 | 自研行扫描（块级）+ 自研行内扫描，精确字节偏移；`pulldown-cmark` 降为 dev 依赖（测试对照/后续 HTML 导出参考） | 确认（见 `docs/ADR/ADR-001`） |
 | D24 | 存储接口同步/异步 | MVP 采用**同步** `StorageProvider`（本地文件系统为唯一 Provider）；异步/流式与文件监听推迟到 Phase 5 | 确认 |
 | D25 | PDF 编译接入方式 | Typst 0.15 走 `to_typst` 标记 + 自实现 `ExportWorld`（`typst::World`）：虚拟主文件、资源根 `base_dir`（`Project` 根才允许相对路径，拒绝包根）、字体经 `typst-kit`（内置 + 可选系统扫描），`typst::compile` → `typst_pdf::pdf`；workspace `rust-version` 随 typst MSRV 提升至 **1.92** | 确认（见 SPEC §8） |
+| D26 | DOCX 导出引擎 | `docx-rs` 1.1（纯 Rust）：直接基于 `mazha-md` 块/片段模型生成 OOXML，不经 HTML 中转；标题用直接格式（加粗 + 字号）不依赖样式表，链接渲染为「文字 + (URL)」（docx-rs 的 `Relationship` 不支持 `TargetMode="External"`，无法生成可点击外链），图片仅输出占位文本；文本转义交由 `strong-xml`，一律 `xml:space="preserve"` 保空白 | 确认（见 SPEC §8） |
 
 ---
 
@@ -613,6 +615,7 @@ interface Workspace {
 | 0.1.33 | 2026-10-13 | **PDF 编译**（PDF 管线第二步，D25）：`mazha-export::to_pdf`/`PdfExporter`——`ExportWorld` 实现 `typst::World`（虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体）→ `typst::compile` → `typst_pdf::pdf`，返回 `PdfDocument{bytes,warnings}`；`PdfExportOptions{base_dir,system_fonts}`、`PdfError::{Compile,Export}`；标记侧修复 4 处可编译性问题——表格改 `align:` 数组 + 逗号分隔实参、图片 alt 改命名字符串参数、块间空行、Markdown 反斜杠转义需二次转义（新增 `escape_typst`/`escape_typst_string`）；workspace `rust-version` 1.85→1.92（typst MSRV），修 rustc 1.98 新增 `collapsible_if`；14 条新测试（export 60，总计 **304**） |
 | 0.1.34 | 2026-10-14 | **Phase 2 起步：桌面只读投影渲染**（§7.1）：新建 `platforms/desktop`（独立 workspace，`gpui-kit` 0.7 锁定 GPUI 快照，`mazha-core` 路径依赖）→ `mazha-desktop`：读 `.md`（或内置示例）→ `Document`/`Projection` → 逐行绘制（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色跟随深浅色；`cargo run -- [path.md]` 可直接打开文件；§7.1 依赖形态按现状修正为 crates.io `gpui-pre` 家族（由 gpui-kit 锁定）；fmt/clippy/build 门禁覆盖该 crate |
 | 0.1.35 | 2026-10-14 | **桌面光标/点击定位 + WYSIWYG 标记显隐**（§11.2）：`DocView` 增 `caret: usize`（**源字节偏移**，真相在源文本）+ `FocusHandle`。**点击定位**：每行 `TextLayout::index_for_position` 命中（窗口坐标→显示字符索引，Err 取最近字符边界）→ 光标行经"行首源偏移 + 索引"、非光标行经 `OffsetMap::display_to_source`（交叉点取更小源偏移=隐藏标记起点）→ `Document::snap_to_boundary`；每行均接 `on_click`（含光标行，可跨行跳转）。**标记显隐**（§11.2）：光标所在行渲染 `source[source_range]` **原文**（`#`/`**`/`-`/`>` 等标记可见、不画列表/任务前缀），其余行投影隐藏。**光标竖线**：文本前插零宽 `canvas`，`position_for_index`（返回**绝对窗口坐标**）+ `paint_quad` 画 1.5px 竖线；行内全部子元素先 prepaint 再 paint，故 prepaint 后的 layout 可安全命中。键盘 `left/right/up/down/home/end`（组合键交系统；上下移动按行内相对位置 + `snap_to_boundary`）。门禁：fmt/clippy/build 全绿，`cargo run` 启动无 panic（进程存活、日志为空） |
+| 0.1.36 | 2026-10-16 | **DOCX 导出**（D26）：`mazha-export::to_docx`（基于 `docx-rs` 1.1 生成 OOXML，不经 HTML 中转）——标题（直接格式 加粗+字号）/段落/引用/提示块/列表（有序/无序/嵌套）/任务列表/GFM 表格（含列对齐）/围栏代码块（逐行保留换行）/分割线/行内 粗/斜/删除线/行内代码/链接（「文字 + (URL)」）/自动链接/wiki-link/标签/图片占位；front-matter 隐藏；文本经 `strong-xml` 自动转义 + `xml:space="preserve"`；`DocxError`（`docx::DocxError` 仅 `Debug`，转字符串）。边界处理：空输入仍产出合法 ZIP（`PK\x03\x04`）、代码块按行插换行、span 原样空白保留、块 `range` 越界防御。13 条新测试；export 73（总计 **317**） |
 
 ---
 

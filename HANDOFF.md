@@ -3,8 +3,8 @@
 > 每次提交代码时**同步更新本文件**（约定，见 `AGENTS.md`）。
 > 单一事实来源是 `SPEC.md`；本文件只做"当前进度 / 下一步"的归总，不替代 SPEC。
 
-- 最近更新：2026-10-14
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 进行中**（桌面只读投影渲染 + 光标/点击定位 + WYSIWYG 标记显隐 + 自写 Element 连续布局/跨行选区）
+- 最近更新：2026-10-16
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 进行中**（桌面只读投影渲染 + 光标/点击定位 + WYSIWYG 标记显隐 + 自写 Element 连续布局/跨行选区 + IME + 编辑命令 + 多光标 + PDF 导出）；**导出线**并行推进（HTML / PDF / **DOCX** 可用）
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）
 - 分支：`main`（当前提交见下方"提交历史"）
 
@@ -28,7 +28,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | `mazha-md` | ✅ Phase 1 完成（方言特性全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**GFM 表格**、**Callout 提示块**、**Front-matter**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/**wiki-link**/**tags**）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | — |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace/push`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、`snapshot`（快照压缩，O(历史)→O(文本)）、并发收敛 | 多文档名册 |
-| `mazha-export` | ✅ HTML + **PDF** 可用 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/提示块/列表/任务/围栏代码/分割线/GFM 表格/行内全套/链接/wiki-link/标签/图片；`to_typst`（Markdown→Typst 标记：含 `escape_typst` 特殊字符转义、表格 `align:` + 逗号实参、图片 `alt:` 命名参数、动态围栏）；**`to_pdf`/`PdfExporter`**（`ExportWorld` 实现 `typst::World`：虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体 → `typst::compile` → `typst_pdf::pdf`；`PdfDocument{bytes,warnings}`、`PdfError::{Compile,Export}`、`PdfExportOptions{base_dir,system_fonts}`） | DOCX/EPUB、模板/主题、字体子集（Web） |
+| `mazha-export` | ✅ HTML + PDF + **DOCX** 可用 | `to_html` + `to_html_document`（完整 HTML5 外壳 + 默认 CSS + title 转义）：标题/段落/引用/提示块/列表/任务/围栏代码/分割线/GFM 表格/行内全套/链接/wiki-link/标签/图片；`to_typst`（Markdown→Typst 标记：含 `escape_typst` 特殊字符转义、表格 `align:` + 逗号实参、图片 `alt:` 命名参数、动态围栏）；**`to_pdf`/`PdfExporter`**（`ExportWorld` 实现 `typst::World`：虚拟主文件 + `base_dir` 资源根 + `typst-kit` 内置/系统字体 → `typst::compile` → `typst_pdf::pdf`；`PdfDocument{bytes,warnings}`、`PdfError::{Compile,Export}`、`PdfExportOptions{base_dir,system_fonts}`）；**`to_docx`**（`docx-rs` 1.1 生成 OOXML，不经 HTML 中转：标题直接格式/段落/引用/提示块/列表/任务/GFM 表格/代码块逐行/分割线/行内 粗/斜/删/码/链接「文字 + (URL)」/wiki-link/标签/图片占位；`DocxError`；text 经 `strong-xml` 转义 + `xml:space="preserve"`） | EPUB、模板/主题、字体子集（Web）、PDF 字体覆盖/转义真实文档回归（R8） |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权 |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（iOS/Android/鸿蒙） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -44,9 +44,9 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 - `mazha-core`：119
 - `mazha-md`：99
-- `mazha-export`：60
+- `mazha-export`：73
 - `mazha-crdt`：11
-- 合计 **304** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **317** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -54,6 +54,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - D23：Markdown **自研行扫描**（块级+行内，精确字节偏移），`pulldown-cmark` 降为 dev 依赖做对照。见 [`docs/ADR/ADR-001`](docs/ADR/ADR-001-self-authored-markdown-parser.md)。
 - D24：`StorageProvider` 采用**同步**接口（本地文件系统为唯一 MVP Provider），异步/流式/文件监听推迟到 Phase 5。
 - D25：PDF 编译走 `to_typst` + 自实现 `ExportWorld`（`typst::World`：虚拟主文件 / `base_dir` 资源根 / `typst-kit` 字体），`typst::compile` + `typst_pdf::pdf`；workspace `rust-version` 提到 1.92（typst 0.15 MSRV）。
+- D26：DOCX 导出走 `docx-rs` 1.1，直接基于 `mazha-md` 块/片段模型生成 OOXML（不经 HTML 中转）；标题用直接格式、链接为「文字 + (URL)」、图片占位。
 
 ## 依赖方向（不可违反）
 
@@ -70,17 +71,21 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. `mazha-export`：DOCX/EPUB、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
+1. `mazha-export`：EPUB（Zip + XHTML，复用 `to_html` 同源渲染）、模板/主题；PDF 字体覆盖/转义的**真实文档回归**（R8）
 2. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 3. Phase 3：`OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表）
 
-## 提交历史（近期，共 50 条；本次提交为最新一条，待下次同步时补入哈希）
+## 提交历史（近期，共 53 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交>
-9e188db feat(desktop): IME 支持 + EntityInputHandler 完整实现
-2a9c1c8 feat(desktop): 编辑命令接入（commands/apply_and_sync）
+<本次提交：feat(export): DOCX 导出（docx-rs）>
+917d9ce chore: update Cargo.lock for mazha-export + rfd deps
+531bdc7 feat(desktop): PDF 导出（Cmd+E）
 72ee12a feat(desktop): 多光标支持
+2a9c1c8 feat(desktop): 编辑命令接入（commands/apply_and_sync）
+9e188db feat(desktop): IME 支持 + EntityInputHandler 完整实现
+2e9a5af feat(desktop): 自写 Element + shape_line 连续布局 + 跨行选区
+9e24880 feat(desktop): 光标/点击定位 + WYSIWYG 标记显隐（光标行原文，其余投影隐藏）
 13e0295 feat(desktop): Phase 2 起步——GPUI 只读投影渲染（可运行）
 e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线第二步）
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
