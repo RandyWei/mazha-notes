@@ -11,14 +11,17 @@
 //! - **WYSIWYG 标记显隐**（SPEC §11.2）：光标所在行渲染**原始 Markdown**（标记可见），
 //!   其余行渲染投影（标记隐藏）；
 //! - **跨行选区**（SPEC §11.2）：鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`，
-//!   在每个块内按重叠区画高亮矩形。
+//!   经核心 `Projection::selection_display_ranges` 折算成每行显示列区间再画高亮。
+//! - **多光标**：Alt+Click 增删光标，编辑命令对所有光标生效。
+//!
+//! 行归属、上下移动（保留显示列）、选区折算、IME 候选定位统一走核心的文档级投影
+//! （`Projection::{line_of_source, source_to_doc_pos, doc_pos_to_source,
+//! selection_display_ranges}`），UI 侧不再自行维护偏移换算。
 //!
 //! 设计取舍：**不做软换行**——每个投影块渲染成一条不换行的 `ShapedLine`。这样
 //! "显示字节索引"与 `OffsetMap` 的"显示字符索引"天然等长（偏移映射要求字符边界），
 //! 一次整篇命中即可换算源偏移；软换行留待后续用 `shape_text` 的 `wrap_boundaries`
 //! 折算成"块内显示行"再映射。
-//!
-//! 尚未实现：多光标。
 
 use std::ops::Range;
 use std::panic::Location;
@@ -29,11 +32,11 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, BlockTarget, DisplayPos, Document, Edit, InlineMark, OffsetMap, ProjectedLine,
-    RunStyle, TextRun as DocTextRun,
+    BlockStyle, BlockTarget, DisplayPos, DocPos, Document, Edit, InlineMark, OffsetMap,
+    ProjectedLine, RunStyle, Selection, TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
 };
-use mazha_export::{PdfDocument, PdfError, to_pdf};
+use mazha_export::to_pdf;
 use rfd::FileDialog;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -140,9 +143,14 @@ struct BlockGeom {
     line: ShapedLine,
     /// 左缩进（引用深度、列表缩进），行内 x 坐标需加上它才是块内绝对 x。
     indent: Pixels,
-    /// 本块是否为光标所在块（仅一块为真；用于绘制光标竖线）。
-    caret_line: bool,
-    /// 本块与当前选区的重叠部分（`None` 表示本块不在选区内）。
+    /// 光标在本块时的行内**显示列**（`None` = 光标不在本块；仅一块为 `Some`）。
+    ///
+    /// 由 `Projection::source_to_doc_pos` 于 prepaint 阶段算好，paint 直接据此画竖线。
+    caret_col: Option<usize>,
+    /// 本块在当前选区内的**显示列**区间（`None` 表示本块不在选区内）。
+    ///
+    /// 由 `Projection::selection_display_ranges` 于 prepaint 阶段算好，paint 直接按
+    /// `line.x_for_index(cols.*)` 换算屏幕 x，无需再经 `OffsetMap` 换算源偏移。
     selection: Option<Range<usize>>,
 }
 
@@ -190,24 +198,20 @@ struct Cursor {
 
 impl Cursor {
     fn new(caret: usize) -> Self {
-        Self { caret, anchor: None, marked: None }
-    }
-
-    /// 是否有选区（锚点存在且不等于光标）。
-    fn has_selection(&self) -> bool {
-        self.anchor.is_some_and(|a| a != self.caret)
+        Self {
+            caret,
+            anchor: None,
+            marked: None,
+        }
     }
 
     /// 当前选区范围（有序，含首不含尾）。
     fn selection(&self) -> Option<Range<usize>> {
         let a = self.anchor?;
-        if a == self.caret { return None; }
+        if a == self.caret {
+            return None;
+        }
         Some(a.min(self.caret)..a.max(self.caret))
-    }
-
-    /// 落在哪一行。
-    fn line_index(&self, projection: &crate::Projection) -> Option<usize> {
-        projection.lines.iter().position(|l| l.source_range.contains(&self.caret) || l.source_range.end == self.caret)
     }
 }
 
@@ -276,9 +280,8 @@ impl DocView {
 
     /// 所有光标的选区集合（去重、合并重叠）。
     fn all_selections(&self) -> Vec<Range<usize>> {
-        let mut ranges: Vec<Range<usize>> = self.cursors.iter()
-            .filter_map(|c| c.selection())
-            .collect();
+        let mut ranges: Vec<Range<usize>> =
+            self.cursors.iter().filter_map(|c| c.selection()).collect();
         ranges.sort_by_key(|r| r.start);
         // 合并重叠/相邻
         let mut merged: Vec<Range<usize>> = Vec::new();
@@ -296,17 +299,6 @@ impl DocView {
         merged
     }
 
-    /// 主光标所在行（`[start, end]` 闭右端，便于 `caret == 行尾` 时仍算本行）。
-    fn primary_line_index(&mut self) -> Option<usize> {
-        let primary = self.primary;
-        let caret = self.cursors[primary].caret;
-        let projection = self.doc.projection();
-        projection
-            .lines
-            .iter()
-            .position(|l| l.source_range.contains(&caret) || l.source_range.end == caret)
-    }
-
     /// 获取主光标的不可变引用（用于只读访问）。
     fn primary_cursor(&self) -> &Cursor {
         &self.cursors[self.primary]
@@ -317,17 +309,18 @@ impl DocView {
         &mut self.cursors[self.primary]
     }
 
-    /// 获取所有光标的可变引用。
-    fn cursors_mut(&mut self) -> &mut [Cursor] {
-        &mut self.cursors
-    }
-
     /// 所有光标左移一个字符边界。
     fn move_left(&mut self, shift: bool) {
         let doc = &self.doc;
         for c in &mut self.cursors {
             let new_caret = doc.prev_char_boundary(c.caret);
-            if shift { if c.anchor.is_none() { c.anchor = Some(c.caret); } } else { c.anchor = None; }
+            if shift {
+                if c.anchor.is_none() {
+                    c.anchor = Some(c.caret);
+                }
+            } else {
+                c.anchor = None;
+            }
             c.caret = doc.snap_to_boundary(new_caret);
         }
     }
@@ -337,7 +330,13 @@ impl DocView {
         let doc = &self.doc;
         for c in &mut self.cursors {
             let new_caret = doc.next_char_boundary(c.caret);
-            if shift { if c.anchor.is_none() { c.anchor = Some(c.caret); } } else { c.anchor = None; }
+            if shift {
+                if c.anchor.is_none() {
+                    c.anchor = Some(c.caret);
+                }
+            } else {
+                c.anchor = None;
+            }
             c.caret = doc.snap_to_boundary(new_caret);
         }
     }
@@ -346,11 +345,17 @@ impl DocView {
     fn move_home(&mut self, shift: bool) {
         let projection = self.doc.projection();
         for c in &mut self.cursors {
-            if let Some(i) = c.line_index(&projection) {
-                let start = projection.lines[i].source_range.start;
-                if shift { if c.anchor.is_none() { c.anchor = Some(c.caret); } } else { c.anchor = None; }
-                c.caret = start;
+            let start = projection.lines[projection.line_of_source(c.caret)]
+                .source_range
+                .start;
+            if shift {
+                if c.anchor.is_none() {
+                    c.anchor = Some(c.caret);
+                }
+            } else {
+                c.anchor = None;
             }
+            c.caret = start;
         }
     }
 
@@ -358,11 +363,17 @@ impl DocView {
     fn move_end(&mut self, shift: bool) {
         let projection = self.doc.projection();
         for c in &mut self.cursors {
-            if let Some(i) = c.line_index(&projection) {
-                let end = projection.lines[i].source_range.end;
-                if shift { if c.anchor.is_none() { c.anchor = Some(c.caret); } } else { c.anchor = None; }
-                c.caret = end;
+            let end = projection.lines[projection.line_of_source(c.caret)]
+                .source_range
+                .end;
+            if shift {
+                if c.anchor.is_none() {
+                    c.anchor = Some(c.caret);
+                }
+            } else {
+                c.anchor = None;
             }
+            c.caret = end;
         }
     }
 
@@ -376,25 +387,38 @@ impl DocView {
         self.move_vertical_all(1, shift);
     }
 
-/// 所有光标上/下移动：`step` 为 -1（上）或 +1（下）。
+    /// 所有光标上/下移动：`step` 为 -1（上）或 +1（下）。
+    ///
+    /// 用文档坐标 [`DocPos`] 保留**显示列**（可见字符列），而非字节相对偏移，
+    /// 避免 CJK 等多字节行上下移动时列漂移；目标行较短时列自动钳到行尾。
     fn move_vertical_all(&mut self, step: isize, shift: bool) {
         let projection = self.doc.projection();
         for c in &mut self.cursors {
-            let Some(i) = c.line_index(&projection) else { continue; };
-            let cur = projection.lines[i].source_range.clone();
-            let target_i = if step < 0 { i.checked_sub(1) } else { (i + 1 < projection.lines.len()).then_some(i + 1) };
-            let Some(target_i) = target_i else {
-                let end = if step < 0 { 0 } else { projection.lines.last().map_or(0, |l| l.source_range.end) };
-                if shift { if c.anchor.is_none() { c.anchor = Some(c.caret); } } else { c.anchor = None; }
-                c.caret = end;
-                continue;
+            let pos = projection.source_to_doc_pos(c.caret);
+            let target_line = if step < 0 {
+                pos.line.checked_sub(1)
+            } else {
+                (pos.line + 1 < projection.len()).then_some(pos.line + 1)
             };
-            let target = projection.lines[target_i].source_range.clone();
-            let rel = c.caret.saturating_sub(c.line_index(&projection).and_then(|i| projection.lines.get(i)).map_or(0, |l| l.source_range.start));
-            let target_caret = (target.start + rel).min(target.end);
-            let target_caret = self.doc.snap_to_boundary(target_caret);
-            if shift { if c.anchor.is_none() { c.anchor = Some(c.caret); } } else { c.anchor = None; }
-            c.caret = target_caret;
+            let new_caret = match target_line {
+                Some(line) => projection.doc_pos_to_source(DocPos { line, col: pos.col }),
+                // 越界：上移落到文首，下移落到文末
+                None => {
+                    if step < 0 {
+                        0
+                    } else {
+                        projection.lines.last().map_or(0, |l| l.source_range.end)
+                    }
+                }
+            };
+            if shift {
+                if c.anchor.is_none() {
+                    c.anchor = Some(c.caret);
+                }
+            } else {
+                c.anchor = None;
+            }
+            c.caret = new_caret;
         }
     }
 
@@ -404,55 +428,19 @@ impl DocView {
     /// 编辑失败（非法边界等）时保持文档与光标不变。成功后塌缩主光标选区并清空 IME 组合区。
     fn apply_edit(&mut self, edit: Edit, new_caret: usize, cx: &mut Context<Self>) {
         if self.doc.apply(edit).is_ok() {
+            // 先算好校正后的位置（结束对 self.doc 的借用），再改光标，避免借用冲突
+            let snapped = self.doc.snap_to_boundary(new_caret);
             let c = self.primary_cursor_mut();
             c.anchor = None;
             c.marked = None;
-            c.caret = self.doc.snap_to_boundary(new_caret);
+            c.caret = snapped;
             cx.notify();
         }
     }
 
-    /// 对所有光标应用相同的编辑逻辑（范围相对于各自的选区/光标位置）。
-    ///
-    /// 由于编辑会改变文档，从后往前应用以保持偏移正确性。
-    fn apply_edit_all(&mut self, cx: &mut Context<Self>, edit_fn: impl Fn(&Range<usize>) -> Edit) {
-        // 收集所有目标范围（选区或光标位置），按起始位置倒序
-        let mut ranges: Vec<Range<usize>> = self.cursors.iter()
-            .map(|c| c.selection().unwrap_or(c.caret..c.caret))
-            .collect();
-        ranges.sort_by_key(|r| r.start);
-        // 去重合并重叠
-        let mut merged: Vec<Range<usize>> = Vec::new();
-        for r in ranges {
-            if let Some(last) = merged.last_mut() {
-                if r.start <= last.end { last.end = last.end.max(r.end); }
-                else { merged.push(r); }
-            } else { merged.push(r); }
-        }
-        // 倒序应用编辑（从后往前，保持前面的偏移不变）
-        for range in merged.iter().rev() {
-            let edit = edit_fn(range);
-            if self.doc.apply(edit.clone()).is_ok() {
-                // 编辑成功，需要更新所有光标位置
-                // 由于我们倒序应用，只有在 range 之前的光标需要调整
-                // 这里简化：重新计算所有光标位置（实际项目中可用更精确的增量更新）
-            }
-        }
-        // 简化：应用后重置所有光标到第一个范围的起始
-        if let Some(first) = self.cursors.first() {
-            let new_caret = self.doc.snap_to_boundary(first.caret);
-            for c in self.cursors_mut() {
-                c.caret = new_caret;
-                c.anchor = None;
-                c.marked = None;
-            }
-        }
-        cx.notify();
-    }
-
     /// 撤销/重做等"绕过 `apply_edit`"的变更之后，统一收敛光标/选区状态并重绘。
     fn after_doc_mutation(&mut self, cx: &mut Context<Self>) {
-        for c in self.cursors_mut() {
+        for c in &mut self.cursors {
             c.caret = self.doc.snap_to_boundary(c.caret);
             c.anchor = None;
             c.marked = None;
@@ -463,17 +451,14 @@ impl DocView {
     /// 应用行内格式命令（粗体/斜体/删除线/行内代码）到所有光标。
     fn apply_inline(&mut self, mark: InlineMark, cx: &mut Context<Self>) {
         // 对每个光标单独应用格式（基于各自的选区/光标位置）
-        let ranges: Vec<Range<usize>> = self.cursors.iter()
+        let ranges: Vec<Range<usize>> = self
+            .cursors
+            .iter()
             .map(|c| c.selection().unwrap_or(c.caret..c.caret))
             .collect();
         // 倒序处理，避免偏移变化影响后续光标
         for range in ranges.iter().rev() {
             let edit = toggle_inline(&self.doc.text(), range.clone(), mark);
-            let new_caret = match &edit {
-                Edit::Insert { at, text } => at + text.len(),
-                Edit::Replace { range, text } => range.start + text.len(),
-                _ => range.start,
-            };
             if self.doc.apply(edit).is_ok() {
                 // 简化：应用成功后重置所有光标
             }
@@ -481,7 +466,7 @@ impl DocView {
         // 简化：应用后重置所有光标到第一个位置
         if let Some(first) = self.cursors.first() {
             let new_caret = self.doc.snap_to_boundary(first.caret);
-            for c in self.cursors_mut() {
+            for c in &mut self.cursors {
                 c.caret = new_caret;
                 c.anchor = None;
                 c.marked = None;
@@ -497,13 +482,20 @@ impl DocView {
         let mut all_ranges = Vec::new();
         for c in &self.cursors {
             let sel = c.selection().unwrap_or(c.caret..c.caret);
-            let start_line = projection.lines.iter()
-                .position(|l| l.source_range.end >= sel.start).unwrap_or(0);
-            let end_line = projection.lines.iter()
+            let start_line = projection
+                .lines
+                .iter()
+                .position(|l| l.source_range.end >= sel.start)
+                .unwrap_or(0);
+            let end_line = projection
+                .lines
+                .iter()
                 .position(|l| l.source_range.start >= sel.end)
-                .map_or(projection.lines.len(), |i| i);
+                .unwrap_or(projection.lines.len());
             let range = projection.lines[start_line].source_range.start
-                ..projection.lines[end_line.min(projection.lines.len() - 1)].source_range.end;
+                ..projection.lines[end_line.min(projection.lines.len() - 1)]
+                    .source_range
+                    .end;
             all_ranges.push(range);
         }
         // 去重合并
@@ -512,9 +504,14 @@ impl DocView {
         let mut merged_ranges: Vec<Range<usize>> = Vec::new();
         for r in merged {
             if let Some(last) = merged_ranges.last_mut() {
-                if r.start <= last.end { last.end = last.end.max(r.end); }
-                else { merged_ranges.push(r); }
-            } else { merged_ranges.push(r); }
+                if r.start <= last.end {
+                    last.end = last.end.max(r.end);
+                } else {
+                    merged_ranges.push(r);
+                }
+            } else {
+                merged_ranges.push(r);
+            }
         }
         // 对每个合并范围应用块样式
         for range in merged_ranges.iter().rev() {
@@ -524,7 +521,11 @@ impl DocView {
         // 简化：重置光标
         if let Some(first) = self.cursors.first() {
             let new_caret = self.doc.snap_to_boundary(first.caret);
-            for c in self.cursors_mut() { c.caret = new_caret; c.anchor = None; c.marked = None; }
+            for c in &mut self.cursors {
+                c.caret = new_caret;
+                c.anchor = None;
+                c.marked = None;
+            }
         }
         cx.notify();
     }
@@ -532,7 +533,7 @@ impl DocView {
     /// 删除选区（或光标左侧一个字符，即退格）。返回是否发生了删除。
     fn delete_backward(&mut self, cx: &mut Context<Self>) -> bool {
         let mut any_deleted = false;
-        for c in self.cursors_mut() {
+        for c in &mut self.cursors {
             if let Some(sel) = c.selection() {
                 let caret = sel.start;
                 if self.doc.apply(Edit::Delete { range: sel }).is_ok() {
@@ -543,47 +544,68 @@ impl DocView {
                 }
             } else {
                 let prev = self.doc.prev_char_boundary(c.caret);
-                if prev != c.caret {
-                    if self.doc.apply(Edit::Delete { range: prev..c.caret }).is_ok() {
-                        c.caret = self.doc.snap_to_boundary(prev);
-                        c.anchor = None;
-                        c.marked = None;
-                        any_deleted = true;
-                    }
-                }
-            }
-        }
-        if any_deleted { cx.notify(); }
-        any_deleted
-    }
-
-    /// 删除光标右侧一个字符（即 Delete 键）。返回是否发生了删除。
-    fn delete_forward(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut any_deleted = false;
-        for c in self.cursors_mut() {
-            let range = c.selection().unwrap_or_else(|| {
-                let next = self.doc.next_char_boundary(c.caret);
-                c.caret..next
-            });
-            if !range.is_empty() {
-                if self.doc.apply(Edit::Delete { range: range.clone() }).is_ok() {
-                    c.caret = self.doc.snap_to_boundary(range.start);
+                if prev != c.caret
+                    && self
+                        .doc
+                        .apply(Edit::Delete {
+                            range: prev..c.caret,
+                        })
+                        .is_ok()
+                {
+                    c.caret = self.doc.snap_to_boundary(prev);
                     c.anchor = None;
                     c.marked = None;
                     any_deleted = true;
                 }
             }
         }
-        if any_deleted { cx.notify(); }
+        if any_deleted {
+            cx.notify();
+        }
+        any_deleted
+    }
+
+    /// 删除光标右侧一个字符（即 Delete 键）。返回是否发生了删除。
+    fn delete_forward(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut any_deleted = false;
+        for c in &mut self.cursors {
+            let range = c.selection().unwrap_or_else(|| {
+                let next = self.doc.next_char_boundary(c.caret);
+                c.caret..next
+            });
+            if !range.is_empty()
+                && self
+                    .doc
+                    .apply(Edit::Delete {
+                        range: range.clone(),
+                    })
+                    .is_ok()
+            {
+                c.caret = self.doc.snap_to_boundary(range.start);
+                c.anchor = None;
+                c.marked = None;
+                any_deleted = true;
+            }
+        }
+        if any_deleted {
+            cx.notify();
+        }
         any_deleted
     }
 
     /// 所有光标处插入换行。有选区则先删除选区。
     fn insert_newline(&mut self, cx: &mut Context<Self>) {
-        for c in self.cursors_mut() {
+        for c in &mut self.cursors {
             let range = c.selection().unwrap_or(c.caret..c.caret);
             let at = range.start;
-            if self.doc.apply(Edit::Replace { range, text: "\n".into() }).is_ok() {
+            if self
+                .doc
+                .apply(Edit::Replace {
+                    range,
+                    text: "\n".into(),
+                })
+                .is_ok()
+            {
                 c.caret = self.doc.snap_to_boundary(at + 1);
                 c.anchor = None;
                 c.marked = None;
@@ -594,10 +616,17 @@ impl DocView {
 
     /// 所有光标处插入制表符（Tab）。有选区则先删除选区。
     fn insert_tab(&mut self, cx: &mut Context<Self>) {
-        for c in self.cursors_mut() {
+        for c in &mut self.cursors {
             let range = c.selection().unwrap_or(c.caret..c.caret);
             let at = range.start;
-            if self.doc.apply(Edit::Replace { range, text: "    ".into() }).is_ok() {
+            if self
+                .doc
+                .apply(Edit::Replace {
+                    range,
+                    text: "    ".into(),
+                })
+                .is_ok()
+            {
                 c.caret = self.doc.snap_to_boundary(at + 4);
                 c.anchor = None;
                 c.marked = None;
@@ -608,7 +637,7 @@ impl DocView {
 
     /// 所有光标处插入普通字符（IME 提交/直接按键）。有选区则先删除选区。
     fn insert_char(&mut self, ch: char, cx: &mut Context<Self>) {
-        for c in self.cursors_mut() {
+        for c in &mut self.cursors {
             let range = c.selection().unwrap_or(c.caret..c.caret);
             let at = range.start;
             let mut text = String::new();
@@ -632,13 +661,22 @@ impl DocView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        let c = self.primary_cursor_mut();
         let start = self.doc.snap_to_boundary(target.start);
         let end = self.doc.snap_to_boundary(target.end);
         let range = start.min(end)..start.max(end);
         let new_caret = range.start + text.len();
-        if self.doc.apply(Edit::Replace { range, text: text.to_string() }).is_ok() {
-            c.caret = self.doc.snap_to_boundary(new_caret);
+        if self
+            .doc
+            .apply(Edit::Replace {
+                range,
+                text: text.to_string(),
+            })
+            .is_ok()
+        {
+            // 先算好校正后的位置，再改主光标，避免同时借用 self.doc 与 self.cursors
+            let snapped = self.doc.snap_to_boundary(new_caret);
+            let c = self.primary_cursor_mut();
+            c.caret = snapped;
             c.anchor = None;
             c.marked = None;
             cx.notify();
@@ -676,7 +714,11 @@ impl DocView {
         let total_u16 = text.encode_utf16().count();
         let clamp = |u: usize| u.min(total_u16);
         let (u_lo, u_hi) = (clamp(range.start), clamp(range.end));
-        let (u_lo, u_hi) = if u_lo <= u_hi { (u_lo, u_hi) } else { (u_hi, u_lo) };
+        let (u_lo, u_hi) = if u_lo <= u_hi {
+            (u_lo, u_hi)
+        } else {
+            (u_hi, u_lo)
+        };
 
         // 第一遍：找 u_lo 对应的字节起点
         let mut u_acc = 0usize;
@@ -715,7 +757,7 @@ impl DocView {
     }
 
     /// 导出当前文档为 PDF 并保存到文件。
-    fn export_pdf(&mut self, cx: &mut Context<Self>) {
+    fn export_pdf(&mut self, _cx: &mut Context<Self>) {
         let markdown = self.doc.text();
         let result = to_pdf(&markdown);
         match result {
@@ -747,7 +789,9 @@ impl DocView {
             // 已有光标：移除（但保留至少一个）
             if self.cursors.len() > 1 {
                 self.cursors.remove(idx);
-                if self.primary >= self.cursors.len() { self.primary = self.cursors.len() - 1; }
+                if self.primary >= self.cursors.len() {
+                    self.primary = self.cursors.len() - 1;
+                }
             }
         } else {
             // 新增光标
@@ -762,7 +806,6 @@ impl Render for DocView {
         let palette = self.palette;
         let header = self.header_text();
         let caret_count = self.cursors.len();
-        let primary_caret = self.cursors[self.primary].caret;
         let line_count = self.doc.projection().len();
         let focus = self.focus.clone();
 
@@ -914,7 +957,10 @@ impl EntityInputHandler for DocView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = range.unwrap_or_else(|| self.primary_selection().unwrap_or(self.cursors[self.primary].caret..self.cursors[self.primary].caret));
+        let target = range.unwrap_or_else(|| {
+            self.primary_selection()
+                .unwrap_or(self.cursors[self.primary].caret..self.cursors[self.primary].caret)
+        });
         self.replace_selection_with_inner(target, text, cx);
     }
 
@@ -927,7 +973,10 @@ impl EntityInputHandler for DocView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = range.unwrap_or_else(|| self.primary_selection().unwrap_or(self.cursors[self.primary].caret..self.cursors[self.primary].caret));
+        let target = range.unwrap_or_else(|| {
+            self.primary_selection()
+                .unwrap_or(self.cursors[self.primary].caret..self.cursors[self.primary].caret)
+        });
         let start = target.start;
         self.replace_selection_with_inner(target, new_text, cx);
         let marked_end = start + new_text.len();
@@ -947,35 +996,37 @@ impl EntityInputHandler for DocView {
     /// IME 需要在屏幕上高亮某个 UTF-16 区间时（如组合下划线），换算成屏幕矩形。
     ///
     /// 用最近一次渲染缓存的块几何（`layout`）定位；无几何时返回 `None`（跳过高亮）。
-fn bounds_for_range(
+    fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
         _element_bounds: Bounds<Pixels>,
         _: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        let (start, end) = self.source_range_from_utf16(range_utf16)?;
+        // 文档级映射：起止点各得（行号, 显示列）；跨行时高亮覆盖到终点所在行
+        let (p0, p1) = {
+            let projection = self.doc.projection();
+            (
+                projection.source_to_doc_pos(start),
+                projection.source_to_doc_pos(end),
+            )
+        };
         let layout = self.layout.as_ref()?;
-        let (start, end) = self.source_range_from_utf16(range_utf16.clone())?;
-        // 找到与 [start, end) 相交的第一个块，用它的几何估算矩形
-        for (idx, block) in layout.blocks.iter().enumerate() {
-            let bs = block.source_range.start;
-            let be = block.source_range.end;
-            if be <= start || end <= bs {
-                continue;
-            }
-            let line_start = start.max(bs);
-            let line_end = end.min(be);
-            let x0 = block.offset_map.source_to_display(line_start).get();
-            let x1 = block.offset_map.source_to_display(line_end).get();
-            let px0 = layout.origin.x + block.indent + block.line.x_for_index(x0);
-            let px1 = layout.origin.x + block.indent + block.line.x_for_index(x1);
-            let row_top = layout.origin.y + layout.line_height * idx as f32;
-            return Some(bounds(
-                point(px0, row_top),
-                size(px1 - px0, layout.line_height),
-            ));
-        }
-        None
+        let b0 = layout.blocks.get(p0.line)?;
+        let x0 = layout.origin.x + b0.indent + b0.line.x_for_index(p0.col);
+        let (x1, rows) = match layout.blocks.get(p1.line) {
+            Some(b1) => (
+                layout.origin.x + b1.indent + b1.line.x_for_index(p1.col),
+                p1.line - p0.line + 1,
+            ),
+            None => (x0, 1),
+        };
+        let row_top = layout.origin.y + layout.line_height * p0.line as f32;
+        Some(bounds(
+            point(x0, row_top),
+            size(x1 - x0, layout.line_height * rows as f32),
+        ))
     }
 
     /// 屏幕点 → 文档 UTF-8 字节偏移（供 IME 判断光标跟随位置）。
@@ -1056,7 +1107,10 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
                 view.apply_inline(InlineMark::Code, cx);
             }
             // 块类型（Cmd+数字/Shift+数字）
-            k if m.platform && k.len() == 1 && k.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
+            k if m.platform
+                && k.len() == 1
+                && k.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
+            {
                 let level = k.parse::<u8>().unwrap_or(1);
                 if (1..=6).contains(&level) {
                     view.apply_block(BlockTarget::Heading(level), cx);
@@ -1328,8 +1382,22 @@ impl Element for DocElement {
         // update 提供 &mut DocView（投影缓存需惰性建立），闭包返回几何数据避免借用越界
         let blocks = self.view.update(cx, |view, _| {
             let caret = view.cursors[view.primary].caret;
-            let caret_line = view.cursors[view.primary].line_index(&view.doc);
             let projection = view.doc.projection();
+            let caret_pos = projection.source_to_doc_pos(caret);
+            // 选区高亮：用核心的文档级映射把每个选区的源区间分解成"每行显示列区间"，
+            // 再按行归并（多光标可能同行重叠）。这样 paint 阶段无需再做源→显示换算。
+            let mut sel_by_line: Vec<Option<Range<usize>>> = vec![None; projection.lines.len()];
+            for sel in &selection {
+                for ldr in projection.selection_display_ranges(Selection::new(sel.start, sel.end)) {
+                    match &mut sel_by_line[ldr.line] {
+                        Some(existing) => {
+                            existing.start = existing.start.min(ldr.cols.start);
+                            existing.end = existing.end.max(ldr.cols.end);
+                        }
+                        none => *none = Some(ldr.cols),
+                    }
+                }
+            }
             let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
             for (idx, line) in projection.lines.iter().enumerate() {
                 let (text, runs) =
@@ -1347,18 +1415,13 @@ impl Element for DocElement {
                     .text_system()
                     .shape_line(text, base_size, &uniform_runs, None);
                 let indent = block_indent(line, indent_base);
-                let sel_overlap = selection
-                    .clone()
-                    .into_iter()
-                    .filter(|sel| ranges_overlap(sel, &line.source_range))
-                    .next();
                 v.push(BlockGeom {
                     source_range: line.source_range.clone(),
                     offset_map: line.offset_map.clone(),
                     line: shaped,
                     indent,
-                    caret_line: caret_line == Some(idx),
-                    selection: sel_overlap,
+                    caret_col: (caret_pos.line == idx).then_some(caret_pos.col),
+                    selection: sel_by_line[idx].clone(),
                 });
             }
             v
@@ -1383,7 +1446,6 @@ impl Element for DocElement {
     ) {
         let layout = prepaint.clone();
         let palette = self.view.read(cx).palette;
-        let caret = self.view.read(cx).cursors[self.view.read(cx).primary].caret;
 
         // 回存几何，供鼠标命中测试（`DocView::hit_source`）读取
         let layout_for_view = layout.clone();
@@ -1400,12 +1462,10 @@ impl Element for DocElement {
             let line_x = layout.origin.x + block.indent;
             let baseline_origin = point(line_x, row_top);
 
-            // 选区高亮：用该块与选区的重叠区间，换算成行内显示 x 区间再填矩形
-            if let Some(sel) = &block.selection {
-                let start_ix = block.offset_map.source_to_display(sel.start).get();
-                let end_ix = block.offset_map.source_to_display(sel.end).get();
-                let x0 = block.line.x_for_index(start_ix);
-                let x1 = block.line.x_for_index(end_ix);
+            // 选区高亮：`selection` 已是本行的显示列区间，直接换算行内 x 填矩形
+            if let Some(cols) = &block.selection {
+                let x0 = block.line.x_for_index(cols.start);
+                let x1 = block.line.x_for_index(cols.end);
                 let hl = bounds(
                     point(baseline_origin.x + x0, row_top),
                     size(x1 - x0, LINE_HEIGHT),
@@ -1423,10 +1483,9 @@ impl Element for DocElement {
                 cx,
             );
 
-            // 光标竖线：仅在光标所在块绘制（用 prepaint 预计算的 caret_line 标记）
-            if block.caret_line {
-                let local = block.offset_map.source_to_display(caret).get();
-                let caret_x = baseline_origin.x + block.line.x_for_index(local);
+            // 光标竖线：仅在光标所在块绘制（用 prepaint 预计算的 caret_col 显示列）
+            if let Some(col) = block.caret_col {
+                let caret_x = baseline_origin.x + block.line.x_for_index(col);
                 let caret_rect = bounds(
                     point(caret_x, row_top + px(2.)),
                     size(px(1.5), LINE_HEIGHT - px(4.)),
@@ -1451,11 +1510,6 @@ impl IntoElement for DocElement {
     fn into_element(self) -> Self::Element {
         self
     }
-}
-
-/// 两个源字节区间是否有重叠（用于选区高亮判断）。
-fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start < b.end && b.start < a.end
 }
 
 fn main() {

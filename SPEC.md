@@ -328,8 +328,10 @@ pub struct ChangeSummary {
 > `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/
 > `selection_display_ranges`，覆盖跨行选区/命中/IME）、`IntentMapper`（最小实现：
 > 回车列表续行/退出列表 + 切换转发）已落地（Phase 1，见 `crates/mazha-core`）。
-> 桌面端改用该文档级 API（替换 `platforms/desktop` 内联的 `line_index`/选区换算）
-> 为 Phase 3 后续项。
+> **桌面端已接入**该文档级 API（`platforms/desktop` 的行归属 `line_of_source`、上下移动
+> 保留显示列 `source_to_doc_pos`/`doc_pos_to_source`、选区高亮 `selection_display_ranges`、
+> IME 候选框定位均改走 `Projection`，原先内联的 `line_index`/选区换算与 `OffsetMap`
+> 二次换算已移除）。
 > `DocId`（待定）、`Projection` 的**增量重建**、
 > 更丰富的意图（缩进/自动配对/删除键合并）为后续迭代项。
 > `Workspace<S: StorageProvider>`（`open`/`save`/`list`，串联存储与文档）已落地。
@@ -562,6 +564,7 @@ interface Workspace {
 | R7 | WASM 插件在 iOS/移动端运行时限制 | 插件可用性 | 移动端用 `wasmi` 无 JIT `[待确认]` |
 | R8 | 纯 Rust PDF 导出的排版质量 | 导出观感 | 已选 Typst 0.15（D21/D25，接入已通）；已补**真实文档回归**（`tests/pdf_real_doc.rs`：中文技术报告多页排版 + 逐字节可复现 + 标记转义扫描），修复行内代码含反引号的 raw 围栏缺陷；残留：字体子集化（Web，Phase 7）、极端字体的字形覆盖需人工抽检 |
 | R9 | 中文字体在 Web 端需内置 | 体积/一致 | 字体子集化 `[待确认]` |
+| R10 | `platforms/*` 是独立 workspace，**不在** `cargo --workspace` 门禁内 | 桌面端编译错误可能漏检（已发生：多光标/PDF 导出提交未过 `cargo build`，桌面端一度无法编译） | 桌面门禁已写入 `HANDOFF.md`（触碰 `platforms/*` 必须单独 `fmt`/`clippy -D warnings`/`build`）；`platforms/desktop/Cargo.lock` 需与依赖变更同步（含 `zip 0.5` 等 yanked 版本要保留锁定）；后续接入 CI |
 
 **待确认清单**：第 7.1（gpui-fast 是否启用）、7.3（Web 方案）、7.4 与 8（中文字体子集）、6.3（插件分发与清单）、6.5（并发编辑语义）、9（移动端交互规范）。
 
@@ -599,6 +602,7 @@ interface Workspace {
 | D26 | DOCX 导出引擎 | `docx-rs` 1.1（纯 Rust）：直接基于 `mazha-md` 块/片段模型生成 OOXML，不经 HTML 中转；标题用直接格式（加粗 + 字号）不依赖样式表，链接渲染为「文字 + (URL)」（docx-rs 的 `Relationship` 不支持 `TargetMode="External"`，无法生成可点击外链），图片仅输出占位文本；文本转义交由 `strong-xml`，一律 `xml:space="preserve"` 保空白 | 确认（见 SPEC §8） |
 | D27 | EPUB 导出引擎 | Zip + XHTML（纯 Rust，`zip` 0.5，与 docx-rs 复用同版本避免重复依赖）：正文复用 HTML 渲染的 **XHTML 方言**（`to_xhtml_body`，空元素自闭合 `<hr/>`/`<br/>`/`<img .../>`/`<input .../>`、布尔属性写 `disabled="disabled"`），打包为 EPUB 3（`mimetype` 首条目且 `Stored` 不压缩、`META-INF/container.xml`、`OEBPS/content.opf`、`nav.xhtml`、`toc.ncx` 兼容回退、`style.css` 复用 `DEFAULT_CSS`、单一 `text.xhtml`）；`dc:identifier` 缺省时用 FNV-1a 内容哈希派生（避免随机/`uuid` 依赖），`dcterms:modified` 用固定时间戳（输出确定） | 确认（见 SPEC §8） |
 | D28 | 导出主题/模板 | 引入 `Theme`（HTML/EPUB 的 CSS）与 `Template`（PDF/Typst 版式前置）两个外观预设；内置 `Theme::{light,dark,sepia}`、`Template::{plain,article}`，均为确定性常量（同输入同输出），支持 `custom`；`to_html_themed`/`to_epub_themed`/`to_pdf_with`/`to_typst_with_template` 接入；`Template::article` 只设页面/字号/段距，**不设字体族**以保留 Typst 的 CJK 字体回退 | 确认（见 SPEC §8、D12/D27） |
+| D29 | 桌面端坐标/选区实现 | `platforms/desktop` 不再自行维护行归属与偏移换算：行归属用 `Projection::line_of_source`、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮用 `selection_display_ranges` 折成每行显示列、IME 候选框用 `source_to_doc_pos` 定位；行内命中仍用缓存 `BlockGeom` 的 `OffsetMap`（只读路径无法借 `&mut` 取投影）。删除桌面端内联 `line_index`/`ranges_overlap`/`apply_edit_all` 等死代码与借用冲突（诸如 `cursors_mut(&mut self)` 触及整 `self` 导致的连锁借用错误） | 确认（见 SPEC §6.1/§11.3） |
 
 ---
 
@@ -647,6 +651,7 @@ interface Workspace {
 | 0.1.38 | 2026-10-16 | **导出主题/模板**（D28）：新增 `mazha-export::theme` 模块——`Theme`（HTML/EPUB 的 CSS：内置 `light`/`dark`/`sepia`，可 `custom`）与 `Template`（PDF/Typst 版式前置：内置 `plain`/`article`，可 `custom`），均为确定性常量。接入：`to_html_themed`（主题 CSS 注入 `<style>`）、`to_epub_themed`（主题作 `style.css`，`EpubMeta` 复用）、`to_typst_with_template`（前置以空行分隔正文）、`PdfExporter::export_with`/`to_pdf_with`（编译带模板标记；`plain` 与旧行为逐字节一致）。`Template::article` 只设页面/字号/段距、不设字体族（保留 CJK 回退）。10 条新测试；export 98（总计 **342**） |
 | 0.1.39 | 2026-10-16 | **PDF 真实文档回归**（风险 R8）：新增集成测试 `tests/pdf_real_doc.rs` + 基线文档（中文技术报告 `tests/data/real_report.md` + SVG 示意图）——验证多页排版（`PdfDocument` 新增 `pages` 字段）、逐字节可复现、标记转义扫描（`#`/`[]`/`` ` ``/`$`/`*_`/`~=`/`//`/`@`/`<>`/中文标点/emoji/组合字符）。回归发现并修复 `to_typst` 行内代码缺陷：内容含反引号时反引号围栏会与内容粘连成更长串导致 `unclosed raw text`，改用 `#raw("…")`；同时行内代码内容不再走 `escape_typst`（Typst raw 不解析标记，原实现会显示出多余反斜杠）。2 条新单测 + 3 条集成测试；export 100 单测 + 3 集成（总计 **347**） |
 | 0.1.40 | 2026-10-16 | **文档级跨行坐标映射**（Phase 3 起步，SPEC §6.1/§11.3）：`mazha-core` 新增 `DocPos{line,col}`、`LineDisplayRange{line,cols}` 与 `Projection` 方法 `line_of_source`（行尾边界归前一行）、`source_to_doc_pos`（落隐藏标记吸附标记起点）、`doc_pos_to_source`（命中换算，列/行越界钳制）、`display_len_at`、`selection_display_ranges`（跨行选区→每行显示列区间，首行到行尾/中间整行/末行到终点）。把原先散落在 `platforms/desktop` 的行归属与选区换算收敛为核心纯 Rust API（桌面端改用留待下一提交）。先测试后实现，10 条新单测（含空投影、CJK 多字节、隐藏标记吸附、反向选区）；core 129（总计 **357**） |
+| 0.1.41 | 2026-10-16 | **桌面端接入核心文档级 API + 修复历史编译债**（D29，Phase 3 后续）：`platforms/desktop` 改用 `Projection::{line_of_source, source_to_doc_pos, doc_pos_to_source, selection_display_ranges}`——行归属、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮在 prepaint 折成每行显示列（paint 直接按列画，删除源码→显示二次换算）、光标竖线改存 `caret_col`、IME 候选框用 `source_to_doc_pos` 定位（跨行覆盖到终点所在行）。**修复历史编译债**：`platforms/*` 独立 workspace 不在 `cargo --workspace` 门禁内，此前多光标/PDF 导出提交未过 `cargo build`，桌面端一度**无法编译**（1 处 `crate::Projection` 未解析 + 20 处借用冲突，均因 `cursors_mut(&mut self)` 借用整个 `self` 与 `self.doc` 相交）。改为按字段借用（`&mut self.cursors`）、先算后写；删除死代码（`line_index`/`primary_line_index`/`cursors_mut`/`has_selection`/`apply_edit_all`/`ranges_overlap`）。**同步独立 `Cargo.lock`**：`zip 0.5` 全系被 yank，桌面端独立解析失败，补齐 `docx`/`zip`/`strong-xml` 等缺失锁定项（含 yanked 版本锁定）。门禁：根 workspace fmt/clippy/test 全绿（357），桌面端 `fmt`/`clippy -D warnings`/`build` 全绿 |
 
 ---
 
