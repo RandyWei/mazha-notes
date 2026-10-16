@@ -212,6 +212,14 @@ pub enum Edit {
 pub enum InlineMark { Emphasis, Strong, Strikethrough, Code }
 pub enum BlockTarget { Paragraph, Heading(u8), BlockQuote, List { ordered: bool } }
 
+/// 表格结构编辑（增删行列）：定位光标所在表格块，重写整块并产出一次 Edit
+pub enum TableOp {
+    InsertRowAbove, InsertRowBelow,
+    InsertColumnLeft, InsertColumnRight,
+    DeleteRow, DeleteColumn,
+}
+fn edit_table(source: &str, caret: usize, op: TableOp) -> Option<Edit>;
+
 /// 输入意图 → 编辑命令 的转换（缩进、列表续行、自动配对等）
 pub trait IntentMapper {
     fn map(&self, intent: &Intent, doc: &Document) -> Vec<Edit>;
@@ -564,7 +572,7 @@ interface Workspace {
 - [ ] 打开一个含标题/列表/表格/代码/公式/图表的 `.md`，正确 WYSIWYG 渲染
 - [ ] 编辑后保存，文件内容为无损 Markdown（往返 `serialize(parse(x)) == x` 对稳定块成立）
 - [ ] 中文输入法（IME）在隐藏标记的行上候选框位置正确
-- [ ] 表格可增删行列；代码块有语法高亮；公式与图表正确渲染
+- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（待做）；公式与图表正确渲染（待解析器支持）
 - [ ] 导出 HTML/PDF 内容与编辑区一致
 
 ### 12.3 跨平台一致性（长期）
@@ -627,6 +635,7 @@ interface Workspace {
 | D28 | 导出主题/模板 | 引入 `Theme`（HTML/EPUB 的 CSS）与 `Template`（PDF/Typst 版式前置）两个外观预设；内置 `Theme::{light,dark,sepia}`、`Template::{plain,article}`，均为确定性常量（同输入同输出），支持 `custom`；`to_html_themed`/`to_epub_themed`/`to_pdf_with`/`to_typst_with_template` 接入；`Template::article` 只设页面/字号/段距，**不设字体族**以保留 Typst 的 CJK 字体回退 | 确认（见 SPEC §8、D12/D27） |
 | D29 | 桌面端坐标/选区实现 | `platforms/desktop` 不再自行维护行归属与偏移换算：行归属用 `Projection::line_of_source`、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮用 `selection_display_ranges` 折成每行显示列、IME 候选框用 `source_to_doc_pos` 定位；行内命中仍用缓存 `BlockGeom` 的 `OffsetMap`（只读路径无法借 `&mut` 取投影）。删除桌面端内联 `line_index`/`ranges_overlap`/`apply_edit_all` 等死代码与借用冲突（诸如 `cursors_mut(&mut self)` 触及整 `self` 导致的连锁借用错误） | 确认（见 SPEC §6.1/§11.3） |
 | D30 | 块级 widget 建模位置 | 块级 widget（代码块/表格/分割线…）作为**核心投影**的一部分：`Projection.widgets: Vec<BlockWidget>` + `block_widget_at`/`block_widget_on_line` 查询；每个 widget 记 `source_range`（整块）+ `line_range`（逻辑行）。核心只给"分组与范围"，具体绘制（面板/网格/高亮）留在 UI；"光标进入才可编辑"由 UI 用 `block_widget_on_line(光标行)` 判定。理由：分组/范围是可无 UI 单测的纯逻辑，且被多端（桌面/移动/Web）复用；公式/图表待解析器支持后再加 `BlockWidgetKind` 变体 | 确认（见 SPEC §6.1/§11.5） |
+| D31 | 表格增删行列的实现位置 | 表格结构编辑（增删行列）作为**核心纯函数** `edit_table(source, caret, TableOp) -> Option<Edit>`（`mazha-core::table`），而非 UI 直接改字符串：核心用解析器定位光标所在 `BlockKind::Table` 块，把该区域解析成 `TableModel{header, align, rows}`，套用结构变更后**规范化重写整块**（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`。理由：① 结构变更（行/列索引、转义 `\|`、对齐保留）是可无 UI 单测的纯逻辑，先测试后实现；② 走 `Edit` 通道才能正确纳入 undo/redo 与投影重建；③ 规范化重写牺牲原表格的空白风格，换取实现简单与结果可预测（后续如需保留风格可改增量编辑）。光标定位用整块偏移（非字符级），"删唯一列 / 在表头删行"等不产生变化时返回 `None` | 确认（见 SPEC §6.1/§11.5） |
 
 ---
 
@@ -678,6 +687,7 @@ interface Workspace {
 | 0.1.41 | 2026-10-16 | **桌面端接入核心文档级 API + 修复历史编译债**（D29，Phase 3 后续）：`platforms/desktop` 改用 `Projection::{line_of_source, source_to_doc_pos, doc_pos_to_source, selection_display_ranges}`——行归属、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮在 prepaint 折成每行显示列（paint 直接按列画，删除源码→显示二次换算）、光标竖线改存 `caret_col`、IME 候选框用 `source_to_doc_pos` 定位（跨行覆盖到终点所在行）。**修复历史编译债**：`platforms/*` 独立 workspace 不在 `cargo --workspace` 门禁内，此前多光标/PDF 导出提交未过 `cargo build`，桌面端一度**无法编译**（1 处 `crate::Projection` 未解析 + 20 处借用冲突，均因 `cursors_mut(&mut self)` 借用整个 `self` 与 `self.doc` 相交）。改为按字段借用（`&mut self.cursors`）、先算后写；删除死代码（`line_index`/`primary_line_index`/`cursors_mut`/`has_selection`/`apply_edit_all`/`ranges_overlap`）。**同步独立 `Cargo.lock`**：`zip 0.5` 全系被 yank，桌面端独立解析失败，补齐 `docx`/`zip`/`strong-xml` 等缺失锁定项（含 yanked 版本锁定）。门禁：根 workspace fmt/clippy/test 全绿（357），桌面端 `fmt`/`clippy -D warnings`/`build` 全绿 |
 | 0.1.42 | 2026-10-16 | **块级 widget 模型**（Phase 3，SPEC §6.1/§11.5，D30）：`mazha-core` 的 `Projection` 新增 `widgets: Vec<BlockWidget>`——把代码块/表格/分割线聚成**整块**模型（`source_range` 整块 + `line_range` 逻辑行 + `BlockWidgetKind::{Code{lang,fenced}, Table{align}, Rule}`），供 UI 按"光标不在块内=渲染态、进入=编辑态"整体绘制。新增查询 `block_widgets()`/`block_widget_at(src)`/`block_widget_on_line(line)`；`build_from`/`refresh` 均重算 widgets（refresh 由新块森林全量重算，O(块数)）；core 新增导出 `BlockWidget`/`BlockWidgetKind` 及 `Align`（复用解析层类型）。先测试后实现，9 条新单测（围栏代码块/无语言/表格对齐/分割线/源序/普通段落无 widget/内联图片不产块级 widget/lookup/引用内代码块）；`assert_projection_matches` 增加 widgets 一致性断言；core 138（总计 **366**）。桌面端渲染待下一提交 |
 | 0.1.43 | 2026-10-16 | **桌面端块级 widget 渲染**（Phase 3，SPEC §11.5、D30）：`platforms/desktop` 依核心 `Projection::block_widgets` 在文本层**之下**先画块级装饰——代码块面板描边 + 右上角语言标签（等宽 `shape_line`）、表格弱底 + 外框 + 行分隔线、分割线真实细线（取代旧的 `─` 文本占位）；光标进入块内则隐藏装饰（编辑态），判定用 `Projection::block_widget_on_line`。`DocLayout` 新增 `widgets: Vec<WidgetDecor>`，prepaint 由 `block_widgets()` 投影（先取光标源偏移再借 `doc.projection()` 避免借用冲突）。门禁：workspace fmt/clippy/test 全绿（**366**）；桌面端 `fmt`/`clippy -D warnings`/`build` 全绿（本环境无法可视化验证渲染效果） |
+| 0.1.44 | 2026-10-16 | **表格增删行列**（Phase 3，SPEC §11.5/§12.2，D31）：新增 `mazha-core::table`——纯函数 `edit_table(source, caret, TableOp) -> Option<Edit>`，把"光标所在表格块"解析成 `TableModel{header, align, rows}`，套用 `InsertRowAbove/Below`、`InsertColumnLeft/Right`、`DeleteRow/Column` 后规范化重写整块（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`；核心导出 `TableOp`/`edit_table`。边界：光标在表格外、删唯一列、在表头/分隔行删行 → `None`；转义 `\|` 不拆列；列对齐经 `Align` 保留。先测试后实现：table 12 条 + document 集成 1 条（经 `Document::apply` 后投影全量一致），core **151**（总计 **379**）。桌面端接入：`apply_table`（走 `apply_edit`，纳入 undo/redo）+ 快捷键 Cmd+Option+↑/↓（增行）、←/→（增列）、Delete（删行）、Shift+Delete（删列）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证） |
 
 ---
 

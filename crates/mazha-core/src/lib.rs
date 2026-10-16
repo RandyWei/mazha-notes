@@ -18,6 +18,7 @@ mod intent;
 mod offset_map;
 mod projection;
 mod selection;
+mod table;
 mod workspace;
 
 pub use commands::{set_block, toggle_inline};
@@ -32,6 +33,7 @@ pub use projection::{
     build_from as build_projection_from,
 };
 pub use selection::Selection;
+pub use table::{TableOp, edit_table};
 pub use workspace::{Workspace, WorkspaceError, WorkspaceResult};
 
 // 复用解析层的公共类型（供 UI 消费投影，无需直接依赖 mazha-md）

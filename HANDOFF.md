@@ -4,7 +4,7 @@
 > 单一事实来源是 `SPEC.md`；本文件只做"当前进度 / 下一步"的归总，不替代 SPEC。
 
 - 最近更新：2026-10-16
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 进行中**（桌面只读投影渲染 + 光标/点击定位 + WYSIWYG 标记显隐 + 自写 Element 连续布局/跨行选区 + IME + 编辑命令 + 多光标 + PDF 导出 + **核心文档级 API 接入**）；**导出线**并行推进（HTML / PDF / DOCX / **EPUB** 均可用）
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2 进行中**（桌面只读投影渲染 + 光标/点击定位 + WYSIWYG 标记显隐 + 自写 Element 连续布局/跨行选区 + IME + 编辑命令 + 多光标 + PDF 导出 + **核心文档级 API 接入** + **块级 widget 渲染/表格增删行列**）；**导出线**并行推进（HTML / PDF / DOCX / **EPUB** 均可用）
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）
 - 分支：`main`（当前提交见下方"提交历史"）
 
@@ -24,7 +24,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 状态 | 已实现 | 待办 |
 |-------|------|--------|------|
-| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存**双增量**维护）、`Edit`/`Selection`/`ChangeSummary`、`OffsetMap`（含 `shift` 平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + `build_projection_from` + **增量 refresh** + **块级 widget** `BlockWidget`/`BlockWidgetKind::{Code,Table,Rule}` 与 `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标映射**（`DocPos`/`LineDisplayRange` + `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/`selection_display_ranges`）、`commands`、`IntentMapper`（选区语义/块级缩进/智能成对退格）、导航（`line_range_of`/CJK 感知 `word_range_at`）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | `DocId`、序列化往返 |
+| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/边界导航/`apply_and_sync`/块缓存+投影缓存**双增量**维护）、`Edit`/`Selection`/`ChangeSummary`、`OffsetMap`（含 `shift` 平移）、`Projection`（`BlockStyle`/`TextRun`/`Widget` + `build_projection_from` + **增量 refresh** + **块级 widget** `BlockWidget`/`BlockWidgetKind::{Code,Table,Rule}` 与 `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标映射**（`DocPos`/`LineDisplayRange` + `source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`display_len_at`/`selection_display_ranges`）、`commands`、**表格增删行列**（`table`：`TableOp`/`edit_table`——定位 `BlockKind::Table` 块，解析 `TableModel{header,align,rows}` → 结构变更 → 规范化重写整块，产出 `Edit::Replace`）、`IntentMapper`（选区语义/块级缩进/智能成对退格）、导航（`line_range_of`/CJK 感知 `word_range_at`）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接（`document_to_crdt`/`crdt_to_document`/`apply_edit_to_crdt`/`apply_remote`/`save_crdt`/`load_crdt`） | `DocId`、序列化往返 |
 | `mazha-md` | ✅ Phase 1 完成（方言特性全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏代码、引用、列表/任务、**GFM 表格**、**Callout 提示块**、**Front-matter**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/**wiki-link**/**tags**）、`serialize_source/to_md`（前缀穿线嵌套序列化：逐字节往返 + 幂等 + 结构保持）、`reparse`（增量：受影响块区间重解析 + range 平移 + 裁切点安全校验 + 全量兜底） | — |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text` content，字符↔字节转换）、`insert/delete/replace/push`、状态向量+增量更新（Yjs v1）、`apply_update`、`fork`（同状态多端副本）、`snapshot`（快照压缩，O(历史)→O(文本)）、并发收敛 | 多文档名册 |
@@ -37,16 +37,16 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现 | 待办 |
 |------|------|--------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 进行中 | **只读投影渲染**（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；**光标/点击定位 + WYSIWYG 标记显隐**：点击用 `TextLayout::index_for_position` 命中（显示字符索引 → `OffsetMap::display_to_source` → 源偏移），光标行渲染原始 Markdown（`#`/`**`/`-` 可见），其余行投影（隐藏），方向键/Home/End 移动，光标竖线用 `canvas` + `paint_quad`；**自写 `Element` + `shape_line`**：逐块连续布局（`DocElement` 记录 `x_for_index`/`closest_index_for_x` 几何）、整篇命中（`DocLayout` 一次换算窗口坐标→源偏移）、**跨行选区**（鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`）；**IME（`EntityInputHandler`）**：`text_for_range`/`selected_text_range`/`marked_text_range`/`unmark_text`/`replace_text_in_range`/`replace_and_mark_text_in_range`/`bounds_for_range`/`character_index_for_point`/`set_selected_text_range`/`text_length_utf16` 全实现，UTF-8↔UTF-16 双向映射，组合文本高亮、提交、取消全支持；**编辑命令（`commands`/`apply_and_sync`）**：行内格式 Cmd+B/I/X/\`（粗/斜/删除线/行内代码），块类型 Cmd+1-6/Shift+8/9/0/-（标题/无序/有序列表/引用/段落），选区/光标位置自动映射到源范围并应用 `toggle_inline`/`set_block`；**多光标**：Alt+Click 增减光标，方向键/编辑命令同步作用于所有光标，选区独立维护；**PDF 导出**：Cmd+E 调用 `mazha-export::to_pdf`，`rfd` 弹出保存对话框，写入 PDF 字节；**核心文档级 API 接入**（D29，0.1.41）：行归属 `line_of_source`、上下移动按 `DocPos` 保留显示列（修正 CJK 漂移）、选区高亮 `selection_display_ranges`（折成每行显示列，paint 直接画）、光标列/IME 候选框用 `source_to_doc_pos`；**块级 widget 渲染**（D30，0.1.43）：依核心 `Projection::block_widgets` 在文本层下画代码块面板 + 语言标签、表格外框/行分隔线、分割线真实细线，光标进入块内隐藏装饰；并修复历史编译债 + 同步独立 `Cargo.lock`（`zip 0.5` yank 所致），`cargo run -- [path/to/file.md]` 可编译运行 | — |
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2 进行中 | **只读投影渲染**（标题字号字重、列表符号、任务复选框、引用缩进、代码块等宽+弱底、行内样式 粗/斜/删除线/行内代码/链接、图片占位、分割线），主题色 + 深浅色跟随；**光标/点击定位 + WYSIWYG 标记显隐**：点击用 `TextLayout::index_for_position` 命中（显示字符索引 → `OffsetMap::display_to_source` → 源偏移），光标行渲染原始 Markdown（`#`/`**`/`-` 可见），其余行投影（隐藏），方向键/Home/End 移动，光标竖线用 `canvas` + `paint_quad`；**自写 `Element` + `shape_line`**：逐块连续布局（`DocElement` 记录 `x_for_index`/`closest_index_for_x` 几何）、整篇命中（`DocLayout` 一次换算窗口坐标→源偏移）、**跨行选区**（鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`）；**IME（`EntityInputHandler`）**：`text_for_range`/`selected_text_range`/`marked_text_range`/`unmark_text`/`replace_text_in_range`/`replace_and_mark_text_in_range`/`bounds_for_range`/`character_index_for_point`/`set_selected_text_range`/`text_length_utf16` 全实现，UTF-8↔UTF-16 双向映射，组合文本高亮、提交、取消全支持；**编辑命令（`commands`/`apply_and_sync`）**：行内格式 Cmd+B/I/X/\`（粗/斜/删除线/行内代码），块类型 Cmd+1-6/Shift+8/9/0/-（标题/无序/有序列表/引用/段落），选区/光标位置自动映射到源范围并应用 `toggle_inline`/`set_block`；**多光标**：Alt+Click 增减光标，方向键/编辑命令同步作用于所有光标，选区独立维护；**PDF 导出**：Cmd+E 调用 `mazha-export::to_pdf`，`rfd` 弹出保存对话框，写入 PDF 字节；**核心文档级 API 接入**（D29，0.1.41）：行归属 `line_of_source`、上下移动按 `DocPos` 保留显示列（修正 CJK 漂移）、选区高亮 `selection_display_ranges`（折成每行显示列，paint 直接画）、光标列/IME 候选框用 `source_to_doc_pos`；**块级 widget 渲染**（D30，0.1.43）：依核心 `Projection::block_widgets` 在文本层下画代码块面板 + 语言标签、表格外框/行分隔线、分割线真实细线，光标进入块内隐藏装饰；**表格增删行列**（D31，0.1.44）：接入核心 `edit_table`（经 `apply_edit`，纳入 undo/redo），快捷键 Cmd+Option+↑/↓（增行）、←/→（增列）、Delete（删行）、Shift+Delete（删列）；并修复历史编译债 + 同步独立 `Cargo.lock`（`zip 0.5` yank 所致），`cargo run -- [path/to/file.md]` 可编译运行 | — |
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6/8/7 |
 
 ## 测试现状
 
-- `mazha-core`：138
+- `mazha-core`：151
 - `mazha-md`：99
 - `mazha-export`：100 单测 + 3 集成（`tests/pdf_real_doc.rs`）
 - `mazha-crdt`：11
-- 合计 **366** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **379** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -62,6 +62,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - R10：`platforms/*` 为独立 workspace，**不在** `cargo --workspace` 门禁内 → 曾有提交未过 `cargo build`。触碰 `platforms/*` 必须按 `HANDOFF.md` 顶部门禁单独 `fmt`/`clippy -D warnings`/`build`。
 - Phase 3（R2 缓解）：文档级跨行映射收敛进 `mazha-core::Projection`（`DocPos`/`LineDisplayRange` + `selection_display_ranges` 等），先测试后实现；**桌面端已于 0.1.41 接入**（D29）。
 - D30：块级 widget 建模在**核心投影**——`Projection.widgets: Vec<BlockWidget>`（`source_range` 整块 + `line_range` 逻辑行 + `BlockWidgetKind::{Code,Table,Rule}`）+ `block_widget_at`/`block_widget_on_line` 查询；核心只给"分组与范围"，绘制留在 UI；"光标进入才可编辑"由 UI 按光标行判定。公式/图表待解析器支持后再加变体。
+- D31：表格增删行列是**核心纯函数** `edit_table(source, caret, TableOp) -> Option<Edit>`（`mazha-core::table`）——解析器定位光标所在表格块 → `TableModel` 结构变更 → **规范化重写整块**（带首尾竖线、按对齐重写分隔行）→ 单次 `Edit::Replace`。走 `Edit` 通道以纳入 undo/redo 与投影重建；规范化牺牲原空白风格换取实现简单与结果可预测。光标在表外/删唯一列/表头删行 → `None`；转义 `\|` 不拆列。
 
 ## 依赖方向（不可违反）
 
@@ -78,14 +79,15 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. **Phase 3（进行中）**：块级 widget 核心模型 + 桌面渲染已完成（0.1.42/0.1.43）→ 桌面端块级**编辑**（表格增删行列、代码块内嵌高亮）；再软换行（`shape_text` 的 `wrap_boundaries` → 块内显示行映射）；公式/图表待解析器支持
+1. **Phase 3（进行中）**：块级 widget 核心模型 + 桌面渲染已完成（0.1.42/0.1.43）；**表格增删行列已完成**（0.1.44）→ 代码块内嵌语法高亮（tree-sitter）；再软换行（`shape_text` 的 `wrap_boundaries` → 块内显示行映射）；公式/图表待解析器支持
 2. `mazha-export`：字体子集（Web，Phase 7）
 3. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 
-## 提交历史（近期，共 60 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 61 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(desktop): 块级 widget 渲染（代码块面板/表格网格/分割线，Phase 3）>
+<本次提交：feat(core): 表格增删行列（TableOp/edit_table）+ 桌面快捷键（D31，Phase 3）>
+3c497ff feat(desktop): 块级 widget 渲染（代码块面板/表格网格/分割线，Phase 3）
 c80a24a feat(core): 块级 widget 模型（BlockWidget/BlockWidgetKind，Phase 3）
 fdd1252 feat(desktop): 接入核心文档级 API + 修复历史编译债（D29，Phase 3）
 c5d6d72 feat(core): 文档级跨行坐标映射（DocPos/选区区间，Phase 3）

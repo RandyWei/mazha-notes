@@ -36,8 +36,9 @@ use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, DisplayPos, DocPos, Document, Edit, InlineMark,
-    OffsetMap, ProjectedLine, RunStyle, Selection, TextRun as DocTextRun,
+    OffsetMap, ProjectedLine, RunStyle, Selection, TableOp, TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
+    edit_table,
 };
 use mazha_export::to_pdf;
 use rfd::FileDialog;
@@ -560,6 +561,18 @@ impl DocView {
             }
         }
         cx.notify();
+    }
+
+    /// 表格结构编辑（增删行列），作用于主光标。
+    ///
+    /// 光标不在表格内、或操作不产生变化（删唯一列 / 在表头删行）时静默忽略。
+    fn apply_table(&mut self, op: TableOp, cx: &mut Context<Self>) {
+        let caret = self.primary_cursor().caret;
+        if let Some(edit) = edit_table(&self.doc.text(), caret, op) {
+            // 表格整体被重写，光标难以精确映射；保守地落到表格起点并吸附到字符边界。
+            let new_caret = edit.source_range().start;
+            self.apply_edit(edit, new_caret, cx);
+        }
     }
 
     /// 删除选区（或光标左侧一个字符，即退格）。返回是否发生了删除。
@@ -1159,6 +1172,25 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             }
             "-" if m.platform && shift => {
                 view.apply_block(BlockTarget::Paragraph, cx);
+            }
+            // 表格结构编辑（Cmd+Option+方向键 / Cmd+Option+Delete）
+            "up" if m.platform && m.alt => {
+                view.apply_table(TableOp::InsertRowAbove, cx);
+            }
+            "down" if m.platform && m.alt => {
+                view.apply_table(TableOp::InsertRowBelow, cx);
+            }
+            "left" if m.platform && m.alt => {
+                view.apply_table(TableOp::InsertColumnLeft, cx);
+            }
+            "right" if m.platform && m.alt => {
+                view.apply_table(TableOp::InsertColumnRight, cx);
+            }
+            "backspace" | "delete" if m.platform && m.alt && shift => {
+                view.apply_table(TableOp::DeleteColumn, cx);
+            }
+            "backspace" | "delete" if m.platform && m.alt => {
+                view.apply_table(TableOp::DeleteRow, cx);
             }
             "e" if m.platform => {
                 view.export_pdf(cx);

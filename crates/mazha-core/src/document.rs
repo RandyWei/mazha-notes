@@ -1172,6 +1172,18 @@ mod tests {
     }
 
     #[test]
+    fn table_op_apply_keeps_projection_consistent() {
+        let mut d = doc("| a | b |\n| --- | --- |\n| 1 | 2 |");
+        // 光标落在首数据行 "1" 内
+        let caret = d.text().find("| 1").unwrap() + 3;
+        let edit = crate::edit_table(&d.text(), caret, crate::TableOp::InsertRowBelow)
+            .expect("光标在表格内应产出编辑");
+        d.apply(edit).unwrap();
+        assert_eq!(d.text(), "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |");
+        assert_projection_matches(&mut d, "表格结构编辑后");
+    }
+
+    #[test]
     fn callout_projects_as_quote_depth() {
         let mut d = doc("> [!NOTE]\n> 内容");
         assert_projection_matches(&mut d, "提示块");
