@@ -434,7 +434,7 @@ interface Workspace {
 | 插件运行时 | `wasmtime`（桌面）/ `wasmi`（移动） | Component Model + WIT |
 | 公式 | `ratex-parser/layout/render/svg` + `ratex-gpui` | KaTeX 移植 |
 | 图表 | `mermaid-rs-renderer` | 纯 Rust → SVG/PNG |
-| PDF 导出 | Typst 0.15（`typst` / `typst-layout` / `typst-pdf` / `typst-kit`）→ [`mazha-export::to_typst`] + [`mazha-export::to_pdf`] | 纯 Rust；排版质量优先（D21，接入方式见 D25）：`to_typst` 产出标记，`ExportWorld` 实现 `typst::World` 后 `compile` + `typst_pdf::pdf` 出字节；字体走 `typst-kit`（内置 + 系统扫描） |
+| PDF 导出 | Typst 0.15（`typst` / `typst-layout` / `typst-pdf` / `typst-kit`）→ [`mazha-export::to_typst`] + [`mazha-export::to_pdf`] | 纯 Rust；排版质量优先（D21，接入方式见 D25）：`to_typst` 产出标记，`ExportWorld` 实现 `typst::World` 后 `compile` + `typst_pdf::pdf` 出字节；字体走 `typst-kit`（内置 + 系统扫描）；`PdfDocument{bytes, warnings, pages}`（`pages` 为排出页数）；行内代码内容含反引号时改用 `#raw("…")`（反引号围栏会与内容粘连成更长串致 unclosed raw text） |
 | HTML 导出 | 基于 `mazha-md` 块/片段模型自研渲染（[`mazha-export::to_html`]） | 纯 Rust；与编辑器同源（D23 后 `pulldown-cmark` 仅 dev 对照） |
 | DOCX 导出 | `docx-rs` 1.1（[`mazha-export::to_docx`]） | 纯 Rust；基于 `mazha-md` 块/片段模型直接生成 OOXML（标题用直接格式、行内 粗/斜/删除线/行内代码、链接「文字 + (URL)」、图片占位、GFM 表格、列表/任务/引用/提示块/代码块/分割线），决策 D26 |
 | EPUB 导出 | Zip + XHTML（复用 `to_html` 同源渲染，[`mazha-export::to_epub`]） | 纯 Rust；EPUB 3 容器（`mimetype` 首条目且不压缩 / `container.xml` / `content.opf` / `nav.xhtml` / `toc.ncx` / XHTML 正文），正文走 XHTML 方言（空元素自闭合、布尔属性带值），决策 D27 |
@@ -536,7 +536,7 @@ interface Workspace {
 | R5 | 移动端触摸交互与 Typora 键盘模型差异 | 一致性目标 | 单独定义移动端交互规范 `[待确认]` |
 | R6 | CRDT 下结构性并发编辑语义 | 数据不丢但可能错乱 | 块级锁定/冲突提示策略 `[待确认]` |
 | R7 | WASM 插件在 iOS/移动端运行时限制 | 插件可用性 | 移动端用 `wasmi` 无 JIT `[待确认]` |
-| R8 | 纯 Rust PDF 导出的排版质量 | 导出观感 | 已选 Typst 0.15（D21/D25，接入已通）；残留风险为中文字体覆盖与标记转义完备性，需真实文档回归 |
+| R8 | 纯 Rust PDF 导出的排版质量 | 导出观感 | 已选 Typst 0.15（D21/D25，接入已通）；已补**真实文档回归**（`tests/pdf_real_doc.rs`：中文技术报告多页排版 + 逐字节可复现 + 标记转义扫描），修复行内代码含反引号的 raw 围栏缺陷；残留：字体子集化（Web，Phase 7）、极端字体的字形覆盖需人工抽检 |
 | R9 | 中文字体在 Web 端需内置 | 体积/一致 | 字体子集化 `[待确认]` |
 
 **待确认清单**：第 7.1（gpui-fast 是否启用）、7.3（Web 方案）、7.4 与 8（中文字体子集）、6.3（插件分发与清单）、6.5（并发编辑语义）、9（移动端交互规范）。
@@ -621,6 +621,7 @@ interface Workspace {
 | 0.1.36 | 2026-10-16 | **DOCX 导出**（D26）：`mazha-export::to_docx`（基于 `docx-rs` 1.1 生成 OOXML，不经 HTML 中转）——标题（直接格式 加粗+字号）/段落/引用/提示块/列表（有序/无序/嵌套）/任务列表/GFM 表格（含列对齐）/围栏代码块（逐行保留换行）/分割线/行内 粗/斜/删除线/行内代码/链接（「文字 + (URL)」）/自动链接/wiki-link/标签/图片占位；front-matter 隐藏；文本经 `strong-xml` 自动转义 + `xml:space="preserve"`；`DocxError`（`docx::DocxError` 仅 `Debug`，转字符串）。边界处理：空输入仍产出合法 ZIP（`PK\x03\x04`）、代码块按行插换行、span 原样空白保留、块 `range` 越界防御。13 条新测试；export 73（总计 **317**） |
 | 0.1.37 | 2026-10-16 | **EPUB 导出**（D27）：`mazha-export::to_epub` / `to_epub_with_meta` / `EpubMeta` / `EpubError`——Zip + XHTML 打包 EPUB 3（`mimetype` 首条目且 `Stored` 不压缩、`META-INF/container.xml`、`OEBPS/content.opf`、`nav.xhtml`、`toc.ncx`、`style.css`、单一 `text.xhtml`）；HTML 渲染新增 **XHTML 方言**（`html::to_xhtml_body`，空元素自闭合、布尔属性带值，`to_html` 行为不变），正文与 HTML 导出同源；`dc:identifier` 缺省用 FNV-1a 内容哈希派生、`dcterms:modified` 固定时间戳（输出确定）；元数据经 XML 转义。边界：空输入仍为合法 EPUB、空标题/语言回退、任务复选框 XHTML 化、`xmllint` 校验全部 XML 部件良构。15 条新测试；export 88（总计 **332**） |
 | 0.1.38 | 2026-10-16 | **导出主题/模板**（D28）：新增 `mazha-export::theme` 模块——`Theme`（HTML/EPUB 的 CSS：内置 `light`/`dark`/`sepia`，可 `custom`）与 `Template`（PDF/Typst 版式前置：内置 `plain`/`article`，可 `custom`），均为确定性常量。接入：`to_html_themed`（主题 CSS 注入 `<style>`）、`to_epub_themed`（主题作 `style.css`，`EpubMeta` 复用）、`to_typst_with_template`（前置以空行分隔正文）、`PdfExporter::export_with`/`to_pdf_with`（编译带模板标记；`plain` 与旧行为逐字节一致）。`Template::article` 只设页面/字号/段距、不设字体族（保留 CJK 回退）。10 条新测试；export 98（总计 **342**） |
+| 0.1.39 | 2026-10-16 | **PDF 真实文档回归**（风险 R8）：新增集成测试 `tests/pdf_real_doc.rs` + 基线文档（中文技术报告 `tests/data/real_report.md` + SVG 示意图）——验证多页排版（`PdfDocument` 新增 `pages` 字段）、逐字节可复现、标记转义扫描（`#`/`[]`/`` ` ``/`$`/`*_`/`~=`/`//`/`@`/`<>`/中文标点/emoji/组合字符）。回归发现并修复 `to_typst` 行内代码缺陷：内容含反引号时反引号围栏会与内容粘连成更长串导致 `unclosed raw text`，改用 `#raw("…")`；同时行内代码内容不再走 `escape_typst`（Typst raw 不解析标记，原实现会显示出多余反斜杠）。2 条新单测 + 3 条集成测试；export 100 单测 + 3 集成（总计 **347**） |
 
 ---
 

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80" viewBox="0 0 240 80">
+  <rect x="0" y="0" width="240" height="80" fill="#eef2f5"/>
+  <rect x="8" y="24" width="96" height="32" rx="4" fill="#4c6ef5"/>
+  <text x="56" y="44" font-size="14" fill="#ffffff" text-anchor="middle">Markdown</text>
+  <line x1="104" y1="40" x2="136" y2="40" stroke="#868e96" stroke-width="2"/>
+  <polygon points="136,35 146,40 136,45" fill="#868e96"/>
+  <rect x="146" y="24" width="86" height="32" rx="4" fill="#12b886"/>
+  <text x="189" y="44" font-size="14" fill="#ffffff" text-anchor="middle">PDF</text>
+</svg>

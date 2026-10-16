@@ -317,8 +317,28 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 i += 1;
             }
             (SpanKind::Marker, SpanRole::InlineCode) => {
-                out.push('`');
-                i += 1;
+                // 行内代码：内容按 **原始文本** 输出（Typst raw 不解析标记，也不吃
+                // 反斜杠转义，故绝不可套 escape_typst）。内容不含反引号时用单
+                // 反引号围栏；含反引号时改用 #raw("…")（字符串可转义），因为
+                // 围栏与内容会粘连成更长反引号串 → 触发 unclosed raw text。
+                let start = i + 1;
+                let end = spans[start..]
+                    .iter()
+                    .position(|s| s.kind == SpanKind::Marker && s.role == SpanRole::InlineCode)
+                    .map_or(spans.len(), |p| start + p);
+                let mut content = String::new();
+                for s in &spans[start..end] {
+                    content.push_str(&source[s.range.clone()]);
+                }
+                if content.contains('`') {
+                    let raw = escape_typst_string(&content);
+                    let _ = write!(out, "#raw(\"{raw}\")");
+                } else {
+                    out.push('`');
+                    out.push_str(&content);
+                    out.push('`');
+                }
+                i = end + 1;
             }
             (SpanKind::Marker, SpanRole::LinkMarker) => {
                 let ch = source.as_bytes().get(sp.range.start).copied();
@@ -407,6 +427,23 @@ mod tests {
     fn typst_inline_code() {
         let t = to_typst("`code`\n");
         assert!(t.contains("`code`"));
+    }
+
+    #[test]
+    fn typst_inline_code_content_is_raw() {
+        // 行内代码内容原样输出：Typst raw 不解析标记，故内容里的特殊字符
+        // 不应被加上反斜杠转义（否则会原样显示出多余的反斜杠）。
+        let t = to_typst("`a_b #c [d]`\n");
+        assert!(t.contains("`a_b #c [d]`"), "{t}");
+        assert!(!t.contains("\\_"), "{t}");
+    }
+
+    #[test]
+    fn typst_inline_code_with_backtick_uses_raw_fn() {
+        // 内容含反引号时不能用反引号围栏（会与围栏粘连成更长串 →
+        // unclosed raw text），改用 #raw("…")。
+        let t = to_typst("`` ` ``\n");
+        assert!(t.contains("#raw(\"`\")"), "{t}");
     }
 
     #[test]

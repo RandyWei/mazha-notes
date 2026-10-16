@@ -62,6 +62,8 @@ pub struct PdfDocument {
     pub bytes: Vec<u8>,
     /// 编译期警告（字体回退、未知语言标签等），已格式化为可读文本。
     pub warnings: Vec<String>,
+    /// 排出的页数（至少 1）。
+    pub pages: usize,
 }
 
 /// PDF 导出错误。
@@ -168,12 +170,14 @@ impl PdfExporter {
 
         let Warned { output, warnings } = typst::compile::<PagedDocument>(&world);
         let document = output.map_err(|errors| PdfError::Compile(format_diagnostics(&errors)))?;
+        let pages = document.pages().len();
         let bytes = typst_pdf_export(&document, &TypstPdfOptions::default())
             .map_err(|errors| PdfError::Export(format_diagnostics(&errors)))?;
 
         Ok(PdfDocument {
             bytes,
             warnings: warnings.iter().map(format_diagnostic).collect(),
+            pages,
         })
     }
 }
