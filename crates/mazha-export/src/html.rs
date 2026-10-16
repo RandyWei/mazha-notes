@@ -16,7 +16,18 @@ use std::ops::Range;
 pub fn to_html(source: &str) -> String {
     let blocks = parse(source);
     let mut out = String::new();
-    render_blocks(source, &blocks, &mut out, false);
+    render_blocks(source, &blocks, &mut out, false, false);
+    out
+}
+
+/// 把 Markdown 源文本渲染为 **XHTML** 片段（EPUB 内容文档复用）。
+///
+/// 与 [`to_html`] 的唯一差别是**空元素自闭合**（`<hr/>`/`<br/>`/`<img .../>`/`<input .../>`）
+/// 且布尔属性写成 `disabled="disabled"`，以满足 EPUB 内容文档"必须是良构 XML"的约束。
+pub(crate) fn to_xhtml_body(source: &str) -> String {
+    let blocks = parse(source);
+    let mut out = String::new();
+    render_blocks(source, &blocks, &mut out, false, true);
     out
 }
 
@@ -59,10 +70,10 @@ pub fn to_html_document(source: &str, title: &str, css: Option<&str>) -> String 
     out
 }
 
-/// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项）。
-fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool) {
+/// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项），`xhtml` 为真时空元素自闭合。
+fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool, xhtml: bool) {
     for b in blocks {
-        render_block(source, b, out, tight);
+        render_block(source, b, out, tight, xhtml);
     }
 }
 
@@ -71,7 +82,13 @@ fn render_blocks(source: &str, blocks: &[Block], out: &mut String, tight: bool) 
 ///
 /// 片段模型里竖线（[`SpanRole::TablePipe`]）是可见文本，单元格内容是普通行内片段；
 /// 分隔行（[`SpanRole::TableDelim`]）整段隐藏。第一行是表头。
-fn render_table(source: &str, block: &Block, align: &[mazha_md::Align], out: &mut String) {
+fn render_table(
+    source: &str,
+    block: &Block,
+    align: &[mazha_md::Align],
+    out: &mut String,
+    xhtml: bool,
+) {
     let rows = table_rows(source, block);
     if rows.is_empty() {
         return;
@@ -92,7 +109,7 @@ fn render_table(source: &str, block: &Block, align: &[mazha_md::Align], out: &mu
             }
             out.push('>');
             // 单元格内已按行内语法解析过，直接渲染其片段
-            render_spans_html(source, cell, out);
+            render_spans_html(source, cell, out, xhtml);
             let _ = write!(out, "</{tag}>");
         }
         out.push_str("</tr>");
@@ -110,11 +127,11 @@ fn render_table(source: &str, block: &Block, align: &[mazha_md::Align], out: &mu
     out.push_str("</table>");
 }
 
-/// 把一组行内片段渲染为 HTML（不做块级包装）。
-fn render_spans_html(source: &str, spans: &[SyntaxSpan], out: &mut String) {
+/// 把一组行内片段渲染为 HTML/XHTML（不做块级包装）。
+fn render_spans_html(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bool) {
     // 复用行内渲染：包一层空 out，再把结果并入
     let mut inner = String::new();
-    render_inline(source, spans, &mut inner);
+    render_inline(source, spans, &mut inner, xhtml);
     out.push_str(&inner);
 }
 
@@ -169,27 +186,27 @@ fn cells_of_line(spans: &[SyntaxSpan], line: &Range<usize>) -> Vec<Vec<SyntaxSpa
     cells
 }
 
-fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
+fn render_block(source: &str, block: &Block, out: &mut String, tight: bool, xhtml: bool) {
     match &block.kind {
         BlockKind::Paragraph => {
             if tight {
-                render_inline(source, &block.spans, out);
+                render_inline(source, &block.spans, out, xhtml);
             } else {
                 out.push_str("<p>");
-                render_inline(source, &block.spans, out);
+                render_inline(source, &block.spans, out, xhtml);
                 out.push_str("</p>");
             }
         }
         BlockKind::Heading { level } => {
             let _ = write!(out, "<h{level}>");
-            render_inline(source, &block.spans, out);
+            render_inline(source, &block.spans, out, xhtml);
             let _ = write!(out, "</h{level}>");
         }
-        BlockKind::ThematicBreak => out.push_str("<hr>"),
+        BlockKind::ThematicBreak => out.push_str(if xhtml { "<hr/>" } else { "<hr>" }),
         BlockKind::FrontMatter { .. } => {
             // front-matter 是元数据，导出时不渲染
         }
-        BlockKind::Table { align } => render_table(source, block, align, out),
+        BlockKind::Table { align } => render_table(source, block, align, out, xhtml),
         BlockKind::CodeBlock { lang, .. } => {
             out.push_str("<pre><code");
             if let Some(lang) = lang {
@@ -206,7 +223,7 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
         }
         BlockKind::BlockQuote => {
             out.push_str("<blockquote>");
-            render_blocks(source, &block.children, out, false);
+            render_blocks(source, &block.children, out, false, xhtml);
             out.push_str("</blockquote>");
         }
         BlockKind::Callout { kind, title } => {
@@ -221,7 +238,7 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
                 escape_text(heading)
             );
             out.push_str("<div class=\"callout-content\">");
-            render_blocks(source, &block.children, out, false);
+            render_blocks(source, &block.children, out, false, xhtml);
             out.push_str("</div></div>");
         }
         BlockKind::List { ordered, start } => {
@@ -235,40 +252,47 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool) {
                 out.push_str("<ul>");
             }
             for item in &block.children {
-                render_list_item(source, item, out);
+                render_list_item(source, item, out, xhtml);
             }
             out.push_str(if *ordered { "</ol>" } else { "</ul>" });
         }
         // 顶层不应出现列表项；兜底按项渲染
-        BlockKind::ListItem { task } => render_item_body(source, block, *task, out),
+        BlockKind::ListItem { task } => render_item_body(source, block, *task, out, xhtml),
     }
 }
 
 /// 渲染列表项：`<li>` + 可选复选框 + 子块（紧凑）。
-fn render_list_item(source: &str, item: &Block, out: &mut String) {
+fn render_list_item(source: &str, item: &Block, out: &mut String, xhtml: bool) {
     let task = match item.kind {
         BlockKind::ListItem { task } => task,
         _ => None,
     };
-    render_item_body(source, item, task, out);
+    render_item_body(source, item, task, out, xhtml);
 }
 
 /// 列表项主体渲染。
-fn render_item_body(source: &str, item: &Block, task: Option<bool>, out: &mut String) {
+fn render_item_body(source: &str, item: &Block, task: Option<bool>, out: &mut String, xhtml: bool) {
     out.push_str("<li>");
     if let Some(done) = task {
-        if done {
+        // XHTML 里布尔属性必须有值且空元素需自闭合
+        if xhtml {
+            out.push_str(if done {
+                "<input type=\"checkbox\" disabled=\"disabled\" checked=\"checked\"/> "
+            } else {
+                "<input type=\"checkbox\" disabled=\"disabled\"/> "
+            });
+        } else if done {
             out.push_str("<input type=\"checkbox\" disabled checked> ");
         } else {
             out.push_str("<input type=\"checkbox\" disabled> ");
         }
     }
-    render_blocks(source, &item.children, out, true);
+    render_blocks(source, &item.children, out, true, xhtml);
     out.push_str("</li>");
 }
 
 /// 渲染行内片段序列。
-fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String) {
+fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bool) {
     let mut state = InlineState::default();
     let mut i = 0usize;
     while i < spans.len() {
@@ -296,9 +320,10 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String) {
             {
                 let _ = write!(
                     out,
-                    "<img src=\"{}\" alt=\"{}\">",
+                    "<img src=\"{}\" alt=\"{}\"{}>",
                     escape_attr(&dest),
-                    escape_attr(&alt)
+                    escape_attr(&alt),
+                    if xhtml { "/" } else { "" }
                 );
             }
             i += 1;
@@ -358,7 +383,7 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 _ => {}
             },
             SpanRole::SoftBreak => out.push('\n'),
-            SpanRole::HardBreak => out.push_str("<br>"),
+            SpanRole::HardBreak => out.push_str(if xhtml { "<br/>" } else { "<br>" }),
             // 其余标记（标题/引用/列表/围栏/转义/链接目标等）导出时隐藏
             _ => {}
         }
@@ -422,7 +447,10 @@ fn escape_text(s: &str) -> String {
 }
 
 /// 转义属性值（在文本转义基础上再加 `"`）。
-fn escape_attr(s: &str) -> String {
+///
+/// `pub(crate)` 供 EPUB 内容文档复用：XML 文本节点与属性值都适用
+/// （多转义的 `"→&quot;` 在文本中同样合法）。
+pub(crate) fn escape_attr(s: &str) -> String {
     escape_text(s).replace('"', "&quot;")
 }
 

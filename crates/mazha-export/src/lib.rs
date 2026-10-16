@@ -6,13 +6,16 @@
 //! - **HTML**：[`to_html`] / [`to_html_document`]，基于 `mazha-md` 的块/片段模型渲染。
 //! - **PDF**：[`to_typst`] 先转成 Typst 标记，再由 [`to_pdf`] 经 Typst 编译出字节。
 //! - **DOCX**：[`to_docx`]，基于 `docx-rs` 生成 OOXML。
+//! - **EPUB**：[`to_epub`] / [`to_epub_with_meta`]，复用 HTML 渲染的 XHTML 方言打包为 EPUB 3。
 
 mod docx;
+mod epub;
 mod html;
 mod pdf;
 mod typst;
 
 pub use docx::{DocxError, to_docx};
+pub use epub::{EpubError, EpubMeta, to_epub, to_epub_with_meta};
 pub use html::{DEFAULT_CSS, to_html, to_html_document};
 pub use pdf::{PdfDocument, PdfError, PdfExportOptions, PdfExporter, to_pdf};
 pub use typst::to_typst;

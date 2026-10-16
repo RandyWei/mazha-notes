@@ -17,6 +17,8 @@ typst-kit = { version = "0.15", features = ["embedded-fonts", "scan-fonts"] }
 # DOCX 导出（docx-rs）
 docx = "1.1.2"
 thiserror = "1.0"
+# EPUB 导出（ZIP 容器；与 docx-rs 复用同一 zip 版本，避免重复依赖）
+zip = "0.5"
 
 [lints]
 workspace = true

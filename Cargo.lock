@@ -1401,6 +1401,7 @@ dependencies = [
  "typst-kit",
  "typst-layout",
  "typst-pdf",
+ "zip",
 ]
 
 [[package]]
