@@ -43,7 +43,7 @@ use mazha_core::{
     Highlighter, InlineMark, ProjectedLine, Projection, RunStyle, Selection, TableOp,
     TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
-    edit_table,
+    edit_table, find_all, replace_all_edit,
 };
 use mazha_export::to_pdf;
 use rfd::FileDialog;
@@ -332,6 +332,28 @@ impl Cursor {
     }
 }
 
+/// 查找/替换条的状态（Phase 3 编辑器扩展；SPEC §11.8）。
+///
+/// 查找/替换逻辑本身在核心 `mazha_core::{find_all, replace_all}`（纯函数、可单测）；
+/// 本结构只存 UI 态（输入文本、当前匹配序号、聚焦哪个框）。
+#[derive(Default)]
+struct FindState {
+    /// 查找条是否展开。
+    open: bool,
+    /// `true` = 焦点在替换框（`Tab` 切换）。
+    focus_replace: bool,
+    /// 是否区分大小写（默认 `false`，随按键切换）。
+    case_sensitive: bool,
+    /// 查找输入框文本。
+    query: String,
+    /// 替换输入框文本。
+    replace: String,
+    /// 当前查询在全文中的所有匹配（源字节区间，按出现顺序）。
+    matches: Vec<Range<usize>>,
+    /// 当前高亮匹配的下标（`matches` 内；越界钳到 0）。
+    index: usize,
+}
+
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
 struct DocView {
     /// 打开的文件路径（`None` = 使用内置示例）。
@@ -358,6 +380,8 @@ struct DocView {
     palette: Palette,
     /// 代码块语法高亮器（首次渲染时惰性创建并复用；`SyntaxSet` 较大）。
     highlighter: Option<Highlighter>,
+    /// 查找/替换条状态（`Cmd+F` 展开）。
+    find: FindState,
 }
 
 impl DocView {
@@ -382,6 +406,7 @@ impl DocView {
             mono_font_size: theme.mono_font_size,
             palette,
             highlighter: None,
+            find: FindState::default(),
         }
     }
 
@@ -907,6 +932,123 @@ impl DocView {
         cx.notify();
     }
 
+    // ==================== 查找/替换（Cmd+F）====================
+
+    /// 展开查找条；若有单行非空选区则把它作为初始查询，随后跳到第一个匹配。
+    fn open_find(&mut self, cx: &mut Context<Self>) {
+        self.find.open = true;
+        self.find.focus_replace = false;
+        // 单行非空选区 → 作为初始查询（跨行选区不作为查询）
+        if let Some(sel) = self.primary_selection() {
+            let t = self.doc.slice(sel).into_owned();
+            if !t.is_empty() && !t.contains('\n') {
+                self.find.query = t;
+            }
+        }
+        self.recompute_matches();
+        if !self.find.matches.is_empty() {
+            self.goto_match(0, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// 收起查找条（保留输入文本，便于下次展开）。
+    fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find.open = false;
+        cx.notify();
+    }
+
+    /// 按当前查询重新计算全部匹配，并把序号钳到有效范围。
+    fn recompute_matches(&mut self) {
+        let text = self.doc.text();
+        let query = self.find.query.clone();
+        let cs = self.find.case_sensitive;
+        self.find.matches = find_all(&text, &query, cs);
+        if self.find.index >= self.find.matches.len() {
+            self.find.index = 0;
+        }
+    }
+
+    /// 跳到第 `i` 个匹配：把它设为唯一选区（`anchor=start`、`caret=end`）以高亮并移动光标。
+    fn goto_match(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(m) = self.find.matches.get(i).cloned() else {
+            return;
+        };
+        self.find.index = i;
+        self.cursors = vec![Cursor {
+            caret: m.end,
+            anchor: Some(m.start),
+            marked: None,
+        }];
+        self.primary = 0;
+        cx.notify();
+    }
+
+    /// 跳到下一个匹配（循环）。
+    fn find_next(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let n = self.find.matches.len();
+        self.goto_match((self.find.index + 1) % n, cx);
+    }
+
+    /// 跳到上一个匹配（循环）。
+    fn find_prev(&mut self, cx: &mut Context<Self>) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let n = self.find.matches.len();
+        self.goto_match((self.find.index + n - 1) % n, cx);
+    }
+
+    /// 用替换文本替换**当前**匹配，然后重算并跳到其后最近的匹配。
+    fn replace_current(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.find.matches.get(self.find.index).cloned() else {
+            return;
+        };
+        let rep = self.find.replace.clone();
+        if self
+            .doc
+            .apply(Edit::Replace {
+                range: m.clone(),
+                text: rep,
+            })
+            .is_ok()
+        {
+            self.recompute_matches();
+            if self.find.matches.is_empty() {
+                // 替换后无更多匹配：光标停在被替换处
+                self.find.index = 0;
+                self.cursors = vec![Cursor::new(self.doc.snap_to_boundary(m.start))];
+                self.primary = 0;
+            } else {
+                // 停在原序号（其后最近的下一个匹配），越界则回首项
+                let i = self.find.index.min(self.find.matches.len() - 1);
+                self.goto_match(i, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 替换**全部**匹配（单次全文 `Edit::Replace`，作为一条撤销记录）。
+    fn replace_all_now(&mut self, cx: &mut Context<Self>) {
+        let text = self.doc.text();
+        let query = self.find.query.clone();
+        let rep = self.find.replace.clone();
+        let cs = self.find.case_sensitive;
+        if let Some(edit) = replace_all_edit(&text, &query, &rep, cs)
+            && self.doc.apply(edit).is_ok()
+        {
+            // 全文替换后旧偏移失效：光标收敛到文首
+            self.cursors = vec![Cursor::new(0)];
+            self.primary = 0;
+            self.recompute_matches();
+        }
+        cx.notify();
+    }
+
     /// 用 `text` 替换主光标处的指定区间 `target`（不先取当前选区）；IME 的内部替换原语。
     ///
     /// 与 [`Self::replace_selection_with`] 的区别：后者以"当前选区"为目标，
@@ -1064,6 +1206,37 @@ impl Render for DocView {
         let caret_count = self.cursors.len();
         let line_count = self.doc.projection().len();
         let focus = self.focus.clone();
+        // 查找/替换条（`Cmd+F` 展开）：查询框 + 替换框 + 匹配计数 + 大小写开关 + 提示
+        let find_bar = if self.find.open {
+            let query = self.find.query.clone();
+            let replace = self.find.replace.clone();
+            let total = self.find.matches.len();
+            let cur = if total == 0 { 0 } else { self.find.index + 1 };
+            let case_label = if self.find.case_sensitive {
+                "Aa·开"
+            } else {
+                "aa·关"
+            };
+            Some(
+                h_flex()
+                    .id("findbar")
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(34.))
+                    .border_b_1()
+                    .border_color(palette.border)
+                    .text_sm()
+                    .child(find_field("find-q", &query, !self.find.focus_replace, &palette))
+                    .child(find_field("find-r", &replace, self.find.focus_replace, &palette))
+                    .child(format!("{cur}/{total} 处"))
+                    .child(case_label)
+                    .child("Enter=下一个 · Shift+Enter=上一个 · Cmd+Enter=替换 · Cmd+Shift+Enter=全部 · Tab=切换框 · Esc=关闭"),
+            )
+        } else {
+            None
+        };
 
         // 正文：可滚动 + 可聚焦（键盘事件入口）+ 鼠标选区
         div()
@@ -1133,10 +1306,12 @@ impl Render for DocView {
                     .text_color(palette.muted)
                     .child(header)
                     .child(format!(
-                        "· {line_count} 行 · 光标×{} · 点击定位 / Alt+点击增减光标 / ↑↓←→ 移动 / Shift 扩选",
+                        "· {line_count} 行 · 光标×{} · 点击定位 / Alt+点击增减光标 / ↑↓←→ 移动 / Shift 扩选 / Cmd+F 查找替换",
                         caret_count
                     )),
             )
+            // 查找/替换条（`Cmd+F` 展开时才渲染）
+            .children(find_bar)
             .child(DocElement { view: cx.entity() })
     }
 }
@@ -1347,6 +1522,12 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
 
+    // 查找条展开时：所有按键优先交给查找处理（避免输入查询时误编辑正文）
+    if view.find.open {
+        handle_find_key(view, event, cx);
+        return;
+    }
+
     // Cmd/Ctrl 组合键：撤销/重做/全选/剪贴板/格式化/块类型；其余交给系统，避免误拦截
     if m.control || m.platform {
         match event.keystroke.key.as_str() {
@@ -1375,6 +1556,10 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             }
             "v" if m.platform => {
                 view.paste(cx);
+            }
+            // 打开查找/替换条（展开时 Cmd+F 由 `handle_find_key` 关闭）
+            "f" if m.platform => {
+                view.open_find(cx);
             }
             // 行内格式（Cmd+键）
             "b" if m.platform => {
@@ -1465,6 +1650,128 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
         _ => return,
     }
     cx.notify();
+}
+
+/// 查找条展开时的按键处理（`handle_key` 在 `find.open` 时全部转到这里）。
+///
+/// 语义：`Enter`/`Shift+Enter` 上/下一个匹配、`Tab` 切换查找/替换框、`Backspace`/`Delete`
+/// 编辑聚焦框、`Esc` 关闭、`Cmd+F` 再按关闭、`Cmd+Enter` 替换当前、`Cmd+Shift+Enter`
+/// 替换全部、`Cmd+Alt+C` 切换大小写敏感；其余 `Cmd` 组合一律忽略（不在查找时改正文）。
+fn handle_find_key(view: &mut DocView, event: &KeyDownEvent, cx: &mut Context<DocView>) {
+    let m = &event.keystroke.modifiers;
+    let key = event.keystroke.key.as_str();
+
+    if m.control || m.platform {
+        match key {
+            // Cmd+F：关闭查找条（再次按下切换）
+            "f" if m.platform => {
+                view.close_find(cx);
+            }
+            // Cmd+Enter：替换当前匹配；Cmd+Shift+Enter：替换全部
+            "enter" | "return" if m.platform => {
+                if m.shift {
+                    view.replace_all_now(cx);
+                } else {
+                    view.replace_current(cx);
+                }
+            }
+            // Cmd+Alt+C：切换大小写敏感并重算
+            "c" if m.platform && m.alt => {
+                view.find.case_sensitive = !view.find.case_sensitive;
+                view.recompute_matches();
+                if view.find.matches.is_empty() {
+                    cx.notify();
+                } else {
+                    view.goto_match(0, cx);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        "escape" => {
+            view.close_find(cx);
+        }
+        // Tab：在查找/替换框之间切换焦点
+        "tab" => {
+            view.find.focus_replace = !view.find.focus_replace;
+            cx.notify();
+        }
+        // Enter：下一个匹配；Shift+Enter：上一个匹配
+        "enter" | "return" => {
+            if m.shift {
+                view.find_prev(cx);
+            } else {
+                view.find_next(cx);
+            }
+        }
+        // 退格/删除：编辑聚焦框的文本
+        "backspace" => {
+            if view.find.focus_replace {
+                view.find.replace.pop();
+            } else {
+                view.find.query.pop();
+                view.recompute_matches();
+            }
+            cx.notify();
+        }
+        "delete" => {
+            if view.find.focus_replace {
+                view.find.replace.clear();
+            } else {
+                view.find.query.clear();
+                view.recompute_matches();
+            }
+            cx.notify();
+        }
+        // 可打印字符：追加到聚焦的输入框；改查找框时即时重算并跳到首个匹配
+        k if k.chars().count() == 1 && !k.chars().next().unwrap().is_control() => {
+            let ch = k.chars().next().unwrap();
+            if view.find.focus_replace {
+                view.find.replace.push(ch);
+                cx.notify();
+            } else {
+                view.find.query.push(ch);
+                view.recompute_matches();
+                if view.find.matches.is_empty() {
+                    cx.notify();
+                } else {
+                    view.goto_match(0, cx);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 渲染查找/替换条里的一个输入框（静态文本 + 聚焦高亮边框；非 gpui 输入组件）。
+///
+/// `focused` 时边框用强调色并在空框里显示占位光标 `_`。
+fn find_field(id: &'static str, value: &str, focused: bool, palette: &Palette) -> impl IntoElement {
+    let shown = if value.is_empty() && focused {
+        "_".to_string()
+    } else {
+        value.to_string()
+    };
+    div()
+        .id(id)
+        .min_w(px(160.))
+        .flex_none()
+        .items_center()
+        .px_2()
+        .h(px(22.))
+        .rounded_md()
+        .border_1()
+        .border_color(if focused {
+            palette.accent
+        } else {
+            palette.border
+        })
+        .bg(palette.subtle)
+        .text_color(palette.foreground)
+        .child(shown)
 }
 
 /// 把 core 的块样式映射为排版字号（标题放大、行内代码等距）。

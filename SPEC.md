@@ -164,7 +164,7 @@ mazha-notes-v2/
 
 | crate | 职责 | 不依赖 | 关键类型/接口 |
 |-------|------|--------|----------------|
-| `mazha-core` | 文档模型、编辑命令、撤销栈、光标/选区、显示↔源偏移映射、投影生成、表格结构编辑、代码块语法高亮 | 任何 GUI | `Document` `Edit` `Projection` `OffsetMap` `Selection` `edit_table` `Highlighter` |
+| `mazha-core` | 文档模型、编辑命令、撤销栈、光标/选区、显示↔源偏移映射、投影生成、表格结构编辑、代码块语法高亮、查找/替换 | 任何 GUI | `Document` `Edit` `Projection` `OffsetMap` `Selection` `edit_table` `Highlighter` `find_all` `replace_all` |
 | `mazha-md` | Markdown 解析、GFM+知识库方言、增量解析（脏块重解析）、序列化 | GUI | `parse` `SyntaxSpan` `Block` `serialize` |
 | `mazha-crdt` | 用 yrs 维护 `Y.Text`，同步协议、状态向量、合并、持久化更新 | GUI | `CrdtDoc` `SyncMessage` |
 | `mazha-store` | 存储 Provider 抽象 + 本地文件系统实现 + 文件监听 | GUI | `StorageProvider` `FileSystemProvider` |
@@ -576,6 +576,7 @@ interface Workspace {
 5. **块级 widget**：图片、公式、图表、表格在光标不在其中时呈现渲染态，进入时切换为可编辑态（表格为单元格网格）。
 6. **输入意图转换**：列表续行、Tab 缩进、`>`/`-`/`#` 自动补全、选区包裹（`Cmd+B` 等）、自动配对括号，全部先转成 `Edit` 再应用。
 7. **系统剪贴板**：`Cmd+C`/`Cmd+X`/`Cmd+V` 复制/剪切/粘贴纯文本（`Cmd+A` 全选已有的选区集合）。多光标时：复制把所有选区按文档顺序以换行拼接；剪切/粘贴按光标**位置倒序**逐个应用，避免靠前编辑使靠后光标偏移失效；剪贴板仅取纯文本（忽略图片/文件），空选区不覆盖剪贴板。
+8. **查找/替换**：`Cmd+F` 展开查找条（查询框 + 替换框 + 匹配计数 + 大小写开关）。`Enter`/`Shift+Enter` 跳上/下一个匹配、`Tab` 切换查找/替换框、`Cmd+Enter` 替换当前、`Cmd+Shift+Enter` 替换全部、`Cmd+Alt+C` 切换大小写敏感、`Esc` 关闭。查找/替换逻辑是核心纯函数 `mazha_core::{find_all, replace_all, replace_all_edit}`（大小写不敏感按字符 `to_lowercase` 比较，支持非 ASCII；不支持正则捕获组），替换全量为单次全文 `Edit::Replace`（一条撤销记录）。桌面查找框为静态文本输入（无 IME），满足 MVP。
 
 ---
 
@@ -592,7 +593,7 @@ interface Workspace {
 - [ ] 打开一个含标题/列表/表格/代码/公式/图表的 `.md`，正确 WYSIWYG 渲染
 - [ ] 编辑后保存，文件内容为无损 Markdown（往返 `serialize(parse(x)) == x` 对稳定块成立）
 - [ ] 中文输入法（IME）在隐藏标记的行上候选框位置正确
-- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；系统剪贴板复制/剪切/粘贴（桌面已实现，0.1.47）；公式与图表正确渲染（待解析器支持）
+- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；系统剪贴板复制/剪切/粘贴（桌面已实现，0.1.47）；查找/替换（核心 `find_all`/`replace_all` + 桌面 `Cmd+F` 面板已实现，0.1.49）；公式与图表正确渲染（待解析器支持）
 - [ ] 导出 HTML/PDF 内容与编辑区一致
 
 ### 12.3 跨平台一致性（长期）
@@ -714,6 +715,7 @@ interface Workspace {
 | 0.1.46 | 2026-10-16 | **软换行**（Phase 3，SPEC §7.1/§11.5/§12.2，D33）：核心新增 `ProjectedLine::{display_byte_len, display_byte_of_col, display_col_of_byte}`（显示字符列 ↔ 显示文本字节偏移；越界钳制、字节落多字节字符内向下吸附到字符起点），纯逻辑可单测；先测试后实现：4 条单测（混合宽字符、跨片段、空行、往返一致），core **160**（总计 **388**）。桌面端 `platforms/desktop` 把每条投影行由 `shape_line` 改为 `shape_text`（带按内容宽度算出的 `wrap_width`）折成一条 `WrappedLine`：`BlockGeom` 改存投影行 + `Arc<WrappedLine>` + 视觉行数 + 前缀字节数；`DocLayout` 增 `row_starts`（每块首视觉行的全局行号）；命中测试（`WrappedLine::closest_index_for_position` 求字节→显示列）、光标竖线/选区高亮（按视觉行拆分，`position_for_index` 取行内 x）、IME 候选框、代码块/表格/分割线装饰的纵向范围全部改为按**视觉行**定位；并修正桌面端先前以显示字符列误当字形字节索引（CJK 光标/命中错位）的隐患。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证渲染效果）；已知限制：上下移动仍按逻辑行持列、不实现横向滚动 |
 | 0.1.47 | 2026-10-16 | **系统剪贴板**（Phase 3，SPEC §11.7/§12.2，编辑器扩展）：桌面端 `platforms/desktop` 新增 `DocView::{copy_selection, cut_selection, paste}`——复制/剪切把所有光标选区（`all_selections` 去重合并）按文档顺序以换行拼接后 `write_to_clipboard`；粘贴读系统剪贴板纯文本（`item.text()`，忽略图片/文件）替换各光标选区（无选区则插入）。多光标安全：剪切/粘贴按光标**位置倒序**逐个应用 `Edit`，避免靠前编辑使靠后光标偏移失效。快捷键 `Cmd+C`/`Cmd+X`（不带 Shift，避免与 `Cmd+Shift+X` 删除线冲突）/`Cmd+V` 接入。仅桌面 UI 逻辑，无核心改动、无新单测（桌面端无测试基建），core **160**（总计 **388**）。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证剪贴板效果） |
 | 0.1.48 | 2026-10-16 | **按视觉行上下移动**（Phase 3 软换行 D33 收尾，SPEC §7.1/§11/§12.2）：桌面端上下移动由逻辑行 ±1 改为**视觉行** ±1。新增自由函数 `visual_vertical_target(layout, projection, caret, step) -> Option<usize>`：① 用投影换出 (逻辑行, 显示列) → `byte_of_col` + `position_for_index` 反查块内视觉行与块内 x，加块缩进得**绝对 x**；② 绝对视觉行 = `row_starts[行] + 块内行`，±1（越界 `None` 即不动）；③ `row_starts` 二分定位目标块与块内行，绝对 x 扣目标块缩进得块内 x；④ `closest_index_for_position` 取目标视觉行最近字节 → 显示列 → 源偏移。`move_up`/`move_down` 改调 `move_visual_vertical`（首帧布局未就绪时回退 `move_vertical_all` 逻辑行）。保留 Shift 扩展选区语义。仅桌面 UI 逻辑，无核心改动、无新单测，core **160**（总计 **388**）。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证上下移动效果） |
+| 0.1.49 | 2026-10-16 | **查找/替换**（Phase 3，SPEC §11.8/§12.2，编辑器扩展）：核心新增 `mazha-core::find`——纯函数 `find_all(text, pattern, case_sensitive) -> Vec<Range<usize>>`（非重叠、按出现顺序；大小写不敏感按字符 `to_lowercase` 比较、支持非 ASCII；空模式返回空）、`replace_all(...) -> String`、`replace_all_edit(...) -> Option<Edit>`（单次全文 `Edit::Replace`，无变化返回 `None`，一条撤销记录）。不支持正则捕获组。先测试后实现：11 条单测（大小写敏感/不敏感、非重叠相邻、空模式/无匹配、CJK、多字节偏移、替换基础/大小写/CJK、替换编辑产生/无变化为 `None`），core **171**（总计 **399**）。桌面端接入：`FindState`（展开态/聚焦框/大小写/查询/替换/匹配/序号）+ `open_find`/`close_find`/`recompute_matches`/`goto_match`/`find_next`/`find_prev`/`replace_current`/`replace_all_now`；`Cmd+F` 展开、查找条展开时 `handle_find_key` 接管全部按键（`Enter`/`Shift+Enter` 跳、`Tab` 切换框、`Cmd+Enter`/`Cmd+Shift+Enter` 替换、`Cmd+Alt+C` 大小写、`Esc` 关闭）；匹配以选区高亮显示。查找框为静态文本输入（无 IME），满足 MVP。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证查找替换效果） |
 
 ---
 
