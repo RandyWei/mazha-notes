@@ -28,6 +28,7 @@
 //! `ProjectedLine::display_byte_of_col`（↔ `display_col_of_byte`）与 `WrappedLine` 的
 //! 字节索引互换（引用 "> " 前缀等额外文本以 `prefix_bytes` 计入）。
 
+use std::cmp::Reverse;
 use std::ops::Range;
 use std::panic::Location;
 use std::path::PathBuf;
@@ -737,6 +738,101 @@ impl DocView {
         cx.notify();
     }
 
+    /// 复制：把所有光标选中的文本（按文档顺序、以换行拼接）写入系统剪贴板。
+    ///
+    /// 无任何选区时不做任何事（空选区不覆盖剪贴板，与多数编辑器一致）。
+    fn copy_selection(&self, cx: &mut Context<Self>) {
+        let sels = self.all_selections();
+        if sels.is_empty() {
+            return;
+        }
+        let text = self.doc.text();
+        let joined = sels
+            .iter()
+            .map(|r| text[r.clone()].to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(joined));
+    }
+
+    /// 剪切：先复制选区文本，再删除所有光标处的选区。
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+        self.delete_all_selections(cx);
+    }
+
+    /// 删除所有光标处的选区（无选区则不动）。返回是否发生了删除。
+    ///
+    /// 按选区**起点倒序**处理：删除靠后的选区不会改变靠前选区的偏移，
+    /// 避免顺序删除导致后续光标落在错误位置。
+    fn delete_all_selections(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut order: Vec<(usize, usize)> = self
+            .cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.selection().map(|r| (i, r.start)))
+            .collect();
+        order.sort_by_key(|&(_, pos)| Reverse(pos));
+        let mut changed = false;
+        for (i, _) in order {
+            let Some(sel) = self.cursors[i].selection() else {
+                continue;
+            };
+            let start = sel.start;
+            if self.doc.apply(Edit::Delete { range: sel }).is_ok() {
+                let c = &mut self.cursors[i];
+                c.caret = self.doc.snap_to_boundary(start);
+                c.anchor = None;
+                c.marked = None;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// 粘贴：读取系统剪贴板的纯文本，替换每个光标处的选区（无选区则插入）。
+    ///
+    /// 按光标**位置倒序**处理，避免靠前插入使靠后光标偏移失效；剪贴板无文本或为空时不动。
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let mut order: Vec<(usize, usize)> = self
+            .cursors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.selection().map_or(c.caret, |r| r.start)))
+            .collect();
+        order.sort_by_key(|&(_, pos)| Reverse(pos));
+        for (i, _) in order {
+            let range = self.cursors[i]
+                .selection()
+                .unwrap_or_else(|| self.cursors[i].caret..self.cursors[i].caret);
+            let at = range.start;
+            let inserted = text.len();
+            if self
+                .doc
+                .apply(Edit::Replace {
+                    range,
+                    text: text.clone(),
+                })
+                .is_ok()
+            {
+                let c = &mut self.cursors[i];
+                c.caret = self.doc.snap_to_boundary(at + inserted);
+                c.anchor = None;
+                c.marked = None;
+            }
+        }
+        cx.notify();
+    }
+
     /// 用 `text` 替换主光标处的指定区间 `target`（不先取当前选区）；IME 的内部替换原语。
     ///
     /// 与 [`Self::replace_selection_with`] 的区别：后者以"当前选区"为目标，
@@ -1177,7 +1273,7 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
 
-    // Cmd/Ctrl 组合键：撤销/重做/全选/格式化/块类型；其余交给系统，避免误拦截
+    // Cmd/Ctrl 组合键：撤销/重做/全选/剪贴板/格式化/块类型；其余交给系统，避免误拦截
     if m.control || m.platform {
         match event.keystroke.key.as_str() {
             "z" if m.platform => {
@@ -1195,6 +1291,16 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
                 view.cursors[0].anchor = Some(0);
                 view.primary = 0;
                 cx.notify();
+            }
+            // 剪贴板（Cmd+C/X/V）：复制/剪切选区、粘贴
+            "c" if m.platform => {
+                view.copy_selection(cx);
+            }
+            "x" if m.platform && !shift => {
+                view.cut_selection(cx);
+            }
+            "v" if m.platform => {
+                view.paste(cx);
             }
             // 行内格式（Cmd+键）
             "b" if m.platform => {

@@ -462,6 +462,7 @@ interface Workspace {
   - **软换行**（D33）：每条投影行用 `shape_text`（带 `wrap_width`）折成多个视觉行；布局按视觉行累计（`row_starts`），命中/光标/选区/IME/块级装饰均以视觉行为单位，光标与选区仍以逻辑行 + 显示字符列表示，经 `ProjectedLine::display_byte_of_col`（↔ `display_col_of_byte`）与字形字节索引互换。
   - 语法标记隐藏：光标不在该行时不绘制标记，光标进入/离开时切换显隐。
   - 块级 widget：表格（单元格网格 + 增删行列）、代码块（内嵌高亮）、图片、任务复选框。
+  - **系统剪贴板**（0.1.47，SPEC §11.7）：`Cmd+C/X/V` 走 `gpui` 的 `write_to_clipboard`/`read_from_clipboard`（纯文本），多光标编辑按位置倒序应用以保证偏移正确。
 - 已确认可复用的纯 Rust 组件：
   - **公式**：`ratex-*`（KaTeX 移植）+ `ratex-gpui`（渲染 + MathQuill 式结构编辑器）。
   - **图表**：`mermaid-rs-renderer`（纯 Rust → SVG/PNG，无浏览器依赖）。
@@ -574,6 +575,7 @@ interface Workspace {
 4. **增量解析**：按块（段落/列表/引用/代码块/表格）缓存解析结果，仅重解析受影响的块；文档尺寸扩大时保持流畅。
 5. **块级 widget**：图片、公式、图表、表格在光标不在其中时呈现渲染态，进入时切换为可编辑态（表格为单元格网格）。
 6. **输入意图转换**：列表续行、Tab 缩进、`>`/`-`/`#` 自动补全、选区包裹（`Cmd+B` 等）、自动配对括号，全部先转成 `Edit` 再应用。
+7. **系统剪贴板**：`Cmd+C`/`Cmd+X`/`Cmd+V` 复制/剪切/粘贴纯文本（`Cmd+A` 全选已有的选区集合）。多光标时：复制把所有选区按文档顺序以换行拼接；剪切/粘贴按光标**位置倒序**逐个应用，避免靠前编辑使靠后光标偏移失效；剪贴板仅取纯文本（忽略图片/文件），空选区不覆盖剪贴板。
 
 ---
 
@@ -590,7 +592,7 @@ interface Workspace {
 - [ ] 打开一个含标题/列表/表格/代码/公式/图表的 `.md`，正确 WYSIWYG 渲染
 - [ ] 编辑后保存，文件内容为无损 Markdown（往返 `serialize(parse(x)) == x` 对稳定块成立）
 - [ ] 中文输入法（IME）在隐藏标记的行上候选框位置正确
-- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；公式与图表正确渲染（待解析器支持）
+- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；系统剪贴板复制/剪切/粘贴（桌面已实现，0.1.47）；公式与图表正确渲染（待解析器支持）
 - [ ] 导出 HTML/PDF 内容与编辑区一致
 
 ### 12.3 跨平台一致性（长期）
@@ -710,6 +712,7 @@ interface Workspace {
 | 0.1.44 | 2026-10-16 | **表格增删行列**（Phase 3，SPEC §11.5/§12.2，D31）：新增 `mazha-core::table`——纯函数 `edit_table(source, caret, TableOp) -> Option<Edit>`，把"光标所在表格块"解析成 `TableModel{header, align, rows}`，套用 `InsertRowAbove/Below`、`InsertColumnLeft/Right`、`DeleteRow/Column` 后规范化重写整块（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`；核心导出 `TableOp`/`edit_table`。边界：光标在表格外、删唯一列、在表头/分隔行删行 → `None`；转义 `\|` 不拆列；列对齐经 `Align` 保留。先测试后实现：table 12 条 + document 集成 1 条（经 `Document::apply` 后投影全量一致），core **151**（总计 **379**）。桌面端接入：`apply_table`（走 `apply_edit`，纳入 undo/redo）+ 快捷键 Cmd+Option+↑/↓（增行）、←/→（增列）、Delete（删行）、Shift+Delete（删列）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证） |
 | 0.1.45 | 2026-10-16 | **代码块语法高亮**（Phase 3，SPEC §11.5/§12.2，D32）：新增 `mazha-core::highlight`——用 **syntect**（纯 Rust fancy-regex 引擎）把一段代码按语言逐行着色，`Highlighter::with_theme(name)` 持有内置 `SyntaxSet`，`highlight(code, lang) -> Vec<Vec<ColoredRun>>` 返回每行的 `(源区间相对行首, (r,g,b))`；语言未命中回退纯文本；不泄漏 syntect 类型（对外 `ColoredRun`/`(u8,u8,u8)`）。`mazha-core` 依赖 syntect（`default-features=false` + `default-fancy/default-syntaxes/default-themes`，无 onig C 依赖）。先测试后实现：5 条单测（rust 关键字多色、未知语言回退单色、空/多行状态、无语言纯文本、区间相对行首），core **156**（总计 **384**）。桌面端接入：`DocView` 惰性持有 `Highlighter`（按背景明度选深/浅内置主题），prepaint 把连续代码行聚段着色，`build_line_runs` 按着色区间切分显示文本逐段上色（等宽 + 弱底）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证渲染效果） |
 | 0.1.46 | 2026-10-16 | **软换行**（Phase 3，SPEC §7.1/§11.5/§12.2，D33）：核心新增 `ProjectedLine::{display_byte_len, display_byte_of_col, display_col_of_byte}`（显示字符列 ↔ 显示文本字节偏移；越界钳制、字节落多字节字符内向下吸附到字符起点），纯逻辑可单测；先测试后实现：4 条单测（混合宽字符、跨片段、空行、往返一致），core **160**（总计 **388**）。桌面端 `platforms/desktop` 把每条投影行由 `shape_line` 改为 `shape_text`（带按内容宽度算出的 `wrap_width`）折成一条 `WrappedLine`：`BlockGeom` 改存投影行 + `Arc<WrappedLine>` + 视觉行数 + 前缀字节数；`DocLayout` 增 `row_starts`（每块首视觉行的全局行号）；命中测试（`WrappedLine::closest_index_for_position` 求字节→显示列）、光标竖线/选区高亮（按视觉行拆分，`position_for_index` 取行内 x）、IME 候选框、代码块/表格/分割线装饰的纵向范围全部改为按**视觉行**定位；并修正桌面端先前以显示字符列误当字形字节索引（CJK 光标/命中错位）的隐患。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证渲染效果）；已知限制：上下移动仍按逻辑行持列、不实现横向滚动 |
+| 0.1.47 | 2026-10-16 | **系统剪贴板**（Phase 3，SPEC §11.7/§12.2，编辑器扩展）：桌面端 `platforms/desktop` 新增 `DocView::{copy_selection, cut_selection, paste}`——复制/剪切把所有光标选区（`all_selections` 去重合并）按文档顺序以换行拼接后 `write_to_clipboard`；粘贴读系统剪贴板纯文本（`item.text()`，忽略图片/文件）替换各光标选区（无选区则插入）。多光标安全：剪切/粘贴按光标**位置倒序**逐个应用 `Edit`，避免靠前编辑使靠后光标偏移失效。快捷键 `Cmd+C`/`Cmd+X`（不带 Shift，避免与 `Cmd+Shift+X` 删除线冲突）/`Cmd+V` 接入。仅桌面 UI 逻辑，无核心改动、无新单测（桌面端无测试基建），core **160**（总计 **388**）。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证剪贴板效果） |
 
 ---
 
