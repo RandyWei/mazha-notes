@@ -138,15 +138,17 @@ fn is_safe_cut(new: &str, tail: usize, region: &[Block]) -> bool {
     !region.last().is_some_and(is_unclosed_fence)
 }
 
-/// 是否为**未闭合**的围栏代码块：`fenced` 为真且只有开栏标记（无收栏标记）。
+/// 是否为**未闭合**的围栏代码块 / 显示公式块（都只剩开栏标记，不足两个）。
+///
+/// 公式块与围栏一样可以跨越空行（未闭合时一直延伸到文档末尾），
+/// 所以裁切点校验必须同样识别它，否则会把公式块拦腰切断（D34 ①）。
 fn is_unclosed_fence(block: &Block) -> bool {
-    matches!(block.kind, BlockKind::CodeBlock { fenced: true, .. })
-        && block
-            .spans
-            .iter()
-            .filter(|s| s.role == SpanRole::FenceMarker)
-            .count()
-            < 2
+    let n = |role: SpanRole| block.spans.iter().filter(|s| s.role == role).count();
+    match block.kind {
+        BlockKind::CodeBlock { fenced: true, .. } => n(SpanRole::FenceMarker) < 2,
+        BlockKind::MathBlock => n(SpanRole::MathMarker) < 2,
+        _ => false,
+    }
 }
 
 /// 平移一个块及其全部子孙/片段的 range（`start` 前置偏移 + `delta` 全局平移）。
@@ -405,5 +407,49 @@ mod tests {
 
         // 最终文本仍可往返（块覆盖完整）
         assert!(!blocks.is_empty());
+    }
+
+    // ---------------- 公式块的增量重解析（D34 ①） ----------------
+
+    #[test]
+    fn unclosed_math_block_not_cut_across_blank() {
+        // 未闭合公式块跨越空行：裁切点校验必须识别它，否则会把公式块拦腰切断
+        let old = "前言\n\n$$\nbody\n";
+        let at = old.find("body").unwrap();
+        let new = format!("{}BODY{}", &old[..at], &old[at + 4..]);
+        assert_matches_full(old, &new, at..at + 4);
+    }
+
+    #[test]
+    fn edit_inside_closed_math_block_matches_full() {
+        let old = "前言\n\n$$\na\n$$\n\n尾\n";
+        let at = old.find("\na\n").unwrap() + 1;
+        let new = format!("{}ab{}", &old[..at], &old[at + 1..]);
+        assert_matches_full(old, &new, at..at + 1);
+    }
+
+    #[test]
+    fn append_close_dollar_matches_full() {
+        // 未闭合 → 补上收尾行
+        let old = "$$\nx\n";
+        let new = "$$\nx\n$$\n";
+        assert_matches_full(old, new, old.len()..old.len());
+    }
+
+    #[test]
+    fn destroy_open_marker_drops_math_block() {
+        // 开栏行被改写 → 不再是公式块（后续 `$$` 单独成块）
+        let old = "前文\n\n$$\nx\n$$\n";
+        let at = old.find("$$").unwrap();
+        let new = "前文\n\n!!\nx\n$$\n";
+        assert_matches_full(old, new, at..at + 2);
+    }
+
+    #[test]
+    fn edit_math_inside_quote_matches_full() {
+        let old = "> $$\n> x\n> $$\n";
+        let at = old.find('x').unwrap();
+        let new = format!("{}y{}", &old[..at], &old[at + 1..]);
+        assert_matches_full(old, &new, at..at + 1);
     }
 }

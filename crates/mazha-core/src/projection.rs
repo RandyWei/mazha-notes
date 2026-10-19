@@ -435,6 +435,8 @@ pub enum RunStyle {
     InlineCode,
     /// 链接文字。
     LinkText,
+    /// 行内公式体 `$…$`（D34）：UI 用斜体 + 主题色区分。
+    Math,
 }
 
 impl From<SpanRole> for RunStyle {
@@ -445,6 +447,7 @@ impl From<SpanRole> for RunStyle {
             SpanRole::Strikethrough => RunStyle::Strikethrough,
             SpanRole::InlineCode => RunStyle::InlineCode,
             SpanRole::LinkText => RunStyle::LinkText,
+            SpanRole::Math => RunStyle::Math,
             _ => RunStyle::Normal,
         }
     }
@@ -511,6 +514,13 @@ pub enum BlockWidgetKind {
     },
     /// 分割线（单行）。
     Rule,
+    /// 显示公式块 `$$…$$`（D34）。
+    Math,
+    /// 图表块：围栏语言为 `lang` 的代码块（如 `mermaid`）归类为此（D34 ③）。
+    Chart {
+        /// 图表语言标识（如 `mermaid`）。
+        lang: String,
+    },
 }
 
 /// 由源文本构造整篇投影。
@@ -672,7 +682,7 @@ fn collect_spans(block: &Block, out: &mut Vec<SyntaxSpan>) {
     }
 }
 
-/// 收集块森林里的块级 widget（代码块/表格/分割线），按源序排列（SPEC §11.5、D30）。
+/// 收集块森林里的块级 widget（代码块/表格/分割线/公式/图表），按源序排列（SPEC §11.5、D30）。
 ///
 /// 只处理叶子块；容器块（引用/列表/提示块）透传，故嵌套在列表项/引用内的代码块/表格
 /// 也会各自产出一个 widget（其 `line_range` 覆盖各自的逻辑行）。块的 `line_range`
@@ -688,10 +698,15 @@ fn collect_block_widgets(blocks: &[Block], lines: &[Line]) -> Vec<BlockWidget> {
 
 fn collect_block_widgets_into(block: &Block, lines: &[Line], out: &mut Vec<BlockWidget>) {
     let kind = match &block.kind {
+        // mermaid 围栏块归类为图表 widget（D34 ③：解析器不特判，归类放在投影层）
+        BlockKind::CodeBlock {
+            lang: Some(lang), ..
+        } if lang == "mermaid" => Some(BlockWidgetKind::Chart { lang: lang.clone() }),
         BlockKind::CodeBlock { lang, fenced } => Some(BlockWidgetKind::Code {
             lang: lang.clone(),
             fenced: *fenced,
         }),
+        BlockKind::MathBlock => Some(BlockWidgetKind::Math),
         BlockKind::Table { align } => Some(BlockWidgetKind::Table {
             align: align.clone(),
         }),
@@ -1235,6 +1250,72 @@ mod tests {
                 .iter()
                 .any(|w| matches!(&w.kind, BlockWidgetKind::Code { .. })),
             "引用内的代码块应产出 Code widget"
+        );
+    }
+
+    // ---------- 公式/图表 widget（D34） ----------
+
+    #[test]
+    fn math_blocks_are_block_widgets() {
+        // 单行与多行 $$ 公式各产出 1 个 Math widget，覆盖含定界行的全部逻辑行
+        let p = build("$$E=mc^2$$\n\n$$\na\n$$\n");
+        assert_eq!(p.widgets.len(), 2, "{:#?}", p.widgets);
+        assert_eq!(p.widgets[0].kind, BlockWidgetKind::Math);
+        assert_eq!(p.widgets[0].line_range, 0..1);
+        assert_eq!(p.widgets[1].kind, BlockWidgetKind::Math);
+        assert_eq!(p.widgets[1].line_range, 2..5);
+    }
+
+    #[test]
+    fn math_block_hides_delimiters_in_display_text() {
+        // 显示文本只剩公式体：`$$` 是隐藏定界符
+        let p = build("$$E=mc^2$$");
+        assert_eq!(p.lines[0].display_text(), "E=mc^2");
+        let p2 = build("> $$\n> x\n> $$\n");
+        assert_eq!(
+            p2.lines[1].display_text(),
+            "x",
+            "引用内的公式同样只显示公式体"
+        );
+    }
+
+    #[test]
+    fn mermaid_fence_is_chart_widget() {
+        // mermaid 归类为 Chart（D34 ③），其余语言仍是 Code
+        let p = build("```mermaid\ngraph TD;\n```\n");
+        assert_eq!(p.widgets.len(), 1);
+        assert_eq!(
+            p.widgets[0].kind,
+            BlockWidgetKind::Chart {
+                lang: "mermaid".to_string()
+            }
+        );
+        let p2 = build("```dot\ngraph{}\n```\n");
+        assert_eq!(
+            p2.widgets[0].kind,
+            BlockWidgetKind::Code {
+                lang: Some("dot".to_string()),
+                fenced: true,
+            },
+            "非 mermaid 语言仍按代码块处理"
+        );
+    }
+
+    #[test]
+    fn inline_math_runs_use_math_style() {
+        // 行内公式体是可见文本并带 RunStyle::Math（D34 ④）
+        let p = build("当 $x^2$ 时");
+        let run = p.lines[0]
+            .runs
+            .iter()
+            .find(|r| r.text.contains('x'))
+            .expect("应有含 x 的文本段");
+        assert_eq!(run.style, RunStyle::Math);
+        assert_eq!(run.text, "x^2");
+        assert_eq!(
+            p.lines[0].display_text(),
+            "当 x^2 时",
+            "`$` 定界符隐藏，公式体可见"
         );
     }
 }

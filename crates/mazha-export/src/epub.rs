@@ -125,15 +125,24 @@ fn to_epub_impl(source: &str, meta: &EpubMeta, css: &str) -> Result<Vec<u8>, Epu
 
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
 
+    // ZIP 条目时间戳**必须固定**：`FileOptions::default()` 取当前时间，会让同一份输入
+    // 在跨 2 秒（DOS 时间粒度）时导出不同字节，破坏"相同输入 → 相同输出"的可复现性。
+    // 用 `DateTime::default()`（1980-01-01，ZIP 纪元起点）保证确定性。
+    let fixed_time = zip::DateTime::default();
+
     // 1) mimetype：必须是**第一个**条目且`Stored`（不压缩）——EPUB 规范硬性要求
     zip.start_file(
         "mimetype",
-        FileOptions::default().compression_method(CompressionMethod::Stored),
+        FileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .last_modified_time(fixed_time),
     )?;
     zip.write_all(b"application/epub+zip")?;
 
     // 其余条目一律 Deflate（FileOptions 是 Copy，可复用）
-    let deflate = FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let deflate = FileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .last_modified_time(fixed_time);
 
     zip.start_file("META-INF/container.xml", deflate)?;
     zip.write_all(CONTAINER_XML.as_bytes())?;

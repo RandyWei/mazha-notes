@@ -45,6 +45,9 @@ table{border-collapse:collapse}
 th,td{border:1px solid #d0d7de;padding:.4em .8em}
 a{color:#0969da;text-decoration:none}
 a:hover{text-decoration:underline}
+.math{font-family:"Latin Modern Math","STIX Two Math",Cambria,Georgia,serif}
+div.math{margin:1em 0;padding:.5em 0;text-align:center}
+span.math{font-style:italic}
 "#;
 
 /// 把 Markdown 源文本渲染为完整 HTML5 文档（含 `<html>/<head>/<body>` 外壳）。
@@ -234,6 +237,13 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool, xhtm
             }
             out.push_str("</code></pre>");
         }
+        BlockKind::MathBlock => {
+            // 显示公式块（D34）：`$$` 定界符隐藏，只输出公式体（含行尾可见文字）。
+            // `pre` 保留源里的换行与空白，避免公式排版被 HTML 折叠。
+            out.push_str("<div class=\"math\">");
+            out.push_str(&escape_text(&math_body(source, block)));
+            out.push_str("</div>");
+        }
         BlockKind::BlockQuote => {
             out.push_str("<blockquote>");
             render_blocks(source, &block.children, out, false, xhtml);
@@ -315,6 +325,16 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bo
             let _ = write!(
                 out,
                 "<span class=\"tag\">{}</span>",
+                escape_text(&source[sp.range.clone()])
+            );
+            i += 1;
+            continue;
+        }
+        // 行内公式体：包一层 <span class="math">（D34 ④）；`$` 定界符是 Marker，落到下面的兜底忽略
+        if sp.kind == SpanKind::Text && sp.role == SpanRole::Math {
+            let _ = write!(
+                out,
+                "<span class=\"math\">{}</span>",
                 escape_text(&source[sp.range.clone()])
             );
             i += 1;
@@ -434,6 +454,30 @@ impl InlineState {
         }
         *flag = !*flag;
     }
+}
+
+/// 汇总公式块的可见文本（D34）：跳过 `$$` 定界标记，仅当片段之间的源文本含换行时补 `\n`。
+///
+/// 与序列化同规则（见 `mazha_md::serialize`）：定界符与容器前缀（如 `> `）都在片段间隙里，
+/// 逐个还原源文本中的换行即可保留公式的多行结构，同时不掺入 `$$` 或 `> `。
+fn math_body(source: &str, block: &Block) -> String {
+    let mut body = String::new();
+    let mut prev_end: Option<usize> = None;
+    for sp in &block.spans {
+        if sp.kind != SpanKind::Text {
+            continue;
+        }
+        if let Some(prev) = prev_end {
+            for c in source[prev..sp.range.start].chars() {
+                if c == '\n' {
+                    body.push('\n');
+                }
+            }
+        }
+        body.push_str(&source[sp.range.clone()]);
+        prev_end = Some(sp.range.end);
+    }
+    body
 }
 
 /// 解析图片源码 `![alt](dest)`（MVP：不处理 alt 内的 `]`）。
@@ -708,5 +752,41 @@ mod tests {
     fn html_tag_nested() {
         let html = to_html("#nested/tag\n");
         assert!(html.contains("<span class=\"tag\">#nested/tag</span>"));
+    }
+
+    // ---------- 公式（D34） ----------
+
+    #[test]
+    fn html_block_math_hides_delimiters() {
+        assert_eq!(to_html("$$E=mc^2$$\n"), "<div class=\"math\">E=mc^2</div>");
+        // 多行：公式体行间保留换行（定界行不输出）
+        assert_eq!(
+            to_html("$$\na + b\n$$\n"),
+            "<div class=\"math\">a + b</div>"
+        );
+    }
+
+    #[test]
+    fn html_block_math_keeps_trailing_text() {
+        // `$$a$$ 后续` 的可见尾巴也要输出（片段间隙无换行则不插换行）
+        assert_eq!(to_html("$$a$$ 后续\n"), "<div class=\"math\">a 后续</div>");
+    }
+
+    #[test]
+    fn html_inline_math_wrapped_not_escaped_as_math() {
+        let html = to_html("当 $x^2$ 时\n");
+        assert_eq!(html, "<p>当 <span class=\"math\">x^2</span> 时</p>");
+        // `$` 定界符隐藏，不残留
+        assert!(!html.contains('$'));
+    }
+
+    #[test]
+    fn html_math_inside_quote_drops_prefix() {
+        // 引用内的公式：`> ` 前缀留在片段间隙，不得混入公式体
+        let html = to_html("> $$\n> x\n> $$\n");
+        assert!(
+            html.contains("<blockquote><div class=\"math\">x</div></blockquote>"),
+            "{html}"
+        );
     }
 }

@@ -1217,6 +1217,7 @@ mod tests {
             "1. 有序\n\n",
             "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n",
             "```rust\nfn main() {}\n```\n\n",
+            "$$E=mc^2$$\n\n",
             "---\n\n",
             "![图](img.png)\n",
         );
@@ -1236,6 +1237,7 @@ mod tests {
                 mazha_md::BlockKind::List { .. } => "list",
                 mazha_md::BlockKind::Table { .. } => "table",
                 mazha_md::BlockKind::CodeBlock { .. } => "code",
+                mazha_md::BlockKind::MathBlock => "math",
                 mazha_md::BlockKind::ThematicBreak => "hr",
                 mazha_md::BlockKind::ListItem { .. } => "list-item",
             })
@@ -1249,6 +1251,7 @@ mod tests {
             "list",
             "table",
             "code",
+            "math",
             "hr",
         ] {
             assert!(

@@ -110,7 +110,35 @@ fn render_block(source: &str, block: &Block, depth: usize, out: &mut Vec<BodyCon
         // 顶层不应出现列表项；兜底按项渲染（无序号前缀）
         BlockKind::ListItem { task } => render_list_item(source, block, *task, depth, out, ""),
         BlockKind::Table { align } => out.push(table(source, block, align)),
+        BlockKind::MathBlock => out.push(math_block_paragraph(source, block)),
     }
+}
+
+/// 显示公式块（D34）：按字面量输出公式体（纯文本 + 行间软换行），`$$` 定界符隐藏。
+///
+/// 片段之间的换行数按源文本还原（容器前缀如 `> ` 不掺入），从而保留公式的多行结构。
+fn math_block_paragraph(source: &str, block: &Block) -> BodyContent<'static> {
+    let mut content: Vec<ParagraphContent<'static>> = Vec::new();
+    let mut prev_end: Option<usize> = None;
+    for sp in &block.spans {
+        if sp.kind != SpanKind::Text {
+            continue;
+        }
+        if let Some(prev) = prev_end {
+            for _ in 0..source[prev..sp.range.start].matches('\n').count() {
+                content.push(line_break());
+            }
+        }
+        let text = &source[sp.range.clone()];
+        if !text.is_empty() {
+            content.push(text_run(text, CharacterProperty::default()));
+        }
+        prev_end = Some(sp.range.end);
+    }
+    BodyContent::Paragraph(Paragraph {
+        property: ParagraphProperty::default(),
+        content,
+    })
 }
 
 /// 构建一段普通段落（可指定基准样式）。
@@ -750,5 +778,38 @@ mod tests {
             c,
             ParagraphContent::Run(r) if r.content.iter().any(|rc| matches!(rc, RunContent::Break(_)))
         )));
+    }
+
+    // ---------- 公式（D34）：按字面量输出（纯文本） ----------
+
+    #[test]
+    fn docx_block_math_is_literal_text() {
+        let out = render("$$E=mc^2$$\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "E=mc^2", "定界符隐藏，公式体为纯文本");
+    }
+
+    #[test]
+    fn docx_multiline_math_keeps_breaks() {
+        let out = render("$$\na + b\n c\n$$\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "a + b c");
+        assert!(p.content.iter().any(|c| matches!(
+            c,
+            ParagraphContent::Run(r) if r.content.iter().any(|rc| matches!(rc, RunContent::Break(_)))
+        )));
+    }
+
+    #[test]
+    fn docx_inline_math_is_plain_text() {
+        let out = render("当 $x^2$ 时\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "当 x^2 时", "`$` 定界符隐藏");
     }
 }

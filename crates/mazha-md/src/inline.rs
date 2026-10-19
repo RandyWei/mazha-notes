@@ -16,7 +16,7 @@ use std::ops::Range;
 fn is_special(b: u8) -> bool {
     matches!(
         b,
-        b'\\' | b'*' | b'_' | b'~' | b'`' | b'[' | b'!' | b'<' | b'#'
+        b'\\' | b'*' | b'_' | b'~' | b'`' | b'[' | b'!' | b'<' | b'#' | b'$'
     )
 }
 
@@ -64,6 +64,7 @@ fn try_construct(source: &str, s: &str, base: usize, i: usize) -> Option<(usize,
     match bytes[i] {
         b'\\' => escape(base, bytes, i),
         b'`' => code_span(base, bytes, i),
+        b'$' => inline_math(source, s, base, i),
         b'!' if bytes.get(i + 1) == Some(&b'[') => image(source, base, bytes, i),
         b'[' if bytes.get(i + 1) == Some(&b'[') => wiki_link(source, base, bytes, i),
         b'[' => link(source, base, bytes, i),
@@ -171,6 +172,64 @@ fn trim_code_edges(bytes: &[u8], start: usize, end: usize) -> (usize, usize) {
     } else {
         (start, end)
     }
+}
+
+/// 行内公式 `$…$`（D34）：两个 `$` 为**隐藏标记**，公式体是可见文本。
+///
+/// 判定规则（SPEC D34）：
+/// - 开 `$`：左侧非字母数字（或行首）、右侧非空白；`$$` 不构成行内公式
+///   （开位右侧是 `$`、或左侧紧贴 `$` 都拒绝，`$$x$$` 因此整段按普通文本处理）；
+/// - 闭 `$`：左侧非空白、右侧非数字（避免 `$5` / `$10` 这类金额被误判成公式）；
+/// - 公式体非空且不跨行；任一条件不成立则返回 `None`，整段按普通文本继续。
+///
+/// 转义 `\$` 由 [`escape`] 分支先命中，不会走到这里。
+fn inline_math(source: &str, s: &str, base: usize, i: usize) -> Option<(usize, Vec<SyntaxSpan>)> {
+    let bytes = s.as_bytes();
+    if bytes.get(i) != Some(&b'$') || bytes.get(i + 1) == Some(&b'$') {
+        return None;
+    }
+    let abs = base + i;
+    // 开 `$` 的左侧字符可能在 region 之外（标题内容区从 `# ` 之后开始），故用源文本判断
+    if abs > 0 {
+        let prev = source[..abs].chars().next_back()?;
+        if prev.is_alphanumeric() || prev == '$' {
+            return None;
+        }
+    }
+    // 开 `$` 右侧必须存在且非空白
+    if s.get(i + 1..)
+        .and_then(|t| t.chars().next())
+        .is_none_or(char::is_whitespace)
+    {
+        return None;
+    }
+    // 逐个候选闭 `$`：内容非空、左邻非空白、右邻非数字
+    let mut k = i + 1;
+    while k < bytes.len() {
+        if bytes[k] == b'$' {
+            let content = &s[i + 1..k];
+            let left = content.chars().next_back();
+            let right = source.get(base + k + 1..).and_then(|t| t.chars().next());
+            if !content.is_empty()
+                && !content.contains('\n')
+                && left.is_some_and(|c| !c.is_whitespace())
+                && !right.is_some_and(char::is_numeric)
+            {
+                let spans = vec![
+                    SyntaxSpan::marker(abs..abs + 1, SpanRole::MathMarker),
+                    SyntaxSpan::text(abs + 1..base + k, SpanRole::Math),
+                    SyntaxSpan::marker(base + k..base + k + 1, SpanRole::MathMarker),
+                ];
+                return Some((k + 1 - i, spans));
+            }
+            // 内容跨行：行内公式到此为止（region 为单行，正常不会命中）
+            if content.contains('\n') {
+                return None;
+            }
+        }
+        k += 1;
+    }
+    None
 }
 
 /// 图片：`![alt](dest)` 整体作为 Widget（源文本隐藏）。
@@ -710,5 +769,73 @@ mod tests {
         let src = "\\#tag";
         let spans = parse_inline(src, 0..src.len());
         assert!(spans.iter().all(|s| s.role != SpanRole::Tag));
+    }
+
+    // ---------------- 行内公式 $…$（D34） ----------------
+
+    #[test]
+    fn inline_math_basic() {
+        // 定界符隐藏、公式体可见
+        let src = "a $x^2$ b";
+        let spans = parse(src);
+        assert_eq!(spans.len(), 5, "{spans:?}");
+        assert_eq!(spans[0], SyntaxSpan::text(0..2, SpanRole::Normal));
+        assert_eq!(spans[1], SyntaxSpan::marker(2..3, SpanRole::MathMarker));
+        assert_eq!(spans[2], SyntaxSpan::text(3..6, SpanRole::Math));
+        assert_eq!(spans[3], SyntaxSpan::marker(6..7, SpanRole::MathMarker));
+        assert_eq!(spans[4], SyntaxSpan::text(7..9, SpanRole::Normal));
+        // 可见区间 = 去掉两个 `$`
+        assert_eq!(crate::span::visible_runs(&spans), vec![0..2, 3..6, 7..9]);
+    }
+
+    #[test]
+    fn inline_math_after_cjk_with_space() {
+        // 左邻空白（非字母数字）成立；中文正文里的 `$x$` 正常识别
+        let src = "当 $x$ 时";
+        let spans = parse(src);
+        assert!(spans.iter().any(|s| s.role == SpanRole::Math));
+    }
+
+    #[test]
+    fn inline_math_left_alnum_rejected() {
+        // 左邻是字母 → 不开公式（词内 `$` 不误判）
+        let spans = parse("a$x$");
+        assert!(spans.iter().all(|s| s.role != SpanRole::Math));
+    }
+
+    #[test]
+    fn inline_math_currency_not_math() {
+        // 金额：闭 `$` 右侧是空白/数字时都不成立
+        let spans = parse("$5 and $10");
+        assert!(spans.iter().all(|s| s.role != SpanRole::Math));
+    }
+
+    #[test]
+    fn inline_math_close_before_digit_rejected() {
+        let spans = parse("$x$5");
+        assert!(spans.iter().all(|s| s.role != SpanRole::Math));
+    }
+
+    #[test]
+    fn inline_math_double_dollar_not_math() {
+        // `$$x$$` 行内不构成行内公式（行首的才交给块级解析）
+        let src = "$$x$$";
+        let spans = parse(src);
+        assert!(spans.iter().all(|s| s.role != SpanRole::Math));
+        assert_eq!(crate::span::visible_runs(&spans), vec![0..src.len()]);
+    }
+
+    #[test]
+    fn inline_math_empty_or_blank_body_rejected() {
+        assert!(parse("$  $").iter().all(|s| s.role != SpanRole::Math));
+        assert!(parse("$").iter().all(|s| s.role != SpanRole::Math));
+    }
+
+    #[test]
+    fn inline_math_escaped_dollar_not_math() {
+        // `\$x$`：反斜杠转义先命中，剩余 `$` 不再开公式
+        let src = "\\$x$";
+        let spans = parse(src);
+        assert!(spans.iter().all(|s| s.role != SpanRole::Math));
     }
 }

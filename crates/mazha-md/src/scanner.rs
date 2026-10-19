@@ -341,11 +341,51 @@ fn source_slice(rest: &str, at: usize) -> &str {
     rest.get(at..).unwrap_or("")
 }
 
+/// 显示公式开栏行的解析结果（SPEC D34）。
+#[derive(Debug, Clone, Copy)]
+enum MathFence {
+    /// 单行 `$$…$$`：值为公式体字节数（收栏 `$$` 紧随其后，行尾其余文字另存为可见文本）。
+    Single(usize),
+    /// 多行开栏：`$$` 自成一行（或行尾另有文字），需继续扫描"仅含 `$$`"的收尾行。
+    Multi,
+}
+
+/// 识别显示公式开栏行：缩进 ≤3 且行内容以 `$$` 起始（D34 ①）。
+///
+/// 单行/多行判定：跳过开栏 `$$` 后（下标从 2 起，避免与开栏自身重叠）
+/// 仍能找到 `$$` 就是单行公式；否则按多行开栏，由 [`build_math_block`] 扫描收尾行。
+/// 因此 `$$` 单独成行、`$$x` 这类行都会开启多行公式（未收尾时延伸到文档末尾）。
+fn math_fence_open(rest: &str) -> Option<MathFence> {
+    let ind = indent(rest);
+    if ind > 3 {
+        return None;
+    }
+    let after = &rest[ind..];
+    if !after.starts_with("$$") {
+        return None;
+    }
+    let close = after.as_bytes()[2..]
+        .windows(2)
+        .position(|w| w == b"$$")
+        .map(|p| p + 2);
+    Some(match close {
+        Some(c) => MathFence::Single(c - 2),
+        None => MathFence::Multi,
+    })
+}
+
+/// 显示公式收尾行：缩进 ≤3 且去掉行尾空白后恰为 `$$`（与围栏收尾同规则）。
+fn is_math_close(rest: &str) -> bool {
+    let ind = indent(rest);
+    ind <= 3 && rest[ind..].trim_end() == "$$"
+}
+
 /// 该行是否开启一个新的非段落块（用于段落终止判断）。
 fn starts_new_block(source: &str, line: Line) -> bool {
     let rest = line.rest(source);
     atx_heading(rest).is_some()
         || fence_open(rest).is_some()
+        || math_fence_open(rest).is_some()
         || is_thematic_break(rest)
         || quote_prefix(rest).is_some()
         || list_marker(rest).is_some()
@@ -410,6 +450,11 @@ fn scan_blocks_range(source: &str, lines: &[Line], start: usize) -> Vec<Block> {
             i = next;
         } else if list_marker(rest).is_some() {
             let (block, next) = build_list(source, lines, i);
+            blocks.push(block);
+            i = next;
+        } else if let Some(fence) = math_fence_open(rest) {
+            // 显示公式块 `$$…$$`（D34）：放在引用/列表之后，`> $$` 仍归引用
+            let (block, next) = build_math_block(source, lines, i, fence);
             blocks.push(block);
             i = next;
         } else {
@@ -482,20 +527,92 @@ fn build_fenced_code(
             i += 1;
             break;
         }
-        // 代码内容按原样（content == start，无容器前缀）
-        spans.push(SyntaxSpan::text(l.start..l.end, SpanRole::CodeContent));
+        // 代码内容从 `l.content` 起算（剥掉 `> `、列表缩进等容器前缀，
+        // 否则前缀会串进可见文本、序列化时又被 prefix_lines 重复加一遍）
+        spans.push(SyntaxSpan::text(l.content..l.end, SpanRole::CodeContent));
         last_end = l.end;
         i += 1;
     }
     if let Some(c) = closed {
-        spans.push(SyntaxSpan::marker(c.start..c.end, SpanRole::FenceMarker));
+        spans.push(SyntaxSpan::marker(c.content..c.end, SpanRole::FenceMarker));
     }
     let kind = BlockKind::CodeBlock { lang, fenced: true };
     (Block::leaf(kind, open_line.start..last_end, spans), i)
 }
 
-/// 构造 GFM 表格；不是表格（或只有表头没有分隔行）时返回 `None`。
+/// 构造显示公式块 `$$…$$`；返回块与下一个待处理行号（D34 ①）。
 ///
+/// 片段约定：开栏/收栏 `$$` 记 `MathMarker`（隐藏），公式体逐行记 `Math`（可见），
+/// **换行不进片段**——序列化按片段间隙里的换行回补（与代码块同一约定）。
+/// 片段一律从 `line.content` 起算（剥掉 `> `、列表标记等容器前缀），
+/// 这样引用/列表项里的公式既不会把前缀吞进可见文本，序列化时也不会重复加前缀。
+/// 开栏/收栏行上多出来的文字（如 `$$a$$ 后缀`）另存为可见的普通文本，保证无损往返。
+fn build_math_block(
+    source: &str,
+    lines: &[Line],
+    open_idx: usize,
+    fence: MathFence,
+) -> (Block, usize) {
+    let open_line = lines[open_idx];
+    let ind = indent(open_line.rest(source));
+    // 开栏标记只覆盖缩进 + `$$`；其后的行内文字交由下面的可见文本片段
+    let body_start = open_line.content + ind + 2;
+    let mut spans = vec![SyntaxSpan::marker(
+        open_line.content..body_start,
+        SpanRole::MathMarker,
+    )];
+    let mut last_end = open_line.end;
+    let mut i = open_idx + 1;
+    match fence {
+        MathFence::Single(body) => {
+            let content_end = body_start + body;
+            if body_start < content_end {
+                spans.push(SyntaxSpan::text(body_start..content_end, SpanRole::Math));
+            }
+            // 收栏 `$$`：只到公式体结束，行尾其余文字不隐藏
+            spans.push(SyntaxSpan::marker(
+                content_end..content_end + 2,
+                SpanRole::MathMarker,
+            ));
+            if content_end + 2 < open_line.end {
+                spans.push(SyntaxSpan::text(
+                    content_end + 2..open_line.end,
+                    SpanRole::Normal,
+                ));
+            }
+        }
+        MathFence::Multi => {
+            if body_start < open_line.end {
+                // 开栏行 `$$` 之后还有文字（如 `$$x` 或 `$$a$$ 后缀`）：保持可见
+                spans.push(SyntaxSpan::text(
+                    body_start..open_line.end,
+                    SpanRole::Normal,
+                ));
+            }
+            while i < lines.len() {
+                let l = lines[i];
+                if is_math_close(l.rest(source)) {
+                    spans.push(SyntaxSpan::marker(l.content..l.end, SpanRole::MathMarker));
+                    last_end = l.end;
+                    i += 1;
+                    break;
+                }
+                // 空行不产出片段（片段间隙里的多个换行足以还原空行）
+                if l.content < l.end {
+                    spans.push(SyntaxSpan::text(l.content..l.end, SpanRole::Math));
+                }
+                last_end = l.end;
+                i += 1;
+            }
+        }
+    }
+    (
+        Block::leaf(BlockKind::MathBlock, open_line.start..last_end, spans),
+        i,
+    )
+}
+
+/// 构造 GFM 表格；不是表格（或只有表头没有分隔行）时返回 `None`。///
 /// 表格三要素（缺一不可）：
 /// 1. 表头行：含未转义的 `|`；
 /// 2. 分隔行：`|---|---|` / `| :-: |` 形式，列数决定列数与对齐；
@@ -1386,5 +1503,265 @@ mod frontmatter_tests {
         let src = "---\n---\n正文\n";
         let out = to_md(src);
         assert_eq!(out, src);
+    }
+}
+
+#[cfg(test)]
+mod nested_prefix_tests {
+    use super::*;
+    use crate::serialize::to_md;
+
+    /// 取某角色片段的源文本切片（用于断言前缀是否串进片段）。
+    fn role_texts<'a>(src: &'a str, b: &Block, role: SpanRole) -> Vec<&'a str> {
+        b.spans
+            .iter()
+            .filter(|s| s.role == role)
+            .map(|s| &src[s.range.clone()])
+            .collect()
+    }
+
+    #[test]
+    fn quote_code_content_excludes_quote_prefix() {
+        // 片段一律从 `line.content` 起算，否则 `> ` 会串进代码文本
+        let src = "> ```\n> x\n> ```\n";
+        let code = &parse(src)[0].children[0];
+        assert_eq!(role_texts(src, code, SpanRole::CodeContent), vec!["x"]);
+        assert_eq!(
+            role_texts(src, code, SpanRole::FenceMarker),
+            vec!["```", "```"]
+        );
+    }
+
+    #[test]
+    fn list_code_content_excludes_item_indent() {
+        let src = "- ```\n  x\n  ```\n";
+        let item = &parse(src)[0].children[0];
+        let code = &item.children[0];
+        assert_eq!(role_texts(src, code, SpanRole::CodeContent), vec!["x"]);
+        assert_eq!(
+            role_texts(src, code, SpanRole::FenceMarker),
+            vec!["```", "```"]
+        );
+    }
+
+    #[test]
+    fn nested_code_roundtrip() {
+        for src in [
+            "> ```\n> x\n> ```\n",
+            "- ```\n  x\n  ```\n",
+            "- para\n  ```\n  x\n  ```\n",
+        ] {
+            assert_eq!(to_md(src), src, "roundtrip {src:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod math_tests {
+    use super::*;
+    use crate::serialize::to_md;
+    use crate::span::{SpanKind, visible_runs};
+
+    /// 取块内片段的 `(kind, role, 源文本)`，逐条断言片段契约。
+    fn parts<'a>(src: &'a str, b: &Block) -> Vec<(SpanKind, SpanRole, &'a str)> {
+        b.spans
+            .iter()
+            .map(|s| (s.kind, s.role, &src[s.range.clone()]))
+            .collect()
+    }
+
+    #[test]
+    fn single_line_math_block() {
+        let src = "$$E=mc^2$$\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::MathBlock);
+        assert_eq!(&src[blocks[0].range.clone()], "$$E=mc^2$$");
+        assert_eq!(
+            parts(src, &blocks[0]),
+            vec![
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Math, "E=mc^2"),
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+            ]
+        );
+        // 定界符隐藏，公式体可见
+        assert_eq!(visible_runs(&blocks[0].spans), vec![2..8]);
+    }
+
+    #[test]
+    fn multiline_math_block() {
+        let src = "$$\na + b\n$$\ntail\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::MathBlock);
+        assert_eq!(&src[blocks[0].range.clone()], "$$\na + b\n$$");
+        assert_eq!(
+            parts(src, &blocks[0]),
+            vec![
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Math, "a + b"),
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+            ]
+        );
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(
+            visible_runs(&blocks[0].spans),
+            vec![3..8],
+            "可见文本只有公式体"
+        );
+    }
+
+    #[test]
+    fn unclosed_math_block_runs_to_end() {
+        // 未闭合：延伸到文档末尾（与未闭合围栏同规则）
+        let src = "$$\nx + y\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::MathBlock);
+        assert_eq!(&src[blocks[0].range.clone()], "$$\nx + y");
+        assert_eq!(
+            parts(src, &blocks[0]),
+            vec![
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Math, "x + y"),
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_double_dollar_opens_multiline() {
+        // `$$` 单独成行 → 多行开栏（同行为下也未闭合）
+        let src = "$$\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::MathBlock);
+        assert_eq!(
+            parts(src, &blocks[0]),
+            vec![(SpanKind::Marker, SpanRole::MathMarker, "$$")]
+        );
+    }
+
+    #[test]
+    fn math_block_blank_line_inside() {
+        let src = "$$\na\n\nb\n$$\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::MathBlock);
+        // 空行不产出片段，但可见文本保留两段
+        assert_eq!(
+            parts(src, &blocks[0])
+                .into_iter()
+                .filter(|p| p.1 == SpanRole::Math)
+                .map(|p| p.2)
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn math_block_indent_limit() {
+        // 缩进 ≤3 仍是公式块
+        let indented = parse("   $$\n   x\n   $$\n");
+        assert_eq!(indented[0].kind, BlockKind::MathBlock);
+        assert_eq!(
+            parts("   $$\n   x\n   $$\n", &indented[0])[1],
+            (SpanKind::Text, SpanRole::Math, "   x")
+        );
+        // 4 空格缩进 → 普通段落（不是公式块）
+        let deep = parse("    $$\n    x\n");
+        assert!(deep.iter().all(|b| b.kind != BlockKind::MathBlock));
+    }
+
+    #[test]
+    fn math_block_interrupts_paragraph() {
+        let src = "前文\n$$\nx\n$$\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[1].kind, BlockKind::MathBlock);
+    }
+
+    #[test]
+    fn single_line_with_trailing_text_stays_visible() {
+        // 行尾还有文字：公式仍是单行块，其余文字保持可见（无损往返）
+        let src = "$$a$$ 后缀\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::MathBlock);
+        assert_eq!(
+            parts(src, &blocks[0]),
+            vec![
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Math, "a"),
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Normal, " 后缀"),
+            ]
+        );
+        assert_eq!(to_md(src), src);
+    }
+
+    #[test]
+    fn math_block_in_quote_strips_prefix() {
+        let src = "> $$\n> x\n> $$\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::BlockQuote);
+        let math = &blocks[0].children[0];
+        assert_eq!(math.kind, BlockKind::MathBlock);
+        assert_eq!(
+            parts(src, math),
+            vec![
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Math, "x"),
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+            ],
+            "片段不得把 `> ` 前缀算进去"
+        );
+    }
+
+    #[test]
+    fn math_block_in_list_strips_marker() {
+        let src = "- $$\n  x\n  $$\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].kind,
+            BlockKind::List {
+                ordered: false,
+                start: 1
+            }
+        );
+        let item = &blocks[0].children[0];
+        let math = &item.children[0];
+        assert_eq!(math.kind, BlockKind::MathBlock);
+        assert_eq!(
+            parts(src, math),
+            vec![
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+                (SpanKind::Text, SpanRole::Math, "x"),
+                (SpanKind::Marker, SpanRole::MathMarker, "$$"),
+            ],
+            "片段不得把列表标记/缩进算进去"
+        );
+    }
+
+    #[test]
+    fn math_block_roundtrip() {
+        for src in [
+            "$$E=mc^2$$\n",
+            "$$\na + b\n$$\n",
+            "$$\nx\n",       // 未闭合
+            "$$\n\ny\n$$\n", // 公式体中的空行
+            "   $$\n   x\n   $$\n",
+            "$$a$$ 后缀\n",
+            "> $$\n> x\n> $$\n",
+            "- $$\n  x\n  $$\n",
+            "前文\n\n$$\na\n$$\n\n后文\n",
+        ] {
+            assert_eq!(to_md(src), src, "roundtrip {src:?}");
+            // 幂等：再解析再序列化仍一致
+            assert_eq!(to_md(&to_md(src)), to_md(src), "idempotent {src:?}");
+        }
     }
 }

@@ -73,6 +73,13 @@ pub enum SpanRole {
     HardBreak,
     /// 转义反斜杠。
     EscapeMarker,
+    /// 行内公式 `$` 定界符（渲染时隐藏，D34）。
+    MathMarker,
+    /// 行内/块级公式体（TeX 源文本，**可见**，D34）。
+    ///
+    /// 可见的理由：公式尚未接入真排版（`ratex-*`），若整段当 Widget 隐藏，
+    /// 编辑区会凭空"丢字"；保留可见文本由 UI 用 `RunStyle::Math` 标注。
+    Math,
 }
 
 /// 覆盖源文本一段字节区间的语法片段；区间端点必为字符边界。

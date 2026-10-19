@@ -143,7 +143,38 @@ fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
         }
         // 列表项由 List 分支统一渲染，这里只在异常输入下兜底
         BlockKind::ListItem { .. } => list_item_to_md(source, b, prefix, false, 1),
+        BlockKind::MathBlock => prefix_lines(&math_block_body(source, b), prefix),
     }
+}
+
+/// 拼回显示公式块的**可见文本**（D34）：跳过 `$$` 定界标记，片段之间的换行逐个补齐、
+/// 其它间隙字符（容器前缀如 `> `、末尾 `$$` 定界）丢弃——前缀由 [`prefix_lines`] 统一回补。
+///
+/// 单行公式（`$$a$$`）的片段间隙无换行，故原样补入（保留 `$$` 之后的可见行尾文字）。
+/// 结果保证以 `\n` 结尾，便于 `prefix_lines` 逐行补前缀。
+fn math_block_body(source: &str, b: &Block) -> String {
+    let mut body = String::new();
+    let mut prev_end: Option<usize> = None;
+    for sp in &b.spans {
+        if let Some(pe) = prev_end {
+            let gap = &source[pe..sp.range.start];
+            if gap.contains('\n') {
+                for c in gap.chars() {
+                    if c == '\n' {
+                        body.push('\n');
+                    }
+                }
+            } else {
+                body.push_str(gap);
+            }
+        }
+        body.push_str(&source[sp.range.clone()]);
+        prev_end = Some(sp.range.end);
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body
 }
 
 /// 渲染列表项：标记 + 首个段落同行，其余子块落在续行（缩进对齐内容起点）。
@@ -164,6 +195,24 @@ fn list_item_to_md(source: &str, item: &Block, prefix: &str, ordered: bool, numb
                     s.push_str(&cont);
                 }
                 s.push_str(line);
+            }
+            wrote_head = true;
+        } else if i == 0 {
+            // 首个子块不是段落（代码块/公式块/嵌套引用…）：标记压在该块**首行**前，
+            // 其余行沿用续行缩进；否则标记会被甩到块尾，序列化出来的列表已损坏
+            let body = block_to_md(source, ch, &cont);
+            let mut lines = body.split_inclusive('\n');
+            if let Some(first) = lines.next() {
+                s.push_str(prefix);
+                s.push_str(&marker);
+                s.push_str(first.strip_prefix(&cont).unwrap_or(first));
+                for line in lines {
+                    s.push_str(line);
+                }
+            } else {
+                s.push_str(prefix);
+                s.push_str(&marker);
+                s.push('\n');
             }
             wrote_head = true;
         } else {
@@ -299,6 +348,8 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
             (SpanKind::Marker, SpanRole::SoftBreak) => out.push('\n'),
             (SpanKind::Marker, SpanRole::HardBreak) => out.push_str("  \n"),
             (SpanKind::Marker, SpanRole::EscapeMarker) => out.push('\\'),
+            // 行内公式定界符：每个片段恰是一个 `$`
+            (SpanKind::Marker, SpanRole::MathMarker) => out.push('$'),
             (SpanKind::Marker, SpanRole::InlineCode) => out.push('`'),
             (SpanKind::Marker, SpanRole::Strong) => out.push_str("**"),
             (SpanKind::Marker, SpanRole::Emphasis) => out.push('*'),

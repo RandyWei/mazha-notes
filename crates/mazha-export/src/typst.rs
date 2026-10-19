@@ -154,7 +154,42 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
         BlockKind::Table { align } => {
             table_to_typst(source, b, align, out);
         }
+        BlockKind::MathBlock => {
+            // 显示公式块（D34）：**字面量**原样输出。绝不用 Typst 的 `$…$`（那是数学
+            // 模式，`\frac` 等 LaTeX 命令会令 `typst::compile` 报错而让 PDF 导出失败，
+            // 见 R8），改用 raw 块围栏逐字保留源码。
+            let body = math_body(source, b);
+            let fence = "`".repeat(longest_backtick_run(&body).max(2) + 1);
+            out.push_str(&fence);
+            out.push('\n');
+            out.push_str(&body);
+            let _ = write!(out, "\n{fence}");
+        }
     }
+}
+
+/// 汇总公式块的可见文本（D34）：跳过 `$$` 定界标记，仅当片段之间的源文本含换行时补 `\n`。
+///
+/// 与序列化同规则：定界符与容器前缀（如 `> `）都落在片段间隙里，逐个还原源文本中的换行
+/// 即可保留公式的多行结构，又不掺入 `$$` 或 `> `。
+fn math_body(source: &str, block: &Block) -> String {
+    let mut body = String::new();
+    let mut prev_end: Option<usize> = None;
+    for sp in &block.spans {
+        if sp.kind != SpanKind::Text {
+            continue;
+        }
+        if let Some(prev) = prev_end {
+            for c in source[prev..sp.range.start].chars() {
+                if c == '\n' {
+                    body.push('\n');
+                }
+            }
+        }
+        body.push_str(&source[sp.range.clone()]);
+        prev_end = Some(sp.range.end);
+    }
+    body
 }
 
 /// 列表项：任务标记 + 内容。
@@ -288,6 +323,21 @@ fn table_rows_typst(source: &str, b: &Block) -> Vec<Vec<String>> {
     rows
 }
 
+/// 以「行内 raw」字面量输出一段原始文本（不解析 Typst 标记，也不吃反斜杠转义）。
+///
+/// 内容不含反引号时用单反引号围栏；含反引号时改用 `#raw("…")`（字符串可转义），
+/// 因为围栏会与内容粘成更长的反引号串 → 触发 unclosed raw text。
+fn push_inline_raw(out: &mut String, content: &str) {
+    if content.contains('`') {
+        let raw = escape_typst_string(content);
+        let _ = write!(out, "#raw(\"{raw}\")");
+    } else {
+        out.push('`');
+        out.push_str(content);
+        out.push('`');
+    }
+}
+
 /// 把一组行内片段转换为 Typst 标记。
 fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
     let mut i = 0usize;
@@ -299,6 +349,11 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
             (SpanKind::Text, SpanRole::Tag) => {
                 let text = escape_typst(&source[sp.range.clone()]);
                 let _ = write!(out, "#text(fill: blue)[{text}]");
+                i += 1;
+            }
+            // 行内公式体（D34）：字面量输出，不转义也不进数学模式（同 R8 的理由）
+            (SpanKind::Text, SpanRole::Math) => {
+                push_inline_raw(out, &source[sp.range.clone()]);
                 i += 1;
             }
             // 可见文本一律输出内容（样式由成对 Marker 开合），特殊字符转义
@@ -337,14 +392,7 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 for s in &spans[start..end] {
                     content.push_str(&source[s.range.clone()]);
                 }
-                if content.contains('`') {
-                    let raw = escape_typst_string(&content);
-                    let _ = write!(out, "#raw(\"{raw}\")");
-                } else {
-                    out.push('`');
-                    out.push_str(&content);
-                    out.push('`');
-                }
+                push_inline_raw(out, &content);
                 i = end + 1;
             }
             (SpanKind::Marker, SpanRole::LinkMarker) => {
@@ -604,5 +652,30 @@ mod tests {
     fn typst_strikethrough() {
         let t = to_typst("~~删~~\n");
         assert!(t.contains("#strike["));
+    }
+
+    // ---------- 公式（D34）：字面量输出，绝不用 Typst 数学模式 ----------
+
+    #[test]
+    fn typst_block_math_is_literal_raw() {
+        let t = to_typst("$$E=mc^2$$\n");
+        assert!(t.contains("E=mc^2"), "{t}");
+        // `$$` 定界符不输出；不能出现 Typst 数学模式
+        assert!(!t.contains('$'), "{t}");
+    }
+
+    #[test]
+    fn typst_block_math_keeps_latex_command_literal() {
+        // R8：`\frac` 等 LaTeX 命令必须逐字保留，否则 typst::compile 会报错
+        let t = to_typst("$$\n\\frac{a}{b}\n$$\n");
+        assert!(t.contains("\\frac{a}{b}"), "{t}");
+        assert!(!t.contains('$'), "{t}");
+    }
+
+    #[test]
+    fn typst_inline_math_is_raw_not_math_mode() {
+        let t = to_typst("当 $x^2$ 时\n");
+        assert!(t.contains("`x^2`"), "{t}");
+        assert!(!t.contains('$'), "{t}");
     }
 }

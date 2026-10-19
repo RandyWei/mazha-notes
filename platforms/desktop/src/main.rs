@@ -225,6 +225,14 @@ enum WidgetDecorKind {
     Table,
     /// 分割线：一条水平细线。
     Rule,
+    /// 显示公式块（D34）：外框（公式体文字自身为斜体主题色）。
+    Math,
+    /// 图表块（如 mermaid，D34）：弱底 + 外框 + 右上角语言标签。
+    /// 真正的图表渲染（mermaid → SVG）属渲染层后续（风险 R4），此处只画占位面板。
+    Chart {
+        /// 语言标签（如 `mermaid`；已 shape，直接 paint）。装箱以避免枚举变体过大。
+        label: Option<Box<ShapedLine>>,
+    },
 }
 
 impl DocLayout {
@@ -1823,6 +1831,11 @@ fn to_gpui_run(
             color = palette.accent;
             background = Some(palette.subtle);
         }
+        // 行内公式体（D34 ④）：斜体 + 主题色，与普通文本区分
+        RunStyle::Math => {
+            font = font.italic();
+            color = palette.accent;
+        }
         RunStyle::LinkText => {
             color = palette.link;
             underline = Some(UnderlineStyle {
@@ -1990,6 +2003,26 @@ fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
     x
 }
 
+/// 在装饰面板右上角画语言标签（代码块/图表共用）：距右边框 6px、距上边框 3px。
+fn paint_corner_label(
+    label: &ShapedLine,
+    right: Pixels,
+    top: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let lx = right - label.width() - px(6.);
+    let ly = top + px(3.);
+    let _ = label.paint(
+        point(lx, ly),
+        LINE_HEIGHT - px(6.),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
 /// 用四条 1px 矩形描出一个矩形边框（gpui 的 `paint_quad` 只有填充，故四边各画一条）。
 fn paint_rect_border(window: &mut Window, rect: Bounds<Pixels>, color: Hsla, thickness: Pixels) {
     let Bounds {
@@ -2114,29 +2147,34 @@ impl Element for DocElement {
                         .lines
                         .get(w.line_range.start)
                         .map_or(indent_base, |l| block_indent(l, indent_base));
+                    // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画（代码块/图表共用）
+                    let shape_label = |lang: &str| {
+                        let run = gpui::TextRun {
+                            len: lang.len(),
+                            font: mono_font.clone(),
+                            color: palette.muted,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        Box::new(window.text_system().shape_line(
+                            lang.to_string().into(),
+                            mono_size,
+                            &[run],
+                            None,
+                        ))
+                    };
                     let kind = match &w.kind {
-                        BlockWidgetKind::Code { lang, .. } => {
-                            // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画
-                            let label = lang.as_ref().map(|l| {
-                                let run = gpui::TextRun {
-                                    len: l.len(),
-                                    font: mono_font.clone(),
-                                    color: palette.muted,
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                Box::new(window.text_system().shape_line(
-                                    l.clone().into(),
-                                    mono_size,
-                                    &[run],
-                                    None,
-                                ))
-                            });
-                            WidgetDecorKind::Code { label }
-                        }
+                        BlockWidgetKind::Code { lang, .. } => WidgetDecorKind::Code {
+                            label: lang.as_deref().map(shape_label),
+                        },
+                        // 图表块（mermaid 等）：同样画语言标签，便于用户知道该块的语言
+                        BlockWidgetKind::Chart { lang } => WidgetDecorKind::Chart {
+                            label: Some(shape_label(lang)),
+                        },
                         BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
                         BlockWidgetKind::Rule => WidgetDecorKind::Rule,
+                        BlockWidgetKind::Math => WidgetDecorKind::Math,
                     };
                     WidgetDecor {
                         kind,
@@ -2297,17 +2335,20 @@ impl Element for DocElement {
                     WidgetDecorKind::Code { label } if !w.editing => {
                         paint_rect_border(window, rect, palette.border, px(1.));
                         if let Some(label) = label {
-                            let lx = right - label.width() - px(6.);
-                            let ly = top + px(3.);
-                            let _ = label.paint(
-                                point(lx, ly),
-                                LINE_HEIGHT - px(6.),
-                                TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            );
+                            paint_corner_label(label, right, top, window, cx);
                         }
+                    }
+                    // 图表块：弱底 + 外框 + 右上角语言标签（真渲染留渲染层，R4）
+                    WidgetDecorKind::Chart { label } if !w.editing => {
+                        window.paint_quad(fill(rect, palette.subtle));
+                        paint_rect_border(window, rect, palette.border, px(1.));
+                        if let Some(label) = label {
+                            paint_corner_label(label, right, top, window, cx);
+                        }
+                    }
+                    // 显示公式：整体描边（公式体文字自身为斜体主题色）
+                    WidgetDecorKind::Math if !w.editing => {
+                        paint_rect_border(window, rect, palette.border, px(1.));
                     }
                     // 表格：弱底填充 + 外框 + 每逻辑行之间的水平分隔线
                     WidgetDecorKind::Table if !w.editing => {
