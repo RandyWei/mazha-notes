@@ -67,6 +67,7 @@ fn try_construct(source: &str, s: &str, base: usize, i: usize) -> Option<(usize,
         b'$' => inline_math(source, s, base, i),
         b'!' if bytes.get(i + 1) == Some(&b'[') => image(source, base, bytes, i),
         b'[' if bytes.get(i + 1) == Some(&b'[') => wiki_link(source, base, bytes, i),
+        b'[' if bytes.get(i + 1) == Some(&b'^') => footnote_ref(base, bytes, i),
         b'[' => link(source, base, bytes, i),
         b'<' => autolink(base, s, i),
         b'#' => tag(base, bytes, i),
@@ -318,6 +319,35 @@ fn find_close(bytes: &[u8], from: usize) -> Option<usize> {
         j += 1;
     }
     None
+}
+
+/// 脚注引用：`[^label]`（SPEC D35 ①）。
+///
+/// `[^` 与 `]` 是隐藏标记（`FootnoteMarker`），label 是**可见文本**（`FootnoteRef`，
+/// UI 用 `RunStyle::Footnote` 标注）。label 非空且不含空白与 `]`；标签紧跟 `(` 时
+/// 让位给普通链接（`[^1](x)` 是"文字为 `^1` 的链接"，与 GFM 一致）。
+fn footnote_ref(base: usize, bytes: &[u8], i: usize) -> Option<(usize, Vec<SyntaxSpan>)> {
+    let label_start = i + 2;
+    let mut j = label_start;
+    while j < bytes.len() && bytes[j] != b']' {
+        if bytes[j] == b'[' || bytes[j].is_ascii_whitespace() {
+            return None;
+        }
+        j += 1;
+    }
+    if j >= bytes.len() || j == label_start {
+        return None;
+    }
+    // `[^1](…)`：让给链接分支
+    if bytes.get(j + 1) == Some(&b'(') {
+        return None;
+    }
+    let spans = vec![
+        SyntaxSpan::marker(base + i..base + label_start, SpanRole::FootnoteMarker),
+        SyntaxSpan::text(base + label_start..base + j, SpanRole::FootnoteRef),
+        SyntaxSpan::marker(base + j..base + j + 1, SpanRole::FootnoteMarker),
+    ];
+    Some((j + 1 - i, spans))
 }
 
 /// 链接：`[text](dest)`；text 递归解析，URL 隐藏。

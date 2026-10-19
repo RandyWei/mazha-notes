@@ -62,6 +62,15 @@ pub enum BlockKind {
     /// 公式体记 `SpanRole::Math`（可见），两端 `$$` 记 `SpanRole::MathMarker`（隐藏）。
     /// 行内公式 `$…$` 不产生块，只是段落里的片段。
     MathBlock,
+    /// 脚注定义块（行首 `[^label]: body`，缩进 ≥4 的续行归入本块；D35）。
+    ///
+    /// `label` 是脚注标签（引用 `[^label]` 与之对应）。片段：`[^` 与 `]:` 记
+    /// `SpanRole::FootnoteMarker`（隐藏）、label 记 `SpanRole::FootnoteRef`（可见）、
+    /// 正文按行内语法解析。行内引用 `[^label]` 不产生块，只是段落里的片段。
+    FootnoteDef {
+        /// 脚注标签（不含 `[^` 与 `]`）。
+        label: String,
+    },
 }
 
 /// 表格列对齐方式（GFM 分隔行 `:--` / `:-:` / `--:` 决定）。

@@ -92,7 +92,10 @@ fn render_blocks(
 /// 渲染单个块。
 fn render_block(source: &str, block: &Block, depth: usize, out: &mut Vec<BodyContent<'static>>) {
     match &block.kind {
-        BlockKind::Paragraph => {
+        // 脚注定义（D35 ④）与普通段落渲染相同：标签与正文都是纯文本
+        // （docx-rs 1.1 无上标 API，标签不做上标处理），`[^label]:` 标记由
+        // inline_content 的兜底忽略。
+        BlockKind::Paragraph | BlockKind::FootnoteDef { .. } => {
             out.push(text_paragraph(source, &block.spans, &BaseStyle::default()));
         }
         BlockKind::Heading { level } => out.push(heading_paragraph(source, &block.spans, *level)),
@@ -811,5 +814,29 @@ mod tests {
             panic!("应为段落");
         };
         assert_eq!(paragraph_text(p), "当 x^2 时", "`$` 定界符隐藏");
+    }
+
+    // ---------- 脚注（D35）：纯文本（docx-rs 1.1 无上标 API） ----------
+
+    #[test]
+    fn docx_footnote_ref_is_plain_label() {
+        let out = render("见[^1]处\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "见1处", "`[^`/`]` 隐藏，标签为纯文本");
+    }
+
+    #[test]
+    fn docx_footnote_def_is_plain_paragraph() {
+        let out = render("[^1]: note\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(
+            paragraph_text(p),
+            "1 note",
+            "`[^label]:` 隐藏，标签与正文可见"
+        );
     }
 }

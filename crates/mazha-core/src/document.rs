@@ -1210,7 +1210,7 @@ mod tests {
         let src = concat!(
             "---\ntitle: 集成\n---\n",
             "# 标题\n\n",
-            "段落 **粗** *斜* ~~删~~ `码` [链接](https://x.com) [[Page|别名]]\n\n",
+            "段落 **粗** *斜* ~~删~~ `码` [链接](https://x.com) [[Page|别名]] 脚注[^1]\n\n",
             "> [!NOTE]\n> 提示内容\n\n",
             "> 普通引用\n\n",
             "- 列表项\n- [x] 任务\n\n",
@@ -1218,6 +1218,7 @@ mod tests {
             "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n",
             "```rust\nfn main() {}\n```\n\n",
             "$$E=mc^2$$\n\n",
+            "[^1]: 脚注正文\n\n",
             "---\n\n",
             "![图](img.png)\n",
         );
@@ -1238,6 +1239,7 @@ mod tests {
                 mazha_md::BlockKind::Table { .. } => "table",
                 mazha_md::BlockKind::CodeBlock { .. } => "code",
                 mazha_md::BlockKind::MathBlock => "math",
+                mazha_md::BlockKind::FootnoteDef { .. } => "footnote",
                 mazha_md::BlockKind::ThematicBreak => "hr",
                 mazha_md::BlockKind::ListItem { .. } => "list-item",
             })
@@ -1252,6 +1254,7 @@ mod tests {
             "table",
             "code",
             "math",
+            "footnote",
             "hr",
         ] {
             assert!(

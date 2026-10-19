@@ -380,12 +380,74 @@ fn is_math_close(rest: &str) -> bool {
     ind <= 3 && rest[ind..].trim_end() == "$$"
 }
 
+/// 脚注定义行的解析结果（SPEC D35 ②），偏移都相对该行的 `rest`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FootnoteDefHead {
+    /// 脚注标签（`[^` 与 `]:` 之间）。
+    label: String,
+    /// `[^` 起点。
+    marker_start: usize,
+    /// 标签起点。
+    label_start: usize,
+    /// 标签终点（即 `]` 的位置）。
+    label_end: usize,
+    /// 正文起点（`]:` + 至多一个空格的之后）。
+    body_start: usize,
+}
+
+/// 脚注定义续行需要的缩进宽度（SPEC D35 ②）：恰好剥离 4 空格。
+const FN_CONT_INDENT: usize = 4;
+
+/// 识别脚注定义行 `[^label]: body`（缩进 ≤3；SPEC D35 ②）。
+///
+/// label 非空且不含空白与 `]`；`]` 之后必须紧跟 `:`（`[^a]`、`[^a]x` 都不算定义，
+/// 避免把普通段落误判为脚注）。`:` 之后的空格归**可见正文**（见下），故
+/// `[^1]:   x` 的多余空格也能逐字节往返。
+fn footnote_def_open(rest: &str) -> Option<FootnoteDefHead> {
+    let ind = indent(rest);
+    if ind > 3 || !rest[ind..].starts_with("[^") {
+        return None;
+    }
+    let label_start = ind + 2;
+    let mut i = label_start;
+    // 扫到 `]`；label 内不允许空白（多字节字符的后续字节都 ≥ 0x80，不会误判为 `]`）
+    while i < rest.len() && rest.as_bytes()[i] != b']' {
+        if rest.as_bytes()[i].is_ascii_whitespace() {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= rest.len() {
+        return None;
+    }
+    let label_end = i;
+    if label_end == label_start {
+        return None;
+    }
+    // `]:`
+    if rest.as_bytes().get(label_end + 1) != Some(&b':') {
+        return None;
+    }
+    let after_colon = label_end + 2;
+    // `:` 之后的空格**留在可见正文**（不并入标记）：既保证 `[^1]: note` 逐字节往返，
+    // 也让编辑区显示为「1 note」而不是「1note」。
+    let body_start = after_colon;
+    Some(FootnoteDefHead {
+        label: rest[label_start..label_end].to_string(),
+        marker_start: ind,
+        label_start,
+        label_end,
+        body_start,
+    })
+}
+
 /// 该行是否开启一个新的非段落块（用于段落终止判断）。
 fn starts_new_block(source: &str, line: Line) -> bool {
     let rest = line.rest(source);
     atx_heading(rest).is_some()
         || fence_open(rest).is_some()
         || math_fence_open(rest).is_some()
+        || footnote_def_open(rest).is_some()
         || is_thematic_break(rest)
         || quote_prefix(rest).is_some()
         || list_marker(rest).is_some()
@@ -438,6 +500,12 @@ fn scan_blocks_range(source: &str, lines: &[Line], start: usize) -> Vec<Block> {
             i += 1;
         } else if let Some((ch, len, lang)) = fence_open(rest) {
             let (block, next) = build_fenced_code(source, lines, i, ch, len, lang);
+            blocks.push(block);
+            i = next;
+        } else if let Some(head) = footnote_def_open(rest) {
+            // 脚注定义 `[^label]: body`（D35）：放在表格之前，避免
+            // `[^1]: a | b` 这类正文里的竖线被表格识别抢先
+            let (block, next) = build_footnote_def(source, lines, i, &head);
             blocks.push(block);
             i = next;
         } else if let Some((block, next)) = build_table(source, lines, i) {
@@ -943,6 +1011,63 @@ fn marker_role(marker: &ListMarker) -> SpanRole {
     } else {
         SpanRole::ListMarker
     }
+}
+
+/// 构造脚注定义块 `[^label]: body`（SPEC D35 ②）。
+///
+/// 片段布局固定为「标记 `[^` | 标签（可见）| 标记 `]:`（含至多一个空格）| 正文」，
+/// 正文按行内语法解析。**续行**仅吸收缩进 ≥4 空格的非空行（剥离至多 4 空格），
+/// 空行或缩进 ≤3 的行即结束定义（不支持多段落定义，留后续）。
+fn build_footnote_def(
+    source: &str,
+    lines: &[Line],
+    start_idx: usize,
+    head: &FootnoteDefHead,
+) -> (Block, usize) {
+    let l = lines[start_idx];
+    let abs = |rel: usize| l.content + rel;
+    let mut spans = vec![
+        SyntaxSpan::marker(
+            abs(head.marker_start)..abs(head.label_start),
+            SpanRole::FootnoteMarker,
+        ),
+        SyntaxSpan::text(
+            abs(head.label_start)..abs(head.label_end),
+            SpanRole::FootnoteRef,
+        ),
+        SyntaxSpan::marker(
+            abs(head.label_end)..abs(head.body_start),
+            SpanRole::FootnoteMarker,
+        ),
+    ];
+    // 正文行：首行从 `body_start` 起，续行剥离至多 4 空格（与列表项续行同规则）
+    let mut body = vec![Line {
+        start: l.start,
+        end: l.end,
+        content: abs(head.body_start),
+    }];
+    let mut i = start_idx + 1;
+    while i < lines.len() {
+        let nl = lines[i];
+        let nrest = nl.rest(source);
+        // 续行必须缩进 ≥4；只剥离恰好 4 空格，**多余的缩进留在可见文本里**
+        // （序列化侧对称地补 4 空格，故任意缩进都能逐字节往返）
+        if is_blank(nrest) || indent(nrest) < FN_CONT_INDENT {
+            break;
+        }
+        body.push(Line {
+            start: nl.start,
+            end: nl.end,
+            content: (nl.content + FN_CONT_INDENT).min(nl.end),
+        });
+        i += 1;
+    }
+    spans.extend(paragraph_spans(source, &body));
+    let range = l.start..body.last().map_or(l.end, |x| x.end);
+    let kind = BlockKind::FootnoteDef {
+        label: head.label.clone(),
+    };
+    (Block::leaf(kind, range, spans), i)
 }
 
 /// 构造段落；若其后紧跟 Setext 下划线，则升级为标题。
@@ -1761,6 +1886,251 @@ mod math_tests {
         ] {
             assert_eq!(to_md(src), src, "roundtrip {src:?}");
             // 幂等：再解析再序列化仍一致
+            assert_eq!(to_md(&to_md(src)), to_md(src), "idempotent {src:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod footnote_tests {
+    use super::*;
+    use crate::serialize::to_md;
+    use crate::span::SpanKind;
+
+    /// 取块内片段的 `(kind, role, 源文本)`，逐条断言片段契约。
+    fn parts<'a>(src: &'a str, b: &Block) -> Vec<(SpanKind, SpanRole, &'a str)> {
+        b.spans
+            .iter()
+            .map(|s| (s.kind, s.role, &src[s.range.clone()]))
+            .collect()
+    }
+
+    /// 首个块。
+    fn block(src: &str) -> Block {
+        parse(src).into_iter().next().expect("至少一个块")
+    }
+
+    /// 块内全部可见（Text）片段拼接。
+    fn visible_text(src: &str, b: &Block) -> String {
+        let mut out = String::new();
+        for s in &b.spans {
+            if s.kind == SpanKind::Text {
+                out.push_str(&src[s.range.clone()]);
+            }
+        }
+        out
+    }
+
+    /// 第一个脚注定义块。
+    fn footnote_def(src: &str) -> Block {
+        parse(src)
+            .into_iter()
+            .find(|b| matches!(b.kind, BlockKind::FootnoteDef { .. }))
+            .unwrap_or_else(|| panic!("应解析出脚注定义：{src:?}"))
+    }
+
+    #[test]
+    fn footnote_ref_spans() {
+        // `[^` 与 `]` 隐藏，label 可见（D35 ①）
+        let src = "见 [^1] 处。\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::Paragraph);
+        assert!(parts(src, &b).contains(&(SpanKind::Marker, SpanRole::FootnoteMarker, "[^")));
+        assert!(parts(src, &b).contains(&(SpanKind::Text, SpanRole::FootnoteRef, "1")));
+        assert!(parts(src, &b).contains(&(SpanKind::Marker, SpanRole::FootnoteMarker, "]")));
+        assert_eq!(visible_text(src, &b), "见 1 处。");
+    }
+
+    #[test]
+    fn footnote_ref_cjk_label() {
+        let src = "正文[^注1]\n";
+        let b = block(src);
+        assert!(parts(src, &b).contains(&(SpanKind::Text, SpanRole::FootnoteRef, "注1")));
+        assert_eq!(visible_text(src, &b), "正文注1");
+    }
+
+    #[test]
+    fn footnote_ref_rejects_malformed() {
+        // 空标签、含空白、未闭合、以及 `[^1](url)`（让位给链接）都不算脚注引用
+        for src in ["[^]\n", "[^a b]\n", "[^abc\n", "x [^1](https://e.com) y\n"] {
+            let b = block(src);
+            assert!(
+                b.spans.iter().all(|s| s.role != SpanRole::FootnoteRef),
+                "{src:?} 不应产生脚注引用：{:#?}",
+                b.spans
+            );
+        }
+    }
+
+    #[test]
+    fn footnote_ref_inside_link_text() {
+        // `[见 [^1]](url)` 这类嵌套括号仍不支持整体成链（既有局限），
+        // 但其中的 `[^1]` 会按脚注引用切分（label 可见、`[^`/`]` 隐藏）
+        let src = "[见 [^1]](https://e.com)\n";
+        let b = block(src);
+        assert!(b.spans.iter().any(|s| s.role == SpanRole::FootnoteRef));
+        assert!(b.spans.iter().all(|s| s.role != SpanRole::LinkDest));
+    }
+
+    #[test]
+    fn footnote_def_block_spans() {
+        let src = "[^1]: note\n";
+        let b = footnote_def(src);
+        assert_eq!(b.kind, BlockKind::FootnoteDef { label: "1".into() });
+        assert_eq!(
+            parts(src, &b),
+            vec![
+                (SpanKind::Marker, SpanRole::FootnoteMarker, "[^"),
+                (SpanKind::Text, SpanRole::FootnoteRef, "1"),
+                (SpanKind::Marker, SpanRole::FootnoteMarker, "]:"),
+                (SpanKind::Text, SpanRole::Normal, " note"),
+            ]
+        );
+        // 可见文本 = 标签 + 正文（两者都可见，避免"丢字"）
+        assert_eq!(visible_text(src, &b), "1 note");
+    }
+
+    #[test]
+    fn footnote_def_without_space_and_empty_body() {
+        let src = "[^a]:x\n";
+        let b = footnote_def(src);
+        assert_eq!(parts(src, &b).last().unwrap().2, "x");
+        let src = "[^a]:\n";
+        let b = footnote_def(src);
+        assert_eq!(b.kind, BlockKind::FootnoteDef { label: "a".into() });
+        assert_eq!(visible_text(src, &b), "a");
+    }
+
+    #[test]
+    fn footnote_def_keeps_extra_spaces() {
+        // `:` 后的空格归可见正文，故多余空格与"无空格"两种写法都能逐字节往返
+        let src = "[^1]:  x\n";
+        let b = footnote_def(src);
+        assert_eq!(parts(src, &b).last().unwrap().2, "  x");
+        assert_eq!(to_md(src), src);
+        assert_eq!(to_md("[^1]:x\n"), "[^1]:x\n");
+    }
+
+    #[test]
+    fn footnote_def_continuation_lines() {
+        // 缩进 ≥4 的续行归入定义（剥离至多 4 空格），行间是隐藏的软换行标记
+        let src = "[^a]: first\n    second\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::FootnoteDef { label: "a".into() });
+        assert_eq!(
+            parts(src, &blocks[0]),
+            vec![
+                (SpanKind::Marker, SpanRole::FootnoteMarker, "[^"),
+                (SpanKind::Text, SpanRole::FootnoteRef, "a"),
+                (SpanKind::Marker, SpanRole::FootnoteMarker, "]:"),
+                (SpanKind::Text, SpanRole::Normal, " first"),
+                (SpanKind::Marker, SpanRole::SoftBreak, "\n"),
+                (SpanKind::Text, SpanRole::Normal, "second"),
+            ]
+        );
+    }
+
+    #[test]
+    fn footnote_def_ends_at_unindented_line() {
+        // 缩进 ≤3 的行结束定义（不吸收惰性续行）
+        let src = "[^a]: first\nsecond\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert!(matches!(blocks[0].kind, BlockKind::FootnoteDef { .. }));
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(visible_text(src, &blocks[1]), "second");
+    }
+
+    #[test]
+    fn footnote_def_ends_at_blank_line() {
+        let src = "[^a]: first\n\n    second\n";
+        let blocks = parse(src);
+        assert!(matches!(blocks[0].kind, BlockKind::FootnoteDef { .. }));
+        assert_eq!(visible_text(src, &blocks[0]), "a first");
+    }
+
+    #[test]
+    fn footnote_def_indent_limit() {
+        // 缩进 4 空格不再是定义（会落到缩进代码块/段落路径）
+        let b = block("    [^1]: x\n");
+        assert!(!matches!(b.kind, BlockKind::FootnoteDef { .. }));
+    }
+
+    #[test]
+    fn footnote_def_requires_colon() {
+        // `[^1]` 后无 `:` 仍是普通段落（避免误判）
+        let b = block("[^1] text\n");
+        assert_eq!(b.kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn footnote_def_interrupts_paragraph() {
+        let blocks = parse("前文\n[^1]: note\n");
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert!(matches!(blocks[1].kind, BlockKind::FootnoteDef { .. }));
+    }
+
+    #[test]
+    fn footnote_def_stops_before_next_def() {
+        // 无缩进的第二个定义另起一块，不被吸收为首个定义的正文
+        let blocks = parse("[^1]: a\n[^2]: b\n");
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::FootnoteDef { label: "1".into() });
+        assert_eq!(blocks[1].kind, BlockKind::FootnoteDef { label: "2".into() });
+    }
+
+    #[test]
+    fn footnote_def_body_parses_inline() {
+        let src = "[^1]: 见 **粗体** 与 `code`\n";
+        let b = footnote_def(src);
+        assert!(b.spans.iter().any(|s| s.role == SpanRole::Strong));
+        assert!(b.spans.iter().any(|s| s.role == SpanRole::InlineCode));
+    }
+
+    #[test]
+    fn footnote_def_inside_quote_strips_prefix() {
+        let src = "> [^1]: note\n";
+        let quote = block(src);
+        assert_eq!(quote.kind, BlockKind::BlockQuote);
+        let def = &quote.children[0];
+        assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
+        assert_eq!(visible_text(src, def), "1 note");
+    }
+
+    #[test]
+    fn footnote_def_inside_list_strips_marker() {
+        let src = "- [^1]: note\n";
+        let list = block(src);
+        let item = &list.children[0];
+        let def = &item.children[0];
+        assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
+        assert_eq!(visible_text(src, def), "1 note");
+    }
+
+    #[test]
+    fn footnote_def_not_taken_as_table() {
+        // 正文含竖线也不该被表格识别抢先（定义分支在表格之前）
+        let src = "[^1]: a | b\n| --- | --- |\n";
+        let blocks = parse(src);
+        assert!(matches!(blocks[0].kind, BlockKind::FootnoteDef { .. }));
+    }
+
+    #[test]
+    fn footnote_roundtrip() {
+        for src in [
+            "见 [^1] 处。\n",
+            "[^1]: note\n",
+            "[^a]:x\n",
+            "[^1]:  x\n",
+            "[^a]: first\n    second\n",
+            "前文\n\n[^1]: note\n\n后文\n",
+            "> [^1]: note\n",
+            "- [^1]: note\n",
+            "[^1]: 见 **粗体**\n",
+        ] {
+            assert_eq!(to_md(src), src, "roundtrip {src:?}");
             assert_eq!(to_md(&to_md(src)), to_md(src), "idempotent {src:?}");
         }
     }

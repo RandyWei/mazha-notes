@@ -80,6 +80,13 @@ pub enum SpanRole {
     /// 可见的理由：公式尚未接入真排版（`ratex-*`），若整段当 Widget 隐藏，
     /// 编辑区会凭空"丢字"；保留可见文本由 UI 用 `RunStyle::Math` 标注。
     Math,
+    /// 脚注标记：行内引用的 `[^` 与 `]`、块级定义的 `[^` 与 `]:`（渲染时隐藏，D35）。
+    FootnoteMarker,
+    /// 脚注标签（`[^label]` 的 label、`[^label]:` 的 label；**可见**，D35）。
+    ///
+    /// 可见的理由同 [`SpanRole::Math`]：标签是脚注的"名字"，隐藏后引用/定义
+    /// 都会变成无名文本；保留可见文本由 UI 用 `RunStyle::Footnote` 标注。
+    FootnoteRef,
 }
 
 /// 覆盖源文本一段字节区间的语法片段；区间端点必为字符边界。

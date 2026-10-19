@@ -144,7 +144,37 @@ fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
         // 列表项由 List 分支统一渲染，这里只在异常输入下兜底
         BlockKind::ListItem { .. } => list_item_to_md(source, b, prefix, false, 1),
         BlockKind::MathBlock => prefix_lines(&math_block_body(source, b), prefix),
+        BlockKind::FootnoteDef { label } => footnote_def_to_md(source, b, label, prefix),
     }
+}
+
+/// 拼回脚注定义块的 Markdown（D35 ②）：`[^label]:` 整体回填，正文只取 `]:`
+/// 标记之后的片段（正文里的软换行渲染为 `\n`，由 [`prefix_lines`] 逐行补容器前缀）。
+///
+/// 解析侧对续行剥离**恰好 4 空格**缩进，这里对称补回；多余缩进会留在可见文本里，
+/// 因此任意缩进都能逐字节往返。
+fn footnote_def_to_md(source: &str, b: &Block, label: &str, prefix: &str) -> String {
+    // 找到 `]:` 标记（脚注标记角色中以 `]` 开头的那个），正文从其下一片段开始
+    let body_from = b
+        .spans
+        .iter()
+        .position(|sp| {
+            sp.kind == SpanKind::Marker
+                && sp.role == SpanRole::FootnoteMarker
+                && source.as_bytes().get(sp.range.start) == Some(&b']')
+        })
+        .map_or(b.spans.len(), |p| p + 1);
+    let body = spans_to_inline_md(source, &b.spans[body_from..]);
+    let mut s = format!("[^{label}]:");
+    for (k, line) in body.split('\n').enumerate() {
+        if k > 0 {
+            // 续行补回解析侧剥离的 4 空格缩进（见 FN_CONT_INDENT）
+            s.push_str("\n    ");
+        }
+        s.push_str(line);
+    }
+    s.push('\n');
+    prefix_lines(&s, prefix)
 }
 
 /// 拼回显示公式块的**可见文本**（D34）：跳过 `$$` 定界标记，片段之间的换行逐个补齐、
@@ -350,6 +380,12 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
             (SpanKind::Marker, SpanRole::EscapeMarker) => out.push('\\'),
             // 行内公式定界符：每个片段恰是一个 `$`
             (SpanKind::Marker, SpanRole::MathMarker) => out.push('$'),
+            // 脚注标记（`[^`、`]`、`]:`）原样回填，与标签/正文拼回完整语法
+            // （与图片 Widget 同处理：都直接抄源文本）
+            (SpanKind::Marker, SpanRole::FootnoteMarker)
+            | (SpanKind::Widget, SpanRole::ImageMarker) => {
+                out.push_str(&slice(source, &sp.range));
+            }
             (SpanKind::Marker, SpanRole::InlineCode) => out.push('`'),
             (SpanKind::Marker, SpanRole::Strong) => out.push_str("**"),
             (SpanKind::Marker, SpanRole::Emphasis) => out.push('*'),
@@ -406,15 +442,12 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
                     _ => {}
                 }
             }
-            (SpanKind::Marker, SpanRole::WikiLinkMarker) => {
-                // 仅在 `[[`（起始标记）处重建；`|`/`]]` 由重建过程整体消费
-                if source.as_bytes().get(sp.range.start) == Some(&b'[') {
-                    pos = reconstruct_wiki_link(source, spans, pos, &mut out);
-                    continue;
-                }
-            }
-            (SpanKind::Widget, SpanRole::ImageMarker) => {
-                out.push_str(&slice(source, &sp.range));
+            // 仅在 `[[`（起始标记）处重建；`|`/`]]` 由重建过程整体消费
+            (SpanKind::Marker, SpanRole::WikiLinkMarker)
+                if source.as_bytes().get(sp.range.start) == Some(&b'[') =>
+            {
+                pos = reconstruct_wiki_link(source, spans, pos, &mut out);
+                continue;
             }
             _ => {}
         }

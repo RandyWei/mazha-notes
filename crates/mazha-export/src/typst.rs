@@ -165,6 +165,11 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
             out.push_str(&body);
             let _ = write!(out, "\n{fence}");
         }
+        BlockKind::FootnoteDef { .. } => {
+            // 脚注定义（D35 ④）：按普通段落输出（标签 `#super[...]` + 正文）。
+            // **不用** Typst 的 `#footnote[...]`，否则会把定义重新归集到页脚并与源顺序错位。
+            inline_to_typst(source, &b.spans, out);
+        }
     }
 }
 
@@ -354,6 +359,12 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
             // 行内公式体（D34）：字面量输出，不转义也不进数学模式（同 R8 的理由）
             (SpanKind::Text, SpanRole::Math) => {
                 push_inline_raw(out, &source[sp.range.clone()]);
+                i += 1;
+            }
+            // 脚注标签（D35 ④）：上标显示（引用与定义的标签一致）
+            (SpanKind::Text, SpanRole::FootnoteRef) => {
+                let text = escape_typst(&source[sp.range.clone()]);
+                let _ = write!(out, "#super[{text}]");
                 i += 1;
             }
             // 可见文本一律输出内容（样式由成对 Marker 开合），特殊字符转义
@@ -677,5 +688,27 @@ mod tests {
         let t = to_typst("当 $x^2$ 时\n");
         assert!(t.contains("`x^2`"), "{t}");
         assert!(!t.contains('$'), "{t}");
+    }
+
+    // ---------- 脚注（D35） ----------
+
+    #[test]
+    fn typst_footnote_ref_is_super() {
+        let t = to_typst("见[^1]处\n");
+        assert!(t.contains("#super[1]"), "{t}");
+    }
+
+    #[test]
+    fn typst_footnote_def_is_plain_paragraph() {
+        // 定义：标签上标 + 正文；**不得**使用 `#footnote`（否则被重新归集到页脚）
+        let t = to_typst("[^1]: note\n");
+        assert!(t.contains("#super[1] note"), "{t}");
+        assert!(!t.contains("#footnote"), "{t}");
+    }
+
+    #[test]
+    fn typst_footnote_continuation_keeps_line() {
+        let t = to_typst("[^a]: first\n    续行\n");
+        assert!(t.contains("#super[a] first\n续行"), "{t}");
     }
 }

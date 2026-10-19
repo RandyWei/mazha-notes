@@ -48,6 +48,8 @@ a:hover{text-decoration:underline}
 .math{font-family:"Latin Modern Math","STIX Two Math",Cambria,Georgia,serif}
 div.math{margin:1em 0;padding:.5em 0;text-align:center}
 span.math{font-style:italic}
+.fnref{font-size:.75em;vertical-align:super;color:#57606a;padding:0 .1em}
+div.footnote{font-size:.9em;color:#57606a;border-left:2px solid #d0d7de;padding:.2em 0 .2em .8em;margin:.6em 0}
 "#;
 
 /// 把 Markdown 源文本渲染为完整 HTML5 文档（含 `<html>/<head>/<body>` 外壳）。
@@ -244,6 +246,17 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool, xhtm
             out.push_str(&escape_text(&math_body(source, block)));
             out.push_str("</div>");
         }
+        BlockKind::FootnoteDef { label } => {
+            // 脚注定义（D35 ④）：就地输出（**不**重排到文末、暂不生成回链）；
+            // `[^label]:` 标记隐藏，标签（上标）与正文可见。
+            let _ = write!(
+                out,
+                "<div class=\"footnote\" id=\"fn-{}\">",
+                escape_attr(label)
+            );
+            render_inline(source, &block.spans, out, xhtml);
+            out.push_str("</div>");
+        }
         BlockKind::BlockQuote => {
             out.push_str("<blockquote>");
             render_blocks(source, &block.children, out, false, xhtml);
@@ -337,6 +350,12 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bo
                 "<span class=\"math\">{}</span>",
                 escape_text(&source[sp.range.clone()])
             );
+            i += 1;
+            continue;
+        }
+        // 脚注标签（D35 ④）：引用与定义的标签都用上标；`[^`/`]`/`]:` 是 Marker，落到兜底忽略
+        if sp.kind == SpanKind::Text && sp.role == SpanRole::FootnoteRef {
+            push_footnote_ref(source, sp, out);
             i += 1;
             continue;
         }
@@ -454,6 +473,15 @@ impl InlineState {
         }
         *flag = !*flag;
     }
+}
+
+/// 输出行内脚注标签（D35 ④）：引用与定义的标签都包 `<sup class="fnref">`，标签经转义。
+fn push_footnote_ref(source: &str, sp: &SyntaxSpan, out: &mut String) {
+    let _ = write!(
+        out,
+        "<sup class=\"fnref\">{}</sup>",
+        escape_text(&source[sp.range.clone()])
+    );
 }
 
 /// 汇总公式块的可见文本（D34）：跳过 `$$` 定界标记，仅当片段之间的源文本含换行时补 `\n`。
@@ -788,5 +816,40 @@ mod tests {
             html.contains("<blockquote><div class=\"math\">x</div></blockquote>"),
             "{html}"
         );
+    }
+
+    // ---------- 脚注（D35） ----------
+
+    #[test]
+    fn html_footnote_ref_is_sup() {
+        // 引用：`[^`/`]` 隐藏，标签包 `<sup class="fnref">`
+        assert_eq!(
+            to_html("见[^1]处\n"),
+            "<p>见<sup class=\"fnref\">1</sup>处</p>"
+        );
+    }
+
+    #[test]
+    fn html_footnote_def_in_place() {
+        // 定义：就地输出，`[^label]:` 隐藏，标签上标、正文可见（不重排文末、无回链）
+        let html = to_html("[^1]: note\n");
+        assert_eq!(
+            html,
+            "<div class=\"footnote\" id=\"fn-1\"><sup class=\"fnref\">1</sup> note</div>"
+        );
+    }
+
+    #[test]
+    fn html_footnote_def_label_attr_escaped() {
+        // id 属性里的特殊字符要转义，避免属性被截断（标签串不含空白/方括号）
+        let html = to_html("[^a&b]: x\n");
+        assert!(html.contains("id=\"fn-a&amp;b\""), "{html}");
+    }
+
+    #[test]
+    fn html_footnote_default_css_has_rules() {
+        let doc = to_html_document("见[^1]处\n\n[^1]: note\n", "t", None);
+        assert!(doc.contains(".fnref"), "{doc}");
+        assert!(doc.contains("div.footnote"), "{doc}");
     }
 }

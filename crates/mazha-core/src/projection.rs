@@ -437,6 +437,8 @@ pub enum RunStyle {
     LinkText,
     /// 行内公式体 `$…$`（D34）：UI 用斜体 + 主题色区分。
     Math,
+    /// 脚注标签（引用的 `[^label]`、定义的 `[^label]:`；D35）：UI 用主题色区分。
+    Footnote,
 }
 
 impl From<SpanRole> for RunStyle {
@@ -448,6 +450,7 @@ impl From<SpanRole> for RunStyle {
             SpanRole::InlineCode => RunStyle::InlineCode,
             SpanRole::LinkText => RunStyle::LinkText,
             SpanRole::Math => RunStyle::Math,
+            SpanRole::FootnoteRef => RunStyle::Footnote,
             _ => RunStyle::Normal,
         }
     }
@@ -1317,5 +1320,41 @@ mod tests {
             "当 x^2 时",
             "`$` 定界符隐藏，公式体可见"
         );
+    }
+
+    #[test]
+    fn footnote_ref_run_uses_footnote_style() {
+        // 行内引用 `[^1]`：`[^`/`]` 隐藏、标签可见并带 RunStyle::Footnote（D35 ③）
+        let p = build("见 [^1] 处");
+        assert_eq!(p.lines[0].display_text(), "见 1 处");
+        let run = p.lines[0]
+            .runs
+            .iter()
+            .find(|r| r.text == "1")
+            .expect("应有标签文本段");
+        assert_eq!(run.style, RunStyle::Footnote);
+    }
+
+    #[test]
+    fn footnote_def_is_plain_block_with_visible_label() {
+        // 定义块：标签 + 正文都可见、样式为 Footnote/Normal，且**不产生块级 widget**（D35 ③）
+        let p = build("[^1]: note\n");
+        assert!(p.widgets.is_empty(), "定义块不应产生块级 widget");
+        assert_eq!(p.lines[0].display_text(), "1 note");
+        assert!(
+            p.lines[0]
+                .runs
+                .iter()
+                .any(|r| r.style == RunStyle::Footnote && r.text == "1")
+        );
+    }
+
+    #[test]
+    fn footnote_def_continuation_projects_two_lines() {
+        // 投影 = 源文本逻辑行 + 末尾空行（SPEC §6.1）
+        let p = build("[^a]: first\n    续行\n");
+        assert_eq!(p.lines.len(), 3);
+        assert_eq!(p.lines[0].display_text(), "a first");
+        assert_eq!(p.lines[1].display_text(), "续行");
     }
 }

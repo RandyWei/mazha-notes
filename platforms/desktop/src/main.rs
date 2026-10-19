@@ -1836,6 +1836,11 @@ fn to_gpui_run(
             font = font.italic();
             color = palette.accent;
         }
+        // 脚注标签（D35 ⑤）：主题色区分。gpui 字号按行设置（shape_line），
+        // 无法逐 run 缩小字号，故这里只改颜色，不做上标/小号处理。
+        RunStyle::Footnote => {
+            color = palette.accent;
+        }
         RunStyle::LinkText => {
             color = palette.link;
             underline = Some(UnderlineStyle {

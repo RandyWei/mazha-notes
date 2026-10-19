@@ -452,4 +452,39 @@ mod tests {
         let new = format!("{}y{}", &old[..at], &old[at + 1..]);
         assert_matches_full(old, &new, at..at + 1);
     }
+
+    // ---------------- 脚注的增量重解析（D35） ----------------
+
+    #[test]
+    fn edit_footnote_def_body_matches_full() {
+        let old = "前文\n\n[^1]: note\n\n尾\n";
+        let at = old.find("note").unwrap();
+        let new = format!("{}长注解{}", &old[..at], &old[at + 4..]);
+        assert_matches_full(old, &new, at..at + 4);
+    }
+
+    #[test]
+    fn add_footnote_ref_matches_full() {
+        let old = "正文\n\n[^1]: note\n";
+        let new = "正文[^1]\n\n[^1]: note\n";
+        assert_matches_full(old, new, 6..6);
+    }
+
+    #[test]
+    fn footnote_def_continuation_edit_matches_full() {
+        // 续行的增补/删除不改变块结构（仍在同一定义内）
+        let old = "前文\n\n[^1]: first\n    续行\n\n尾\n";
+        let at = old.find("续行").unwrap();
+        let new = format!("{}第二行{}", &old[..at], &old[at + 6..]);
+        assert_matches_full(old, &new, at..at + 6);
+    }
+
+    #[test]
+    fn unindent_footnote_continuation_splits_block() {
+        // 去掉续行缩进 → 定义结束，尾随行成为独立段落
+        let old = "前文\n\n[^1]: first\n    second\n";
+        let at = old.find("    second").unwrap();
+        let new = format!("{}second{}", &old[..at], &old[at + 4..]);
+        assert_matches_full(old, &new, at..at + 4);
+    }
 }
