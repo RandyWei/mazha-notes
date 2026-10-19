@@ -248,6 +248,14 @@ pub struct ProjectedLine {
     pub offset_map: OffsetMap,       // 显示位置 ↔ 源偏移
 }
 
+impl ProjectedLine {
+    pub fn display_text(&self) -> String;              // 可见片段拼接
+    pub fn display_byte_len(&self) -> usize;           // 显示文本字节长度
+    /// 显示列（字符索引）↔ 显示文本字节偏移（软换行布局用；越界钳制、字节落字符内上取整）
+    pub fn display_byte_of_col(&self, col: usize) -> usize;
+    pub fn display_col_of_byte(&self, byte: usize) -> usize;
+}
+
 /// 块样式（容器样式可叠加，如"引用中的列表项"）
 pub struct BlockStyle {
     pub quote_depth: u8,
@@ -450,13 +458,14 @@ interface Workspace {
 - UI 框架：**GPUI**（Zed 自研，Apache-2.0；现以 `gpui-pre` 家族发布在 crates.io）+ **gpui-kit 0.7**（组件/主题/Dock/表格/只读 Markdown 渲染）。
 - GPUI 版本由 gpui-kit 锁定（`gpui-pre` 0.3.x 快照），应用只声明 `gpui-kit`，升级需同步；可选 `gpui-fast` 保留渲染特性（`[待确认]`是否启用）。
 - 编辑器实现要点（沿用现有开源实践 `zorite/gpui-editor`、`velotype`）：
-  - 自写 `Element` + `shape_line` 绘制投影；实现 `EntityInputHandler`（键盘 + IME）。
+  - 自写 `Element` + `shape_text`（软换行）绘制投影；实现 `EntityInputHandler`（键盘 + IME）。
+  - **软换行**（D33）：每条投影行用 `shape_text`（带 `wrap_width`）折成多个视觉行；布局按视觉行累计（`row_starts`），命中/光标/选区/IME/块级装饰均以视觉行为单位，光标与选区仍以逻辑行 + 显示字符列表示，经 `ProjectedLine::display_byte_of_col`（↔ `display_col_of_byte`）与字形字节索引互换。
   - 语法标记隐藏：光标不在该行时不绘制标记，光标进入/离开时切换显隐。
   - 块级 widget：表格（单元格网格 + 增删行列）、代码块（内嵌高亮）、图片、任务复选框。
 - 已确认可复用的纯 Rust 组件：
   - **公式**：`ratex-*`（KaTeX 移植）+ `ratex-gpui`（渲染 + MathQuill 式结构编辑器）。
   - **图表**：`mermaid-rs-renderer`（纯 Rust → SVG/PNG，无浏览器依赖）。
-  - **代码高亮**：tree-sitter（已确认；gpui-kit 内置 tree-sitter 集成，增量、多语言）。
+  - **代码高亮**：**syntect**（纯 Rust fancy-regex，Sublime 语法；SPEC D32）——核心 `mazha-core::highlight` 输出着色区间，桌面端分屏着色。（tree-sitter 亦可用，但为免 onig/交叉编译负担改用 syntect。）
 
 ### 7.2 移动端（iOS / Android）— Rust core + 原生 UI
 
@@ -581,7 +590,7 @@ interface Workspace {
 - [ ] 打开一个含标题/列表/表格/代码/公式/图表的 `.md`，正确 WYSIWYG 渲染
 - [ ] 编辑后保存，文件内容为无损 Markdown（往返 `serialize(parse(x)) == x` 对稳定块成立）
 - [ ] 中文输入法（IME）在隐藏标记的行上候选框位置正确
-- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；公式与图表正确渲染（待解析器支持）
+- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；公式与图表正确渲染（待解析器支持）
 - [ ] 导出 HTML/PDF 内容与编辑区一致
 
 ### 12.3 跨平台一致性（长期）
@@ -646,6 +655,7 @@ interface Workspace {
 | D30 | 块级 widget 建模位置 | 块级 widget（代码块/表格/分割线…）作为**核心投影**的一部分：`Projection.widgets: Vec<BlockWidget>` + `block_widget_at`/`block_widget_on_line` 查询；每个 widget 记 `source_range`（整块）+ `line_range`（逻辑行）。核心只给"分组与范围"，具体绘制（面板/网格/高亮）留在 UI；"光标进入才可编辑"由 UI 用 `block_widget_on_line(光标行)` 判定。理由：分组/范围是可无 UI 单测的纯逻辑，且被多端（桌面/移动/Web）复用；公式/图表待解析器支持后再加 `BlockWidgetKind` 变体 | 确认（见 SPEC §6.1/§11.5） |
 | D31 | 表格增删行列的实现位置 | 表格结构编辑（增删行列）作为**核心纯函数** `edit_table(source, caret, TableOp) -> Option<Edit>`（`mazha-core::table`），而非 UI 直接改字符串：核心用解析器定位光标所在 `BlockKind::Table` 块，把该区域解析成 `TableModel{header, align, rows}`，套用结构变更后**规范化重写整块**（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`。理由：① 结构变更（行/列索引、转义 `\|`、对齐保留）是可无 UI 单测的纯逻辑，先测试后实现；② 走 `Edit` 通道才能正确纳入 undo/redo 与投影重建；③ 规范化重写牺牲原表格的空白风格，换取实现简单与结果可预测（后续如需保留风格可改增量编辑）。光标定位用整块偏移（非字符级），"删唯一列 / 在表头删行"等不产生变化时返回 `None` | 确认（见 SPEC §6.1/§11.5） |
 | D32 | 代码块语法高亮的引擎与位置 | 用 **syntect**（Sublime 语法定义）做语法高亮，作为**核心纯模块** `mazha-core::highlight`（不依赖 GUI）：`Highlighter::with_theme(name)` 持有内置 `SyntaxSet`（大、需复用），`highlight(code, lang) -> Vec<Vec<ColoredRun>>` 逐行返回带前景色片段（区间相对行首），语言名按扩展名/词元/语法名匹配、未命中回退纯文本。引擎用**纯 Rust 的 fancy-regex**（`default-features=false, features=["default-fancy","default-syntaxes","default-themes"]`），避免 `onig` 的 C 依赖与交叉编译/移动端工具链风险。理由：① 输出（源文本→着色区间）是可无 UI 单测的纯逻辑，多端复用；② 不把 `syntect` 类型泄进公共 API（对外只用 `(u8,u8,u8)`）；③ UI 按显示文本切分着色（代码块行显示文本 == 源码行内容），无需再做源↔显示换算。取舍：syntect 会显著增大 `mazha-core` 体积（含语法/主题 dump），后续如体积敏感可下沉到独立 crate 或按特性裁剪 | 确认（见 SPEC §6.1/§11.5） |
+| D33 | 软换行的实现层次与坐标模型 | **软换行放在 UI 层**（`platforms/desktop`），不改变核心的"逻辑行 + 显示字符列"坐标模型：每条投影行用 gpui `shape_text`（带 `wrap_width = 内容宽度`）折成一条 `WrappedLine`（内含多个换行边界 = 视觉行）。布局几何按视觉行累计（`DocLayout::row_starts`），命中测试、光标竖线、选区高亮、IME 候选框、块级 widget 装饰的纵向范围都以**视觉行**为单位；光标与选区仍以逻辑行 + 显示**字符列**表示（`DocPos`/`LineDisplayRange` 不变）。显示字符列 ↔ 字形字节索引的换算由核心 `ProjectedLine::display_byte_of_col`/`display_col_of_byte`（纯逻辑、可单测）承担——形状化与换行边界以显示文本的 UTF-8 字节为单位，而投影/偏移映射以字符列为单位（引用 `"> "` 等投影外前缀以 `prefix_bytes` 计入）。理由：① 换行依赖像素宽度（字体度量），属 UI 关注点，核心保持无 GUI、可单测；② 复用 gpui 的换行/命中（`WrappedLine::position_for_index`/`closest_index_for_position`），避免自研断行；③ 顺手修正桌面端先前"以字符列当字节索引"喂 `x_for_index` 的 CJK 隐患。取舍与限制：暂不做"按视觉行上下移动"（仍按逻辑行持列移动）、不实现横向滚动/超长不可断行（如超长 URL）溢出；块级装饰纵向范围随换行伸展 | 确认（见 SPEC §7.1/§11.5） |
 
 ---
 
@@ -699,6 +709,7 @@ interface Workspace {
 | 0.1.43 | 2026-10-16 | **桌面端块级 widget 渲染**（Phase 3，SPEC §11.5、D30）：`platforms/desktop` 依核心 `Projection::block_widgets` 在文本层**之下**先画块级装饰——代码块面板描边 + 右上角语言标签（等宽 `shape_line`）、表格弱底 + 外框 + 行分隔线、分割线真实细线（取代旧的 `─` 文本占位）；光标进入块内则隐藏装饰（编辑态），判定用 `Projection::block_widget_on_line`。`DocLayout` 新增 `widgets: Vec<WidgetDecor>`，prepaint 由 `block_widgets()` 投影（先取光标源偏移再借 `doc.projection()` 避免借用冲突）。门禁：workspace fmt/clippy/test 全绿（**366**）；桌面端 `fmt`/`clippy -D warnings`/`build` 全绿（本环境无法可视化验证渲染效果） |
 | 0.1.44 | 2026-10-16 | **表格增删行列**（Phase 3，SPEC §11.5/§12.2，D31）：新增 `mazha-core::table`——纯函数 `edit_table(source, caret, TableOp) -> Option<Edit>`，把"光标所在表格块"解析成 `TableModel{header, align, rows}`，套用 `InsertRowAbove/Below`、`InsertColumnLeft/Right`、`DeleteRow/Column` 后规范化重写整块（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`；核心导出 `TableOp`/`edit_table`。边界：光标在表格外、删唯一列、在表头/分隔行删行 → `None`；转义 `\|` 不拆列；列对齐经 `Align` 保留。先测试后实现：table 12 条 + document 集成 1 条（经 `Document::apply` 后投影全量一致），core **151**（总计 **379**）。桌面端接入：`apply_table`（走 `apply_edit`，纳入 undo/redo）+ 快捷键 Cmd+Option+↑/↓（增行）、←/→（增列）、Delete（删行）、Shift+Delete（删列）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证） |
 | 0.1.45 | 2026-10-16 | **代码块语法高亮**（Phase 3，SPEC §11.5/§12.2，D32）：新增 `mazha-core::highlight`——用 **syntect**（纯 Rust fancy-regex 引擎）把一段代码按语言逐行着色，`Highlighter::with_theme(name)` 持有内置 `SyntaxSet`，`highlight(code, lang) -> Vec<Vec<ColoredRun>>` 返回每行的 `(源区间相对行首, (r,g,b))`；语言未命中回退纯文本；不泄漏 syntect 类型（对外 `ColoredRun`/`(u8,u8,u8)`）。`mazha-core` 依赖 syntect（`default-features=false` + `default-fancy/default-syntaxes/default-themes`，无 onig C 依赖）。先测试后实现：5 条单测（rust 关键字多色、未知语言回退单色、空/多行状态、无语言纯文本、区间相对行首），core **156**（总计 **384**）。桌面端接入：`DocView` 惰性持有 `Highlighter`（按背景明度选深/浅内置主题），prepaint 把连续代码行聚段着色，`build_line_runs` 按着色区间切分显示文本逐段上色（等宽 + 弱底）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证渲染效果） |
+| 0.1.46 | 2026-10-16 | **软换行**（Phase 3，SPEC §7.1/§11.5/§12.2，D33）：核心新增 `ProjectedLine::{display_byte_len, display_byte_of_col, display_col_of_byte}`（显示字符列 ↔ 显示文本字节偏移；越界钳制、字节落多字节字符内向下吸附到字符起点），纯逻辑可单测；先测试后实现：4 条单测（混合宽字符、跨片段、空行、往返一致），core **160**（总计 **388**）。桌面端 `platforms/desktop` 把每条投影行由 `shape_line` 改为 `shape_text`（带按内容宽度算出的 `wrap_width`）折成一条 `WrappedLine`：`BlockGeom` 改存投影行 + `Arc<WrappedLine>` + 视觉行数 + 前缀字节数；`DocLayout` 增 `row_starts`（每块首视觉行的全局行号）；命中测试（`WrappedLine::closest_index_for_position` 求字节→显示列）、光标竖线/选区高亮（按视觉行拆分，`position_for_index` 取行内 x）、IME 候选框、代码块/表格/分割线装饰的纵向范围全部改为按**视觉行**定位；并修正桌面端先前以显示字符列误当字形字节索引（CJK 光标/命中错位）的隐患。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证渲染效果）；已知限制：上下移动仍按逻辑行持列、不实现横向滚动 |
 
 ---
 

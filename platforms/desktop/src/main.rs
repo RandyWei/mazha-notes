@@ -1,8 +1,8 @@
 //! 码札桌面端（Phase 2：只读投影渲染 + 光标/标记显隐 + 跨行选区）。见 `SPEC.md` §7.1、§11。
 //!
 //! 管线：`.md` 源文本 → [`Document`]（源文本真相 + 投影缓存）→ `Projection`
-//! （块样式 + 带样式可见文本片段 + 图片占位）→ 自写 [`DocElement`] 用 `shape_line`
-//! 逐块连续绘制。
+//! （块样式 + 带样式可见文本片段 + 图片占位）→ 自写 [`DocElement`] 用 `shape_text`
+//! 逐块软换行并连续绘制。
 //!
 //! 本里程碑已具备：
 //! - **只读投影渲染**：语法标记默认隐藏（由 core 投影决定，UI 不解析 Markdown）；
@@ -21,14 +21,17 @@
 //! （`Projection::{line_of_source, source_to_doc_pos, doc_pos_to_source,
 //! selection_display_ranges}`），UI 侧不再自行维护偏移换算。
 //!
-//! 设计取舍：**不做软换行**——每个投影块渲染成一条不换行的 `ShapedLine`。这样
-//! "显示字节索引"与 `OffsetMap` 的"显示字符索引"天然等长（偏移映射要求字符边界），
-//! 一次整篇命中即可换算源偏移；软换行留待后续用 `shape_text` 的 `wrap_boundaries`
-//! 折算成"块内显示行"再映射。
+//! **软换行**（SPEC §7.1、§11）：每条投影行用 `shape_text`（带 `wrap_width`）形状化为
+//! 一个 [`WrappedLine`]——按内容宽度自动折成多个**视觉行**。布局几何按视觉行累计
+//! （`DocLayout::row_starts`），命中测试、光标、选区、IME 候选框、块级 widget 装饰
+//! 均以视觉行为单位；光标/选区仍以逻辑行 + 显示**字符列**表示，经核心
+//! `ProjectedLine::display_byte_of_col`（↔ `display_col_of_byte`）与 `WrappedLine` 的
+//! 字节索引互换（引用 "> " 前缀等额外文本以 `prefix_bytes` 计入）。
 
 use std::ops::Range;
 use std::panic::Location;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -36,8 +39,7 @@ use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
-    Highlighter, InlineMark, OffsetMap, ProjectedLine, RunStyle, Selection, TableOp,
-    TextRun as DocTextRun,
+    Highlighter, InlineMark, ProjectedLine, RunStyle, Selection, TableOp, TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
     edit_table,
 };
@@ -140,12 +142,16 @@ impl Palette {
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
 #[derive(Clone)]
 struct BlockGeom {
-    /// 该块在源文本中的字节区间。
-    source_range: Range<usize>,
-    /// 显示位置 ↔ 源偏移映射（不换行时：显示索引 = 显示字符索引）。
-    offset_map: OffsetMap,
-    /// 已形状化的行（不含换行；`x_for_index`/`closest_index_for_x` 均为行内相对坐标）。
-    line: ShapedLine,
+    /// 本块的投影行（`runs`/`offset_map`；供显示列↔字节、源偏移换算）。
+    proj: ProjectedLine,
+    /// 已形状化并**软换行**的行（行内相对坐标；`position_for_index` 按行高定位视觉行）。
+    ///
+    /// 用 `Arc` 包裹：`WrappedLine` 不实现 `Clone`，而 [`DocLayout`] 需可克隆回存视图。
+    shaped: Arc<WrappedLine>,
+    /// 本块的视觉行数（`>= 1`）。
+    rows: usize,
+    /// 前缀字节数（引用 `"> "` 等投影外文本；显示列→形状文本字节需加上它）。
+    prefix_bytes: usize,
     /// 左缩进（引用深度、列表缩进），行内 x 坐标需加上它才是块内绝对 x。
     indent: Pixels,
     /// 光标在本块时的行内**显示列**（`None` = 光标不在本块；仅一块为 `Some`）。
@@ -155,11 +161,24 @@ struct BlockGeom {
     /// 本块在当前选区内的**显示列**区间（`None` 表示本块不在选区内）。
     ///
     /// 由 `Projection::selection_display_ranges` 于 prepaint 阶段算好，paint 直接按
-    /// `line.x_for_index(cols.*)` 换算屏幕 x，无需再经 `OffsetMap` 换算源偏移。
+    /// 视觉行换算屏幕 x（经 `display_byte_of_col`）。
     selection: Option<Range<usize>>,
 }
 
-/// 整篇文档的布局几何：块序列 + 光标原点 + 统一行高。
+impl BlockGeom {
+    /// 显示列 → 形状化文本内的字节偏移（含前缀）。
+    fn byte_of_col(&self, col: usize) -> usize {
+        self.prefix_bytes + self.proj.display_byte_of_col(col)
+    }
+
+    /// 形状化文本内的字节偏移 → 显示列（扣除前缀，越界钳到行末）。
+    fn col_of_byte(&self, byte: usize) -> usize {
+        self.proj
+            .display_col_of_byte(byte.saturating_sub(self.prefix_bytes))
+    }
+}
+
+/// 整篇文档的布局几何：块序列 + 光标原点 + 统一行高 + 视觉行累积。
 ///
 /// 在 [`DocElement::prepaint`] 中构建，经 `cx.defer` 回存到 [`DocView`]，
 /// 供鼠标命中测试在事件回调里读取。
@@ -173,6 +192,10 @@ struct DocLayout {
     origin: Point<Pixels>,
     /// 统一行高。
     line_height: Pixels,
+    /// 每个块**首视觉行**的全局行号；末位为总视觉行数（长度 = `blocks.len() + 1`）。
+    ///
+    /// 软换行下逻辑行 ≠ 视觉行：命中测试/绘制都以它把"全局视觉行"映射回块。
+    row_starts: Vec<usize>,
 }
 
 /// 块级 widget 的绘制装饰（由核心 [`mazha_core::Projection::block_widgets`] 投影而来）。
@@ -203,19 +226,33 @@ enum WidgetDecorKind {
 }
 
 impl DocLayout {
-    /// 从窗口坐标命中一个**显示位置**（块序号 + 行内显示字节索引）。
+    /// 从窗口坐标命中一个**显示位置**（块序号 + 行内显示字符列）。
+    ///
+    /// 软换行下先由 `row_starts` 把全局视觉行二分定位到块，再取块内视觉行的相对坐标
+    /// 交给 [`WrappedLine::closest_index_for_position`] 求字节偏移，最后换算成显示列。
     fn hit(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
         if self.blocks.is_empty() {
             return None;
         }
+        let total = *self.row_starts.last()?;
+        if total == 0 {
+            return None;
+        }
         let rel_y = position.y - self.origin.y;
-        let row = (rel_y / self.line_height).floor().max(0.);
-        let row = (row as usize).min(self.blocks.len() - 1);
-        let block = &self.blocks[row];
-        // 行内 x 需减去该块的缩进才是 ShapedLine 内的相对坐标
+        let row = (rel_y / self.line_height).floor().max(0.) as usize;
+        let row = row.min(total - 1);
+        // row_starts[i] <= row < row_starts[i+1] → 块 i（首元素为 0，故减一后非负）
+        let block_idx = self.row_starts.partition_point(|&s| s <= row) - 1;
+        let block = &self.blocks[block_idx];
+        let local_row = row - self.row_starts[block_idx];
+        // 行内 x 需减去该块缩进；y 只要落在该视觉行内即可（取行中点）
         let rel_x = position.x - self.origin.x - block.indent;
-        let local_ix = block.line.closest_index_for_x(rel_x);
-        Some((row, local_ix))
+        let local_y = self.line_height * local_row as f32 + self.line_height / 2.;
+        let byte = block
+            .shaped
+            .closest_index_for_position(point(rel_x, local_y), self.line_height)
+            .unwrap_or_else(|ix| ix);
+        Some((block_idx, block.col_of_byte(byte)))
     }
 }
 
@@ -795,13 +832,13 @@ impl DocView {
     /// 从窗口坐标命中一个**源字节偏移**（整篇命中：先算显示索引，再经 OffsetMap 映射）。
     fn hit_source(&self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout.as_ref()?;
-        let (row, local_ix) = layout.hit(position)?;
+        let (row, col) = layout.hit(position)?;
         let block = &layout.blocks[row];
-        // 显示索引（不换行 = 显示字符索引）→ 源字节偏移
-        let source_offset = block.offset_map.display_to_source(DisplayPos(local_ix));
+        // 显示字符列 → 源字节偏移
+        let source_offset = block.proj.offset_map.display_to_source(DisplayPos(col));
         Some(
             self.doc
-                .snap_to_boundary(source_offset.min(block.source_range.end)),
+                .snap_to_boundary(source_offset.min(block.proj.source_range.end)),
         )
     }
 
@@ -1063,18 +1100,35 @@ impl EntityInputHandler for DocView {
         };
         let layout = self.layout.as_ref()?;
         let b0 = layout.blocks.get(p0.line)?;
-        let x0 = layout.origin.x + b0.indent + b0.line.x_for_index(p0.col);
-        let (x1, rows) = match layout.blocks.get(p1.line) {
-            Some(b1) => (
-                layout.origin.x + b1.indent + b1.line.x_for_index(p1.col),
-                p1.line - p0.line + 1,
-            ),
-            None => (x0, 1),
+        let pos0 = b0
+            .shaped
+            .position_for_index(b0.byte_of_col(p0.col), layout.line_height)
+            .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
+        let x0 = layout.origin.x + b0.indent + pos0.x;
+        let y0 = layout.origin.y + layout.line_height * layout.row_starts[p0.line] as f32 + pos0.y;
+        let (x1, y1) = match layout.blocks.get(p1.line) {
+            Some(b1) => {
+                let pos1 = b1
+                    .shaped
+                    .position_for_index(b1.byte_of_col(p1.col), layout.line_height)
+                    .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
+                (
+                    layout.origin.x + b1.indent + pos1.x,
+                    layout.origin.y
+                        + layout.line_height * layout.row_starts[p1.line] as f32
+                        + pos1.y,
+                )
+            }
+            None => (x0, y0),
         };
-        let row_top = layout.origin.y + layout.line_height * p0.line as f32;
+        // 跨视觉行的候选框：取起止点包络（含起点所在视觉行的高度）
+        let top = y0.min(y1);
+        let height = (y0.max(y1) + layout.line_height) - top;
+        let width = if x1 > x0 { x1 - x0 } else { x0 - x1 };
+        let width = if width < px(2.) { px(2.) } else { width };
         Some(bounds(
-            point(x0, row_top),
-            size(x1 - x0, layout.line_height * rows as f32),
+            point(x0.min(x1), top),
+            size(width, height.max(layout.line_height)),
         ))
     }
 
@@ -1383,6 +1437,56 @@ fn rgb_to_hsla((r, g, b): (u8, u8, u8)) -> Hsla {
     gpui::rgb(hex).into()
 }
 
+/// 把单行显示文本按 `wrap_width` 形状化为一条**软换行**的 [`WrappedLine`]。
+///
+/// 输入不含 `\n`，故 `shape_text` 恰好返回一条 `WrappedLine`（内部可能含多个换行边界）。
+/// 形状化失败或返回空（理论上不发生：空文本/覆盖完整的 runs 都能成功）时，退化为空行，
+/// 保证布局块序列与投影行一一对应。
+fn shape_wrapped_line(
+    window: &mut Window,
+    text: SharedString,
+    font_size: Pixels,
+    runs: &[gpui::TextRun],
+    wrap_width: Pixels,
+) -> WrappedLine {
+    let ts = window.text_system().clone();
+    if let Ok(mut lines) = ts.shape_text(text, font_size, runs, Some(wrap_width), None)
+        && let Some(line) = lines.pop()
+    {
+        return line;
+    }
+    ts.shape_text(
+        SharedString::default(),
+        font_size,
+        &[],
+        Some(wrap_width),
+        None,
+    )
+    .ok()
+    .and_then(|mut lines| lines.pop())
+    .expect("空行形状化必然成功")
+}
+
+/// 已换行行的每视觉行起止**字节偏移**（长度 = 视觉行数 + 1）。
+///
+/// 换行边界以 `run_ix`/`glyph_ix` 指向的**字形**表示，取该字形的字节 `index` 即为下一
+/// 视觉行的起始字节。用于把选区的字节区间按视觉行切分。
+fn row_byte_bounds(w: &WrappedLine) -> Vec<usize> {
+    let mut v = Vec::with_capacity(w.wrap_boundaries().len() + 2);
+    v.push(0);
+    for b in w.wrap_boundaries() {
+        let idx = w
+            .unwrapped_layout
+            .runs
+            .get(b.run_ix)
+            .and_then(|r| r.glyphs.get(b.glyph_ix))
+            .map_or_else(|| w.len(), |g| g.index);
+        v.push(idx);
+    }
+    v.push(w.len());
+    v
+}
+
 /// 块在屏幕上的横向缩进（引用深度 + 列表缩进），单位为像素。
 fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
     let mut x = base;
@@ -1429,10 +1533,11 @@ fn paint_rect_border(window: &mut Window, rect: Bounds<Pixels>, color: Hsla, thi
     ));
 }
 
-/// 文档正文的自写元素：逐块 `shape_line` 连续布局 + 绘制，并把几何回存给视图。
+/// 文档正文的自写元素：逐块 `shape_text`（软换行）连续布局 + 绘制，并把几何回存给视图。
 ///
 /// 之所以自写 [`Element`] 而不用 `div`+`StyledText`：需要在 `prepaint` 里拿到
-/// 每块**不换行**的 `ShapedLine` 几何（`x_for_index`/`closest_index_for_x`），
+/// 每块的 `WrappedLine` 几何（换行边界 + `position_for_index`/`closest_index_for_position`）、
+/// 每块视觉行数，以及全局视觉行表（`row_starts`），
 /// 一次整篇命中测试即可把窗口坐标换算成源偏移（见 [`DocLayout::hit`]）。
 struct DocElement {
     /// 视图实体：prepaint 里读取光标/选区并回存 [`DocLayout`]。
@@ -1500,7 +1605,8 @@ impl Element for DocElement {
         let indent_base = BASE;
 
         // update 提供 &mut DocView（投影缓存需惰性建立），闭包返回几何数据避免借用越界
-        let (blocks, widgets) = self.view.update(cx, |view, _| {
+        let content_width_total = bounds.size.width;
+        let (blocks, widgets, row_starts) = self.view.update(cx, |view, _| {
             // 需先取所有光标的源偏移，随后 projection() 会可变借用 view.doc（借用不相交）
             let caret_sources: Vec<usize> = view.cursors.iter().map(|c| c.caret).collect();
             let projection = view.doc.projection();
@@ -1602,6 +1708,8 @@ impl Element for DocElement {
                 }
             }
             let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
+            let mut row_starts: Vec<usize> = Vec::with_capacity(projection.lines.len() + 1);
+            let mut row_acc = 0usize;
             for (idx, line) in projection.lines.iter().enumerate() {
                 let (text, runs) = build_line_runs(
                     line,
@@ -1612,6 +1720,8 @@ impl Element for DocElement {
                     &palette,
                     code_hl[idx].as_deref(),
                 );
+                // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
+                let prefix_bytes = text.len().saturating_sub(line.display_text().len());
                 // 用统一字体排版，保证行高一致（粗斜体/等宽在 runs 内体现）
                 let line_font = base_font.clone();
                 let uniform_runs: Vec<gpui::TextRun> = runs
@@ -1621,20 +1731,25 @@ impl Element for DocElement {
                         r
                     })
                     .collect();
-                let shaped = window
-                    .text_system()
-                    .shape_line(text, base_size, &uniform_runs, None);
                 let indent = block_indent(line, indent_base);
+                // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
+                let wrap_width = (content_width_total - indent - BASE).max(px(48.));
+                let shaped = shape_wrapped_line(window, text, base_size, &uniform_runs, wrap_width);
+                let rows = shaped.wrap_boundaries().len() + 1;
+                row_starts.push(row_acc);
+                row_acc += rows;
                 v.push(BlockGeom {
-                    source_range: line.source_range.clone(),
-                    offset_map: line.offset_map.clone(),
-                    line: shaped,
+                    proj: line.clone(),
+                    shaped: Arc::new(shaped),
+                    rows,
+                    prefix_bytes,
                     indent,
                     caret_col: (caret_pos.line == idx).then_some(caret_pos.col),
                     selection: sel_by_line[idx].clone(),
                 });
             }
-            (v, widgets)
+            row_starts.push(row_acc);
+            (v, widgets, row_starts)
         });
 
         DocLayout {
@@ -1642,6 +1757,7 @@ impl Element for DocElement {
             widgets,
             origin: bounds.origin,
             line_height: LINE_HEIGHT,
+            row_starts,
         }
     }
 
@@ -1669,11 +1785,14 @@ impl Element for DocElement {
 
         // 先画块级 widget 装饰（面板/网格/分割线），再画文本，保证文字在上层。
         // 渲染态画装饰；编辑态（光标已在块内）不画，露出可编辑内容（SPEC §11.5）。
+        // 装饰块的纵向范围按**视觉行**累计（`row_starts`），软换行下同样正确。
         if !layout.widgets.is_empty() {
             let content_right = element_bounds.origin.x + element_bounds.size.width - BASE;
             for w in &layout.widgets {
-                let top = layout.origin.y + LINE_HEIGHT * w.line_range.start as f32;
-                let bottom = layout.origin.y + LINE_HEIGHT * w.line_range.end as f32;
+                let top =
+                    layout.origin.y + LINE_HEIGHT * layout.row_starts[w.line_range.start] as f32;
+                let bottom =
+                    layout.origin.y + LINE_HEIGHT * layout.row_starts[w.line_range.end] as f32;
                 let left = layout.origin.x + w.indent;
                 let right = content_right.max(left + px(24.));
                 let rect = bounds(point(left, top), size(right - left, bottom - top));
@@ -1703,12 +1822,12 @@ impl Element for DocElement {
                             );
                         }
                     }
-                    // 表格：弱底填充 + 外框 + 每行之间的水平分隔线
+                    // 表格：弱底填充 + 外框 + 每逻辑行之间的水平分隔线
                     WidgetDecorKind::Table if !w.editing => {
                         window.paint_quad(fill(rect, palette.subtle));
                         paint_rect_border(window, rect, palette.border, px(1.));
-                        for row in (w.line_range.start + 1)..w.line_range.end {
-                            let y = layout.origin.y + LINE_HEIGHT * row as f32;
+                        for line in (w.line_range.start + 1)..w.line_range.end {
+                            let y = layout.origin.y + LINE_HEIGHT * layout.row_starts[line] as f32;
                             window.paint_quad(fill(
                                 bounds(point(left, y), size(right - left, px(1.))),
                                 palette.border,
@@ -1720,27 +1839,52 @@ impl Element for DocElement {
             }
         }
 
-        // 逐块绘制：选区高亮底 → 文本 → 光标竖线
+        // 逐块绘制：选区高亮底 → 文本 → 光标竖线（均按视觉行定位）
         for (idx, block) in layout.blocks.iter().enumerate() {
-            let row_top = layout.origin.y + LINE_HEIGHT * idx as f32;
+            let first_row = layout.row_starts[idx];
+            let row_top = layout.origin.y + LINE_HEIGHT * first_row as f32;
             let line_x = layout.origin.x + block.indent;
-            let baseline_origin = point(line_x, row_top);
 
-            // 选区高亮：`selection` 已是本行的显示列区间，直接换算行内 x 填矩形
+            // 选区高亮：`selection` 是本块的显示列区间；按视觉行拆成多段矩形
             if let Some(cols) = &block.selection {
-                let x0 = block.line.x_for_index(cols.start);
-                let x1 = block.line.x_for_index(cols.end);
-                let hl = bounds(
-                    point(baseline_origin.x + x0, row_top),
-                    size(x1 - x0, LINE_HEIGHT),
-                );
-                window.paint_quad(fill(hl, palette.selection));
+                let b0 = block.byte_of_col(cols.start);
+                let b1 = block.byte_of_col(cols.end);
+                if b1 > b0 {
+                    let rb = row_byte_bounds(&block.shaped);
+                    for r in 0..block.rows {
+                        let (rs, re) = (rb[r], rb[r + 1]);
+                        let (s, e) = (b0.max(rs), b1.min(re));
+                        if e <= s {
+                            continue;
+                        }
+                        // 视觉行内 x 相对行首；行首本身 x=0（`position_for_index` 在边界字节
+                        // 会落到上一行，故行首直接取 0）
+                        let x0 = if s == rs {
+                            Pixels::ZERO
+                        } else {
+                            block
+                                .shaped
+                                .position_for_index(s, layout.line_height)
+                                .map_or(Pixels::ZERO, |p| p.x)
+                        };
+                        let x1 = block
+                            .shaped
+                            .position_for_index(e, layout.line_height)
+                            .map_or(Pixels::ZERO, |p| p.x);
+                        let width = if x1 > x0 { x1 - x0 } else { Pixels::ZERO };
+                        let y = row_top + layout.line_height * r as f32;
+                        window.paint_quad(fill(
+                            bounds(point(line_x + x0, y), size(width, layout.line_height)),
+                            palette.selection,
+                        ));
+                    }
+                }
             }
 
-            // 文本本体
-            let _ = block.line.paint(
-                baseline_origin,
-                LINE_HEIGHT,
+            // 文本本体（`WrappedLine::paint` 内部按换行边界逐视觉行绘制）
+            let _ = block.shaped.paint(
+                point(line_x, row_top),
+                layout.line_height,
                 TextAlign::Left,
                 None,
                 window,
@@ -1748,11 +1892,14 @@ impl Element for DocElement {
             );
 
             // 光标竖线：仅在光标所在块绘制（用 prepaint 预计算的 caret_col 显示列）
-            if let Some(col) = block.caret_col {
-                let caret_x = baseline_origin.x + block.line.x_for_index(col);
+            if let Some(col) = block.caret_col
+                && let Some(p) = block
+                    .shaped
+                    .position_for_index(block.byte_of_col(col), layout.line_height)
+            {
                 let caret_rect = bounds(
-                    point(caret_x, row_top + px(2.)),
-                    size(px(1.5), LINE_HEIGHT - px(4.)),
+                    point(line_x + p.x, row_top + p.y + px(2.)),
+                    size(px(1.5), layout.line_height - px(4.)),
                 );
                 window.paint_quad(fill(caret_rect, palette.accent));
             }

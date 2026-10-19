@@ -298,6 +298,58 @@ impl ProjectedLine {
         s
     }
 
+    /// 显示文本的字节长度。
+    pub fn display_byte_len(&self) -> usize {
+        self.runs.iter().map(|r| r.text.len()).sum()
+    }
+
+    /// 显示列（可见字符索引）→ 显示文本内的**字节偏移**（越界钳到文本末）。
+    ///
+    /// 供 UI 把 [`DocPos::col`]（字符列）换算成 `shape_text`/字形索引所需的字节偏移：
+    /// 形状化与换行边界都以显示文本的 UTF-8 字节为单位，而光标/选区用的是字符列。
+    pub fn display_byte_of_col(&self, col: usize) -> usize {
+        let mut chars = 0usize;
+        let mut bytes = 0usize;
+        for r in &self.runs {
+            let n = r.text.chars().count();
+            if col <= chars + n {
+                let want = col - chars;
+                return bytes
+                    + r.text
+                        .char_indices()
+                        .nth(want)
+                        .map_or(r.text.len(), |(b, _)| b);
+            }
+            chars += n;
+            bytes += r.text.len();
+        }
+        bytes
+    }
+
+    /// 显示文本内的**字节偏移** → 显示列（可见字符索引，越界钳到文本末）。
+    ///
+    /// [`display_byte_of_col`](Self::display_byte_of_col) 的逆；字节偏移落在多字节
+    /// 字符内部时，向下吸附到该字符起点（即只统计"完全位于该字节之前"的字符）。
+    pub fn display_col_of_byte(&self, byte: usize) -> usize {
+        let mut chars = 0usize;
+        let mut bytes = 0usize;
+        for r in &self.runs {
+            let rlen = r.text.len();
+            if byte <= bytes + rlen {
+                let want = byte - bytes;
+                let n = r
+                    .text
+                    .char_indices()
+                    .take_while(|&(b, c)| b + c.len_utf8() <= want)
+                    .count();
+                return chars + n;
+            }
+            chars += r.text.chars().count();
+            bytes += rlen;
+        }
+        chars
+    }
+
     /// 行内容未变、仅源坐标整体平移 `delta` 时，产出一行平移后的副本。
     ///
     /// 可见文本、显示位置、样式均不变；只平移行区间、片段区间与
@@ -1015,6 +1067,60 @@ mod tests {
         assert_eq!(p.source_to_doc_pos(0), DocPos::ZERO);
         assert_eq!(p.doc_pos_to_source(DocPos::ZERO), 0);
         assert_eq!(p.display_len_at(0), 0);
+    }
+
+    // ---------- 显示列 ↔ 显示文本字节：SPEC §6.1（软换行布局用） ----------
+
+    #[test]
+    fn display_byte_of_col_mixed_widths() {
+        // "a中b"：字节 0 / 1..4 / 4..5；字符列 0 / 1 / 2 / 3
+        let l = one("a中b");
+        assert_eq!(l.display_text(), "a中b");
+        assert_eq!(l.display_byte_len(), 5);
+        assert_eq!(l.display_byte_of_col(0), 0);
+        assert_eq!(l.display_byte_of_col(1), 1, "中 起于字节 1");
+        assert_eq!(l.display_byte_of_col(2), 4, "b 起于字节 4");
+        assert_eq!(l.display_byte_of_col(3), 5, "列=字符数 → 文本末");
+        assert_eq!(l.display_byte_of_col(99), 5, "越界钳到文本末");
+    }
+
+    #[test]
+    fn display_col_of_byte_inverts_and_snaps() {
+        let l = one("a中b");
+        assert_eq!(l.display_col_of_byte(0), 0);
+        assert_eq!(l.display_col_of_byte(1), 1);
+        assert_eq!(l.display_col_of_byte(4), 2);
+        assert_eq!(l.display_col_of_byte(5), 3);
+        assert_eq!(l.display_col_of_byte(99), 3, "越界钳到文本末");
+        // 落在多字节字符内部：向上取整到该字符之后
+        assert_eq!(l.display_col_of_byte(2), 1, "中 内部 → 吸附到其起点");
+        // 往返一致（列边界）
+        for col in 0..=3 {
+            assert_eq!(l.display_col_of_byte(l.display_byte_of_col(col)), col);
+        }
+    }
+
+    #[test]
+    fn display_byte_of_col_spans_runs() {
+        // "**粗**体"：可见 "粗体"（两段：粗 Strong、体 Normal）
+        let l = one("**粗**体");
+        assert_eq!(l.display_text(), "粗体");
+        assert_eq!(l.runs.len(), 2);
+        assert_eq!(l.display_byte_of_col(0), 0);
+        assert_eq!(l.display_byte_of_col(1), 3, "第二段起点（粗 为 3 字节）");
+        assert_eq!(l.display_byte_of_col(2), 6);
+        assert_eq!(l.display_col_of_byte(3), 1);
+        assert_eq!(l.display_col_of_byte(6), 2);
+    }
+
+    #[test]
+    fn display_byte_of_col_empty_line() {
+        let l = one("");
+        assert_eq!(l.display_byte_len(), 0);
+        assert_eq!(l.display_byte_of_col(0), 0);
+        assert_eq!(l.display_col_of_byte(0), 0);
+        assert_eq!(l.display_byte_of_col(9), 0);
+        assert_eq!(l.display_col_of_byte(9), 0);
     }
 
     // ---------- 块级 widget：SPEC §11.5 / D30 ----------
