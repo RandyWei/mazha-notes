@@ -40,7 +40,8 @@ use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
-    Highlighter, InlineMark, ProjectedLine, RunStyle, Selection, TableOp, TextRun as DocTextRun,
+    Highlighter, InlineMark, ProjectedLine, Projection, RunStyle, Selection, TableOp,
+    TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
     edit_table,
 };
@@ -257,6 +258,50 @@ impl DocLayout {
     }
 }
 
+/// 在软换行布局下，把某处位置向上/向下移动一个**视觉行**，尽量保留水平像素位置。
+///
+/// 返回新的源字节偏移；已是全文首/末个视觉行时返回 `None`（调用方保持原位）。
+///
+/// 计算步骤（视觉行 ≠ 逻辑行，故不能只按逻辑行 +1/-1）：
+/// 1. 用投影把 `caret` 换成 (逻辑行, 显示列)，经 `byte_of_col` + `position_for_index`
+///    反查出该处所在**块内视觉行**与块内 x，加上块缩进得**绝对 x**；
+/// 2. 绝对视觉行 = `row_starts[逻辑行] + 块内视觉行`，上/下一行即 ±1（越界返回 `None`）；
+/// 3. 目标绝对视觉行经 `row_starts` 二分定位到块与块内行，绝对 x 扣掉目标块缩进得块内 x；
+/// 4. 用 `closest_index_for_position` 在目标视觉行上取最近字节 → 显示列 → 源偏移。
+fn visual_vertical_target(
+    layout: &DocLayout,
+    projection: &Projection,
+    caret: usize,
+    step: isize,
+) -> Option<usize> {
+    let pos = projection.source_to_doc_pos(caret);
+    let block = layout.blocks.get(pos.line)?;
+    let byte = block.byte_of_col(pos.col);
+    let p = block.shaped.position_for_index(byte, layout.line_height)?;
+    let cur_row = (p.y / layout.line_height) as usize;
+    let abs_x = block.indent + p.x;
+    let global = *layout.row_starts.get(pos.line)? + cur_row;
+    let total = *layout.row_starts.last()?;
+    let target_global = if step < 0 {
+        global.checked_sub(1)?
+    } else if global + 1 < total {
+        global + 1
+    } else {
+        return None;
+    };
+    let block_idx = layout.row_starts.partition_point(|&s| s <= target_global) - 1;
+    let tblock = layout.blocks.get(block_idx)?;
+    let local_row = target_global - *layout.row_starts.get(block_idx)?;
+    let local_x = (abs_x - tblock.indent).max(Pixels::ZERO);
+    let local_y = layout.line_height * local_row as f32 + layout.line_height / 2.;
+    let tbyte = tblock
+        .shaped
+        .closest_index_for_position(point(local_x, local_y), layout.line_height)
+        .unwrap_or_else(|ix| ix);
+    let tcol = tblock.col_of_byte(tbyte);
+    Some(tblock.proj.offset_map.display_to_source(DisplayPos(tcol)))
+}
+
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
 #[derive(Debug, Clone)]
 struct Cursor {
@@ -452,14 +497,14 @@ impl DocView {
         }
     }
 
-    /// 所有光标上移一行（保持行内相对字符位置，超出则钳到行尾）。
+    /// 所有光标上移一个**视觉行**（软换行：按行折行后逐行移动，保留水平位置）。
     fn move_up(&mut self, shift: bool) {
-        self.move_vertical_all(-1, shift);
+        self.move_visual_vertical(-1, shift);
     }
 
-    /// 所有光标下移一行。
+    /// 所有光标下移一个**视觉行**。
     fn move_down(&mut self, shift: bool) {
-        self.move_vertical_all(1, shift);
+        self.move_visual_vertical(1, shift);
     }
 
     /// 所有光标上/下移动：`step` 为 -1（上）或 +1（下）。
@@ -486,6 +531,35 @@ impl DocView {
                     }
                 }
             };
+            if shift {
+                if c.anchor.is_none() {
+                    c.anchor = Some(c.caret);
+                }
+            } else {
+                c.anchor = None;
+            }
+            c.caret = new_caret;
+        }
+    }
+
+    /// 所有光标上/下移动一个**视觉行**（软换行 D33 收尾），尽量保留水平像素位置。
+    ///
+    /// 有布局时按视觉行走（绕过软换行）；首帧前布局未就绪时回退到逻辑行移动。
+    /// 全文首/末视觉行处不动。不调用 `cx.notify`（由调用方统一触发重绘）。
+    fn move_visual_vertical(&mut self, step: isize, shift: bool) {
+        // 布局未就绪（首帧渲染前）：回退到逻辑行移动
+        if self.layout.is_none() {
+            self.move_vertical_all(step, shift);
+            return;
+        }
+        // 之后 `layout`（self.layout）、`projection`（self.doc）、`self.cursors` 三处借用字段互不重叠
+        let Some(layout) = self.layout.as_ref() else {
+            return;
+        };
+        let projection = self.doc.projection();
+        for c in &mut self.cursors {
+            let new_caret =
+                visual_vertical_target(layout, projection, c.caret, step).unwrap_or(c.caret);
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
