@@ -133,10 +133,17 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
         BlockKind::CodeBlock { lang, .. } => {
             let lang_tag = lang.as_deref().unwrap_or("");
             let mut content = String::new();
+            let mut first = true;
             for sp in &b.spans {
-                if sp.role == SpanRole::CodeContent {
-                    content.push_str(&source[sp.range.clone()]);
+                if sp.role != SpanRole::CodeContent {
+                    continue;
                 }
+                // 片段按行切分且不含行尾换行，段间补 `\n`（空白行片段为空仍占一个换行）
+                if !first {
+                    content.push('\n');
+                }
+                first = false;
+                content.push_str(&source[sp.range.clone()]);
             }
             // 围栏取「内容中最长反引号串 + 1（至少 3）」，避免内容自带 ``` 时提前闭合
             let fence = "`".repeat(longest_backtick_run(&content).max(2) + 1);
@@ -471,6 +478,13 @@ mod tests {
         assert!(t.contains("```rust"));
         assert!(t.contains("fn main() {}"));
         assert!(t.contains("```"));
+    }
+
+    #[test]
+    fn typst_code_block_keeps_newlines() {
+        // CodeContent 片段不含行尾换行，导出时必须补回换行（否则多行代码粘连）
+        let t = to_typst("```rust\nfn a() {}\nfn b() {}\n```\n");
+        assert!(t.contains("fn a() {}\nfn b() {}"), "{t}");
     }
 
     #[test]

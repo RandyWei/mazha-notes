@@ -44,9 +44,9 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 - `mazha-core`：171
 - `mazha-md`：99
-- `mazha-export`：100 单测 + 3 集成（`tests/pdf_real_doc.rs`）
+- `mazha-export`：102 单测 + 3 集成（`tests/pdf_real_doc.rs`）
 - `mazha-crdt`：11
-- 合计 **399** 条（其余为占位 crate 的版本号冒烟测试）
+- 合计 **401** 条（其余为占位 crate 的版本号冒烟测试）
 
 ## 关键决策（详见 SPEC §14 / `docs/ADR`）
 
@@ -85,10 +85,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 2. `mazha-export`：字体子集（Web，Phase 7）
 3. `mazha-crdt`：多文档名册；`mazha-store` 文件监听（`watch`，Phase 5）
 
-## 提交历史（近期，共 66 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 67 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(core): 查找/替换（find_all/replace_all）+ 桌面 Cmd+F 查找条（0.1.49，Phase 3）>
+<本次提交：fix(export): 多行代码块导出丢失换行（HTML/Typst，R8 同类缺陷）>
+b6fd01b feat(core): 查找/替换（find_all/replace_all）+ 桌面 Cmd+F 查找条（0.1.49，Phase 3）
 dfa6b15 feat(desktop): 按视觉行上下移动（visual_vertical_target，软换行 D33 收尾，Phase 3）
 423f2db feat(desktop): 系统剪贴板 Cmd+C/X/V 复制/剪切/粘贴（0.1.47，Phase 3）
 d389872 feat(core): 软换行（显示列↔字节换算 + 桌面 shape_text 视觉行布局，D33，Phase 3）

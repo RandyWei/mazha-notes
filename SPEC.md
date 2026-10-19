@@ -27,7 +27,7 @@
 | 产品定位 | 个人笔记/知识库 + 开发者文档 + 通用写作 + 团队协作文档 |
 | 编辑器形态 | **WYSIWYG 所见即所得**（Typora 式，无预览窗、无同步循环） |
 | 编辑器内核 | **源文本为真相**（rope 存原文 + 增量解析 + 显示/源偏移映射） |
-| Markdown 方言 | **GFM + 知识库扩展**（wiki-link / callout / front-matter / 标签） |
+| Markdown 方言 | **GFM + 知识库扩展**（wiki-link / callout / front-matter / 标签 / 公式 `$…$` `$$…$$`） |
 | 文档存储 | **本地文件 + 文件夹**（一文档一 `.md`），用户自选目录 |
 | 多端同步 | **计划云同步**；底层现在就引入 **CRDT（yrs）**，CRDT 内保存 Markdown 源文本 |
 | 扩展机制 | **WASM 插件运行时**（连接自部署/自定义存储、第三方能力） |
@@ -165,7 +165,7 @@ mazha-notes-v2/
 | crate | 职责 | 不依赖 | 关键类型/接口 |
 |-------|------|--------|----------------|
 | `mazha-core` | 文档模型、编辑命令、撤销栈、光标/选区、显示↔源偏移映射、投影生成、表格结构编辑、代码块语法高亮、查找/替换 | 任何 GUI | `Document` `Edit` `Projection` `OffsetMap` `Selection` `edit_table` `Highlighter` `find_all` `replace_all` |
-| `mazha-md` | Markdown 解析、GFM+知识库方言、增量解析（脏块重解析）、序列化 | GUI | `parse` `SyntaxSpan` `Block` `serialize` |
+| `mazha-md` | Markdown 解析、GFM+知识库方言、公式（行内 `$…$` + 块级 `$$…$$`）、增量解析（脏块重解析）、序列化 | GUI | `parse` `SyntaxSpan` `Block` `serialize` |
 | `mazha-crdt` | 用 yrs 维护 `Y.Text`，同步协议、状态向量、合并、持久化更新 | GUI | `CrdtDoc` `SyncMessage` |
 | `mazha-store` | 存储 Provider 抽象 + 本地文件系统实现 + 文件监听 | GUI | `StorageProvider` `FileSystemProvider` |
 | `mazha-export` | 源文本 → HTML / PDF / DOCX / EPUB | GUI | `to_html` / `to_pdf` / `to_docx` / `to_epub` |
@@ -270,7 +270,7 @@ pub struct BlockStyle {
 pub struct TextRun {
     pub source_range: Range<usize>,  // 连续可见文本的源字节范围
     pub display_start: usize,        // 首字符的显示字符列
-    pub style: RunStyle,             // Normal/Emphasis/Strong/Strikethrough/InlineCode/LinkText
+    pub style: RunStyle,             // Normal/Emphasis/Strong/Strikethrough/InlineCode/LinkText/Math
     pub text: String,                // 可见文本
 }
 
@@ -292,6 +292,8 @@ pub enum BlockWidgetKind {
     Code { lang: Option<String>, fenced: bool },  // 代码块（围栏/缩进）
     Table { align: Vec<Align> },                  // GFM 表格（列对齐）
     Rule,                                         // 分割线（单行）
+    Math,                                         // 显示公式块（`$$…$$`，D34）
+    Chart { lang: String },                       // 图表块（mermaid 等，D34）
 }
 
 /// 显示偏移 ↔ 源偏移 双向映射（WYSIWYG 最关键的数据结构）
@@ -526,7 +528,7 @@ interface Workspace {
 - [ ] 打开/保存 Markdown 文件；文件树；新建/重命名/删除/移动
 - [ ] WYSIWYG 编辑：标题、粗体、斜体、删除线、行内代码、链接、引用、有序/无序/任务列表
 - [ ] 基础块：代码块（高亮）、图片、表格（增删行列）、脚注
-- [ ] 公式（`$…$` / `$$…$$`）与 Mermaid 图表
+- [ ] 公式（`$…$` / `$$…$$`）与 Mermaid 图表（**解析与模型**已实现 0.1.51；所见即所得排版待 ratex / mermaid-rs 接入）
 - [ ] 多标签页、命令面板、快捷键体系
 - [ ] 导出 HTML / PDF（纯 Rust）
 
@@ -577,6 +579,7 @@ interface Workspace {
 6. **输入意图转换**：列表续行、Tab 缩进、`>`/`-`/`#` 自动补全、选区包裹（`Cmd+B` 等）、自动配对括号，全部先转成 `Edit` 再应用。
 7. **系统剪贴板**：`Cmd+C`/`Cmd+X`/`Cmd+V` 复制/剪切/粘贴纯文本（`Cmd+A` 全选已有的选区集合）。多光标时：复制把所有选区按文档顺序以换行拼接；剪切/粘贴按光标**位置倒序**逐个应用，避免靠前编辑使靠后光标偏移失效；剪贴板仅取纯文本（忽略图片/文件），空选区不覆盖剪贴板。
 8. **查找/替换**：`Cmd+F` 展开查找条（查询框 + 替换框 + 匹配计数 + 大小写开关）。`Enter`/`Shift+Enter` 跳上/下一个匹配、`Tab` 切换查找/替换框、`Cmd+Enter` 替换当前、`Cmd+Shift+Enter` 替换全部、`Cmd+Alt+C` 切换大小写敏感、`Esc` 关闭。查找/替换逻辑是核心纯函数 `mazha_core::{find_all, replace_all, replace_all_edit}`（大小写不敏感按字符 `to_lowercase` 比较，支持非 ASCII；不支持正则捕获组），替换全量为单次全文 `Edit::Replace`（一条撤销记录）。桌面查找框为静态文本输入（无 IME），满足 MVP。
+9. **公式/图表占位**（D34）：`$$…$$` 显示公式块与 mermaid 围栏块各归类为一个**块级 widget**（`BlockWidgetKind::{Math, Chart}`），光标不在块内时按块画占位面板（描边 + 「公式」/「图表」标签），光标进入切回编辑态（显示 TeX/mermaid 源文本，与代码块同规则）；行内 `$…$` 的 `$` 标记隐藏、公式体作为可见文本并用 `RunStyle::Math`（斜体 + 主题色）区分。所见即所得的数学排版与图表 SVG 属渲染层（`ratex-*` / `mermaid-rs-renderer`），不在本阶段范围（风险 R4）。
 
 ---
 
@@ -593,7 +596,7 @@ interface Workspace {
 - [ ] 打开一个含标题/列表/表格/代码/公式/图表的 `.md`，正确 WYSIWYG 渲染
 - [ ] 编辑后保存，文件内容为无损 Markdown（往返 `serialize(parse(x)) == x` 对稳定块成立）
 - [ ] 中文输入法（IME）在隐藏标记的行上候选框位置正确
-- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；系统剪贴板复制/剪切/粘贴（桌面已实现，0.1.47）；查找/替换（核心 `find_all`/`replace_all` + 桌面 `Cmd+F` 面板已实现，0.1.49）；公式与图表正确渲染（待解析器支持）
+- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；软换行（核心显示列↔字节换算 + 桌面按视觉行布局已实现，0.1.46）；系统剪贴板复制/剪切/粘贴（桌面已实现，0.1.47）；查找/替换（核心 `find_all`/`replace_all` + 桌面 `Cmd+F` 面板已实现，0.1.49）；公式与图表**已解析并入块级 widget 模型**（核心 `BlockWidgetKind::{Math,Chart}` + 桌面板与 `RunStyle::Math` 已实现，0.1.51），真实排版待 ratex / mermaid-rs
 - [ ] 导出 HTML/PDF 内容与编辑区一致
 
 ### 12.3 跨平台一致性（长期）
@@ -659,6 +662,7 @@ interface Workspace {
 | D31 | 表格增删行列的实现位置 | 表格结构编辑（增删行列）作为**核心纯函数** `edit_table(source, caret, TableOp) -> Option<Edit>`（`mazha-core::table`），而非 UI 直接改字符串：核心用解析器定位光标所在 `BlockKind::Table` 块，把该区域解析成 `TableModel{header, align, rows}`，套用结构变更后**规范化重写整块**（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`。理由：① 结构变更（行/列索引、转义 `\|`、对齐保留）是可无 UI 单测的纯逻辑，先测试后实现；② 走 `Edit` 通道才能正确纳入 undo/redo 与投影重建；③ 规范化重写牺牲原表格的空白风格，换取实现简单与结果可预测（后续如需保留风格可改增量编辑）。光标定位用整块偏移（非字符级），"删唯一列 / 在表头删行"等不产生变化时返回 `None` | 确认（见 SPEC §6.1/§11.5） |
 | D32 | 代码块语法高亮的引擎与位置 | 用 **syntect**（Sublime 语法定义）做语法高亮，作为**核心纯模块** `mazha-core::highlight`（不依赖 GUI）：`Highlighter::with_theme(name)` 持有内置 `SyntaxSet`（大、需复用），`highlight(code, lang) -> Vec<Vec<ColoredRun>>` 逐行返回带前景色片段（区间相对行首），语言名按扩展名/词元/语法名匹配、未命中回退纯文本。引擎用**纯 Rust 的 fancy-regex**（`default-features=false, features=["default-fancy","default-syntaxes","default-themes"]`），避免 `onig` 的 C 依赖与交叉编译/移动端工具链风险。理由：① 输出（源文本→着色区间）是可无 UI 单测的纯逻辑，多端复用；② 不把 `syntect` 类型泄进公共 API（对外只用 `(u8,u8,u8)`）；③ UI 按显示文本切分着色（代码块行显示文本 == 源码行内容），无需再做源↔显示换算。取舍：syntect 会显著增大 `mazha-core` 体积（含语法/主题 dump），后续如体积敏感可下沉到独立 crate 或按特性裁剪 | 确认（见 SPEC §6.1/§11.5） |
 | D33 | 软换行的实现层次与坐标模型 | **软换行放在 UI 层**（`platforms/desktop`），不改变核心的"逻辑行 + 显示字符列"坐标模型：每条投影行用 gpui `shape_text`（带 `wrap_width = 内容宽度`）折成一条 `WrappedLine`（内含多个换行边界 = 视觉行）。布局几何按视觉行累计（`DocLayout::row_starts`），命中测试、光标竖线、选区高亮、IME 候选框、块级 widget 装饰的纵向范围都以**视觉行**为单位；光标与选区仍以逻辑行 + 显示**字符列**表示（`DocPos`/`LineDisplayRange` 不变）。显示字符列 ↔ 字形字节索引的换算由核心 `ProjectedLine::display_byte_of_col`/`display_col_of_byte`（纯逻辑、可单测）承担——形状化与换行边界以显示文本的 UTF-8 字节为单位，而投影/偏移映射以字符列为单位（引用 `"> "` 等投影外前缀以 `prefix_bytes` 计入）。理由：① 换行依赖像素宽度（字体度量），属 UI 关注点，核心保持无 GUI、可单测；② 复用 gpui 的换行/命中（`WrappedLine::position_for_index`/`closest_index_for_position`），避免自研断行；③ 顺手修正桌面端先前"以字符列当字节索引"喂 `x_for_index` 的 CJK 隐患。取舍与限制：上下移动已按**视觉行**行走（0.1.48 `visual_vertical_target`：绝对 x 跨块携带、目标行窄则钳到行内、越界不动）；不实现横向滚动/超长不可断行（如超长 URL）溢出（溢出即被裁切）；块级装饰纵向范围随换行伸展 | 确认（见 SPEC §7.1/§11.5） |
+| D34 | 公式/图表的解析与建模 | **解析放 `mazha-md`，归类放 `mazha-core`，真排版留渲染层**。① 块级显示公式 `$$…$$` 新增 `BlockKind::MathBlock`（行首缩进 ≤3 开启；同行内闭合即单行块，否则扫描到仅含 `$$` 的行；未闭合延伸到文档末尾，与未闭合围栏同规则，增量裁切点校验 `is_unclosed_fence` 同样覆盖），`$$` 记 `SpanRole::MathMarker`（隐藏）、公式体记 `SpanRole::Math`（可见）。② 行内公式 `$…$` 由行内扫描产出 `SpanRole::{MathMarker, Math}`，规则为：开 `$` 右侧非空白且左侧非字母数字（或行首）、闭 `$` 左侧非空白且右侧非数字（避免 `$5`/`$10` 误判）、内容非空且不跨行、`$$` 在行内不构成行内公式；转义 `\$` 仍走既有转义分支。③ **mermaid 不改解析器**（` ```mermaid ` 本就是 `CodeBlock{lang}`），由核心投影归类为 `BlockWidgetKind::Chart { lang }`；`BlockKind::MathBlock` 归类为 `BlockWidgetKind::Math`（D30 的"待解析器支持后再加变体"至此补齐）。④ 行内公式体用 `RunStyle::Math`（斜体 + 主题色）区分。⑤ 导出：HTML `<span class="math">` / `<div class="math">`；Typst/DOCX 按字面量输出（`#raw` / 纯文本，遵循 R8"行内代码用 `#raw`"的先例——**不**塞进 Typst `$…$` 数学模式，以免 `\frac` 等 LaTeX 命令令 `typst::compile` 报错而让 PDF 导出失败）。取舍：所见即所得的数学排版（`ratex-*`）与图表 SVG（`mermaid-rs-renderer`）属渲染层、风险 R4，本阶段只做占位面板；行内公式暂不作为 `SpanKind::Widget`（否则源文本整段被隐藏而 UI 尚无公式渲染，会凭空"丢字"），保留可见文本 | 确认（见 SPEC §6.1/§11.5/§11.9） |
 
 ---
 
@@ -716,6 +720,7 @@ interface Workspace {
 | 0.1.47 | 2026-10-16 | **系统剪贴板**（Phase 3，SPEC §11.7/§12.2，编辑器扩展）：桌面端 `platforms/desktop` 新增 `DocView::{copy_selection, cut_selection, paste}`——复制/剪切把所有光标选区（`all_selections` 去重合并）按文档顺序以换行拼接后 `write_to_clipboard`；粘贴读系统剪贴板纯文本（`item.text()`，忽略图片/文件）替换各光标选区（无选区则插入）。多光标安全：剪切/粘贴按光标**位置倒序**逐个应用 `Edit`，避免靠前编辑使靠后光标偏移失效。快捷键 `Cmd+C`/`Cmd+X`（不带 Shift，避免与 `Cmd+Shift+X` 删除线冲突）/`Cmd+V` 接入。仅桌面 UI 逻辑，无核心改动、无新单测（桌面端无测试基建），core **160**（总计 **388**）。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证剪贴板效果） |
 | 0.1.48 | 2026-10-16 | **按视觉行上下移动**（Phase 3 软换行 D33 收尾，SPEC §7.1/§11/§12.2）：桌面端上下移动由逻辑行 ±1 改为**视觉行** ±1。新增自由函数 `visual_vertical_target(layout, projection, caret, step) -> Option<usize>`：① 用投影换出 (逻辑行, 显示列) → `byte_of_col` + `position_for_index` 反查块内视觉行与块内 x，加块缩进得**绝对 x**；② 绝对视觉行 = `row_starts[行] + 块内行`，±1（越界 `None` 即不动）；③ `row_starts` 二分定位目标块与块内行，绝对 x 扣目标块缩进得块内 x；④ `closest_index_for_position` 取目标视觉行最近字节 → 显示列 → 源偏移。`move_up`/`move_down` 改调 `move_visual_vertical`（首帧布局未就绪时回退 `move_vertical_all` 逻辑行）。保留 Shift 扩展选区语义。仅桌面 UI 逻辑，无核心改动、无新单测，core **160**（总计 **388**）。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证上下移动效果） |
 | 0.1.49 | 2026-10-16 | **查找/替换**（Phase 3，SPEC §11.8/§12.2，编辑器扩展）：核心新增 `mazha-core::find`——纯函数 `find_all(text, pattern, case_sensitive) -> Vec<Range<usize>>`（非重叠、按出现顺序；大小写不敏感按字符 `to_lowercase` 比较、支持非 ASCII；空模式返回空）、`replace_all(...) -> String`、`replace_all_edit(...) -> Option<Edit>`（单次全文 `Edit::Replace`，无变化返回 `None`，一条撤销记录）。不支持正则捕获组。先测试后实现：11 条单测（大小写敏感/不敏感、非重叠相邻、空模式/无匹配、CJK、多字节偏移、替换基础/大小写/CJK、替换编辑产生/无变化为 `None`），core **171**（总计 **399**）。桌面端接入：`FindState`（展开态/聚焦框/大小写/查询/替换/匹配/序号）+ `open_find`/`close_find`/`recompute_matches`/`goto_match`/`find_next`/`find_prev`/`replace_current`/`replace_all_now`；`Cmd+F` 展开、查找条展开时 `handle_find_key` 接管全部按键（`Enter`/`Shift+Enter` 跳、`Tab` 切换框、`Cmd+Enter`/`Cmd+Shift+Enter` 替换、`Cmd+Alt+C` 大小写、`Esc` 关闭）；匹配以选区高亮显示。查找框为静态文本输入（无 IME），满足 MVP。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证查找替换效果） |
+| 0.1.50 | 2026-10-16 | **修复：多行围栏代码块导出丢换行**（R8 同类缺陷，非新决策）：`CodeContent` 片段按行切分且**不含行尾换行**，`mazha-export` 直接串接导致 `fn a() {}fn b() {}` 粘连（代码内空白行同理）。HTML `render_block` 与 Typst `block_to_typst` 的代码块分支改为片段间补 `\n`（空白行片段为空，仍占一个换行；DOCX 原本用 `line_break` 已正确）。新增 2 条回归测试；export **102**（总计 **401**）。仅影响导出，编辑区投影不受影响 |
 
 ---
 

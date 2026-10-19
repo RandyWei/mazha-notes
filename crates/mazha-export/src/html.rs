@@ -218,11 +218,19 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool, xhtm
                 let _ = write!(out, " class=\"language-{}\"", escape_attr(lang));
             }
             out.push('>');
-            // 汇总所有 CodeContent 片段（围栏标记不输出）
+            // 汇总所有 CodeContent 片段（围栏标记不输出）。
+            // 片段按行切分且**不含行尾换行**，故段间补一个 `\n`，
+            // 否则多行代码会被拼成一行；空白行片段为空，同样占一个换行。
+            let mut first = true;
             for sp in &block.spans {
-                if sp.role == SpanRole::CodeContent {
-                    out.push_str(&escape_text(&source[sp.range.clone()]));
+                if sp.role != SpanRole::CodeContent {
+                    continue;
                 }
+                if !first {
+                    out.push('\n');
+                }
+                first = false;
+                out.push_str(&escape_text(&source[sp.range.clone()]));
             }
             out.push_str("</code></pre>");
         }
@@ -516,6 +524,20 @@ mod tests {
         assert_eq!(
             to_html("```rust\nfn f() {}\n```\n"),
             "<pre><code class=\"language-rust\">fn f() {}</code></pre>"
+        );
+    }
+
+    #[test]
+    fn multiline_code_block_keeps_newlines() {
+        // CodeContent 片段按行切分且不含行尾换行，导出时必须补回换行
+        assert_eq!(
+            to_html("```rust\nfn a() {}\nfn b() {}\n```\n"),
+            "<pre><code class=\"language-rust\">fn a() {}\nfn b() {}</code></pre>"
+        );
+        // 代码中的空白行同样保留
+        assert_eq!(
+            to_html("```\na\n\nb\n```\n"),
+            "<pre><code>a\n\nb</code></pre>"
         );
     }
 
