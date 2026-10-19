@@ -10,6 +10,12 @@ authors.workspace = true
 [dependencies]
 ropey = "1"
 thiserror = "2"
+# 语法高亮：用纯 Rust 的 fancy-regex 引擎（避免 onig 的 C 依赖），并自带语法/主题 dump
+syntect = { version = "5", default-features = false, features = [
+    "default-fancy",
+    "default-syntaxes",
+    "default-themes",
+] }
 mazha-md = { path = "../mazha-md" }
 mazha-store = { path = "../mazha-store" }
 mazha-crdt = { path = "../mazha-crdt" }

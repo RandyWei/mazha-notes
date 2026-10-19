@@ -35,8 +35,9 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, BlockTarget, BlockWidgetKind, DisplayPos, DocPos, Document, Edit, InlineMark,
-    OffsetMap, ProjectedLine, RunStyle, Selection, TableOp, TextRun as DocTextRun,
+    BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
+    Highlighter, InlineMark, OffsetMap, ProjectedLine, RunStyle, Selection, TableOp,
+    TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
     edit_table,
 };
@@ -272,6 +273,8 @@ struct DocView {
     mono_font_size: Pixels,
     /// 主题色快照。
     palette: Palette,
+    /// 代码块语法高亮器（首次渲染时惰性创建并复用；`SyntaxSet` 较大）。
+    highlighter: Option<Highlighter>,
 }
 
 impl DocView {
@@ -295,6 +298,7 @@ impl DocView {
             mono_font: theme.mono_font_family.clone(),
             mono_font_size: theme.mono_font_size,
             palette,
+            highlighter: None,
         }
     }
 
@@ -1302,6 +1306,7 @@ fn to_gpui_run(
 /// 把一整块投影行（引用前缀 + 可见片段）拼成一条不换行的可见文本 + 对应 gpui 样式段。
 ///
 /// 返回 `(完整可见文本, gpui_runs)`。引用前缀 `> ` 用 muted 色，其余用片段自身样式。
+/// `highlight` 为代码块行的语法高亮片段（相对该行显示文本；`None` = 不高亮）。
 fn build_line_runs(
     line: &ProjectedLine,
     base_font: &Font,
@@ -1309,6 +1314,7 @@ fn build_line_runs(
     mono_size: Pixels,
     base_size: Pixels,
     palette: &Palette,
+    highlight: Option<&[ColoredRun]>,
 ) -> (SharedString, Vec<gpui::TextRun>) {
     let mut text = String::new();
     let mut runs: Vec<gpui::TextRun> = Vec::new();
@@ -1327,8 +1333,34 @@ fn build_line_runs(
         text.push_str(prefix);
     }
 
-    // 代码块内容行整体等宽 + 弱底色
     let size = block_font_size(&line.block, base_size, mono_size);
+
+    // 代码块行 + 有语法高亮：按高亮区间切分可见文本，逐段着色（等宽 + 弱底色）。
+    if line.block.code_block
+        && let Some(spans) = highlight
+    {
+        let content = line.display_text();
+        for span in spans {
+            let Some(seg) = content.get(span.range.clone()) else {
+                continue; // 防御：越界片段跳过
+            };
+            if seg.is_empty() {
+                continue;
+            }
+            runs.push(gpui::TextRun {
+                len: seg.len(),
+                font: mono_font.clone(),
+                color: rgb_to_hsla(span.color),
+                background_color: Some(palette.subtle),
+                underline: None,
+                strikethrough: None,
+            });
+            text.push_str(seg);
+        }
+        return (text.into(), runs);
+    }
+
+    // 其余情况（含未高亮的代码块）：按投影片段拼接
     for run in &line.runs {
         let mut gp = to_gpui_run(run, base_font, mono_font, mono_size, size, palette);
         if line.block.code_block {
@@ -1343,6 +1375,12 @@ fn build_line_runs(
     // 分割线：不在此处画字符，改由 `paint` 依块级 widget 画一条真实细线（SPEC §11.5、D30）。
 
     (text.into(), runs)
+}
+
+/// 把 `(r, g, b)`（syntect 前景色）转成 gpui 的 [`Hsla`]。
+fn rgb_to_hsla((r, g, b): (u8, u8, u8)) -> Hsla {
+    let hex = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    gpui::rgb(hex).into()
 }
 
 /// 块在屏幕上的横向缩进（引用深度 + 列表缩进），单位为像素。
@@ -1529,10 +1567,51 @@ impl Element for DocElement {
                     }
                 }
             }
+            // 代码块语法高亮：把连续代码行聚成一段，按语言一次性着色（SPEC §11.5、§12.2）。
+            // 浅色主题用浅色高亮主题，深色主题用深色主题。
+            let theme_name = if palette.background.l < 0.5 {
+                "base16-ocean.dark"
+            } else {
+                "InspiredGitHub"
+            };
+            let highlighter = view
+                .highlighter
+                .get_or_insert_with(|| Highlighter::with_theme(theme_name));
+            let mut code_hl: Vec<Option<Vec<ColoredRun>>> = vec![None; projection.lines.len()];
+            let mut ci = 0usize;
+            while ci < projection.lines.len() {
+                if !projection.lines[ci].block.code_block {
+                    ci += 1;
+                    continue;
+                }
+                let start = ci;
+                let lang = projection.lines[ci].block.code_lang.clone();
+                let mut code = String::new();
+                while ci < projection.lines.len() && projection.lines[ci].block.code_block {
+                    if ci > start {
+                        code.push('\n');
+                    }
+                    code.push_str(&projection.lines[ci].display_text());
+                    ci += 1;
+                }
+                let highlighted = highlighter.highlight(&code, lang.as_deref());
+                for (k, spans) in highlighted.into_iter().enumerate() {
+                    if let Some(slot) = code_hl.get_mut(start + k) {
+                        *slot = Some(spans);
+                    }
+                }
+            }
             let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
             for (idx, line) in projection.lines.iter().enumerate() {
-                let (text, runs) =
-                    build_line_runs(line, &base_font, &mono_font, mono_size, base_size, &palette);
+                let (text, runs) = build_line_runs(
+                    line,
+                    &base_font,
+                    &mono_font,
+                    mono_size,
+                    base_size,
+                    &palette,
+                    code_hl[idx].as_deref(),
+                );
                 // 用统一字体排版，保证行高一致（粗斜体/等宽在 runs 内体现）
                 let line_font = base_font.clone();
                 let uniform_runs: Vec<gpui::TextRun> = runs

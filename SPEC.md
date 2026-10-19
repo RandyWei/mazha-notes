@@ -164,7 +164,7 @@ mazha-notes-v2/
 
 | crate | 职责 | 不依赖 | 关键类型/接口 |
 |-------|------|--------|----------------|
-| `mazha-core` | 文档模型、编辑命令、撤销栈、光标/选区、显示↔源偏移映射、投影生成 | 任何 GUI | `Document` `Edit` `Projection` `OffsetMap` `Selection` |
+| `mazha-core` | 文档模型、编辑命令、撤销栈、光标/选区、显示↔源偏移映射、投影生成、表格结构编辑、代码块语法高亮 | 任何 GUI | `Document` `Edit` `Projection` `OffsetMap` `Selection` `edit_table` `Highlighter` |
 | `mazha-md` | Markdown 解析、GFM+知识库方言、增量解析（脏块重解析）、序列化 | GUI | `parse` `SyntaxSpan` `Block` `serialize` |
 | `mazha-crdt` | 用 yrs 维护 `Y.Text`，同步协议、状态向量、合并、持久化更新 | GUI | `CrdtDoc` `SyncMessage` |
 | `mazha-store` | 存储 Provider 抽象 + 本地文件系统实现 + 文件监听 | GUI | `StorageProvider` `FileSystemProvider` |
@@ -181,6 +181,7 @@ platforms/desktop ─▶ mazha-core ─┬─▶ mazha-md
                                  ├─▶ mazha-store
                                  ├─▶ mazha-export
                                  ├─▶ mazha-plugin ─▶ wasmtime/wasmi
+                                 ├─▶ syntect（代码高亮，纯 Rust fancy-regex）
                                  └─▶ (mazha-ffi / mazha-wasm 为平台绑定入口)
 ```
 
@@ -219,6 +220,14 @@ pub enum TableOp {
     DeleteRow, DeleteColumn,
 }
 fn edit_table(source: &str, caret: usize, op: TableOp) -> Option<Edit>;
+
+/// 代码块语法高亮（纯逻辑、无 GUI）：一段代码 → 每行的带前景色片段
+pub struct Highlighter { /* 内置 SyntaxSet + Theme */ }
+pub struct ColoredRun { pub range: Range<usize>, pub color: (u8, u8, u8) } // range 相对行首
+impl Highlighter {
+    pub fn with_theme(theme: &str) -> Self;                              // 内置主题名；未知则回退
+    pub fn highlight(&self, code: &str, lang: Option<&str>) -> Vec<Vec<ColoredRun>>;
+}
 
 /// 输入意图 → 编辑命令 的转换（缩进、列表续行、自动配对等）
 pub trait IntentMapper {
@@ -572,7 +581,7 @@ interface Workspace {
 - [ ] 打开一个含标题/列表/表格/代码/公式/图表的 `.md`，正确 WYSIWYG 渲染
 - [ ] 编辑后保存，文件内容为无损 Markdown（往返 `serialize(parse(x)) == x` 对稳定块成立）
 - [ ] 中文输入法（IME）在隐藏标记的行上候选框位置正确
-- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（待做）；公式与图表正确渲染（待解析器支持）
+- [ ] 表格可增删行列（核心 `edit_table` + 桌面快捷键已实现，0.1.44）；代码块有语法高亮（核心 `Highlighter` + 桌面接入已实现，0.1.45）；公式与图表正确渲染（待解析器支持）
 - [ ] 导出 HTML/PDF 内容与编辑区一致
 
 ### 12.3 跨平台一致性（长期）
@@ -636,6 +645,7 @@ interface Workspace {
 | D29 | 桌面端坐标/选区实现 | `platforms/desktop` 不再自行维护行归属与偏移换算：行归属用 `Projection::line_of_source`、上下移动按 `DocPos` 保留**显示列**（修正 CJK 字节相对偏移缺陷）、选区高亮用 `selection_display_ranges` 折成每行显示列、IME 候选框用 `source_to_doc_pos` 定位；行内命中仍用缓存 `BlockGeom` 的 `OffsetMap`（只读路径无法借 `&mut` 取投影）。删除桌面端内联 `line_index`/`ranges_overlap`/`apply_edit_all` 等死代码与借用冲突（诸如 `cursors_mut(&mut self)` 触及整 `self` 导致的连锁借用错误） | 确认（见 SPEC §6.1/§11.3） |
 | D30 | 块级 widget 建模位置 | 块级 widget（代码块/表格/分割线…）作为**核心投影**的一部分：`Projection.widgets: Vec<BlockWidget>` + `block_widget_at`/`block_widget_on_line` 查询；每个 widget 记 `source_range`（整块）+ `line_range`（逻辑行）。核心只给"分组与范围"，具体绘制（面板/网格/高亮）留在 UI；"光标进入才可编辑"由 UI 用 `block_widget_on_line(光标行)` 判定。理由：分组/范围是可无 UI 单测的纯逻辑，且被多端（桌面/移动/Web）复用；公式/图表待解析器支持后再加 `BlockWidgetKind` 变体 | 确认（见 SPEC §6.1/§11.5） |
 | D31 | 表格增删行列的实现位置 | 表格结构编辑（增删行列）作为**核心纯函数** `edit_table(source, caret, TableOp) -> Option<Edit>`（`mazha-core::table`），而非 UI 直接改字符串：核心用解析器定位光标所在 `BlockKind::Table` 块，把该区域解析成 `TableModel{header, align, rows}`，套用结构变更后**规范化重写整块**（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`。理由：① 结构变更（行/列索引、转义 `\|`、对齐保留）是可无 UI 单测的纯逻辑，先测试后实现；② 走 `Edit` 通道才能正确纳入 undo/redo 与投影重建；③ 规范化重写牺牲原表格的空白风格，换取实现简单与结果可预测（后续如需保留风格可改增量编辑）。光标定位用整块偏移（非字符级），"删唯一列 / 在表头删行"等不产生变化时返回 `None` | 确认（见 SPEC §6.1/§11.5） |
+| D32 | 代码块语法高亮的引擎与位置 | 用 **syntect**（Sublime 语法定义）做语法高亮，作为**核心纯模块** `mazha-core::highlight`（不依赖 GUI）：`Highlighter::with_theme(name)` 持有内置 `SyntaxSet`（大、需复用），`highlight(code, lang) -> Vec<Vec<ColoredRun>>` 逐行返回带前景色片段（区间相对行首），语言名按扩展名/词元/语法名匹配、未命中回退纯文本。引擎用**纯 Rust 的 fancy-regex**（`default-features=false, features=["default-fancy","default-syntaxes","default-themes"]`），避免 `onig` 的 C 依赖与交叉编译/移动端工具链风险。理由：① 输出（源文本→着色区间）是可无 UI 单测的纯逻辑，多端复用；② 不把 `syntect` 类型泄进公共 API（对外只用 `(u8,u8,u8)`）；③ UI 按显示文本切分着色（代码块行显示文本 == 源码行内容），无需再做源↔显示换算。取舍：syntect 会显著增大 `mazha-core` 体积（含语法/主题 dump），后续如体积敏感可下沉到独立 crate 或按特性裁剪 | 确认（见 SPEC §6.1/§11.5） |
 
 ---
 
@@ -688,6 +698,7 @@ interface Workspace {
 | 0.1.42 | 2026-10-16 | **块级 widget 模型**（Phase 3，SPEC §6.1/§11.5，D30）：`mazha-core` 的 `Projection` 新增 `widgets: Vec<BlockWidget>`——把代码块/表格/分割线聚成**整块**模型（`source_range` 整块 + `line_range` 逻辑行 + `BlockWidgetKind::{Code{lang,fenced}, Table{align}, Rule}`），供 UI 按"光标不在块内=渲染态、进入=编辑态"整体绘制。新增查询 `block_widgets()`/`block_widget_at(src)`/`block_widget_on_line(line)`；`build_from`/`refresh` 均重算 widgets（refresh 由新块森林全量重算，O(块数)）；core 新增导出 `BlockWidget`/`BlockWidgetKind` 及 `Align`（复用解析层类型）。先测试后实现，9 条新单测（围栏代码块/无语言/表格对齐/分割线/源序/普通段落无 widget/内联图片不产块级 widget/lookup/引用内代码块）；`assert_projection_matches` 增加 widgets 一致性断言；core 138（总计 **366**）。桌面端渲染待下一提交 |
 | 0.1.43 | 2026-10-16 | **桌面端块级 widget 渲染**（Phase 3，SPEC §11.5、D30）：`platforms/desktop` 依核心 `Projection::block_widgets` 在文本层**之下**先画块级装饰——代码块面板描边 + 右上角语言标签（等宽 `shape_line`）、表格弱底 + 外框 + 行分隔线、分割线真实细线（取代旧的 `─` 文本占位）；光标进入块内则隐藏装饰（编辑态），判定用 `Projection::block_widget_on_line`。`DocLayout` 新增 `widgets: Vec<WidgetDecor>`，prepaint 由 `block_widgets()` 投影（先取光标源偏移再借 `doc.projection()` 避免借用冲突）。门禁：workspace fmt/clippy/test 全绿（**366**）；桌面端 `fmt`/`clippy -D warnings`/`build` 全绿（本环境无法可视化验证渲染效果） |
 | 0.1.44 | 2026-10-16 | **表格增删行列**（Phase 3，SPEC §11.5/§12.2，D31）：新增 `mazha-core::table`——纯函数 `edit_table(source, caret, TableOp) -> Option<Edit>`，把"光标所在表格块"解析成 `TableModel{header, align, rows}`，套用 `InsertRowAbove/Below`、`InsertColumnLeft/Right`、`DeleteRow/Column` 后规范化重写整块（带首尾竖线、按对齐重写分隔行），产出单次 `Edit::Replace`；核心导出 `TableOp`/`edit_table`。边界：光标在表格外、删唯一列、在表头/分隔行删行 → `None`；转义 `\|` 不拆列；列对齐经 `Align` 保留。先测试后实现：table 12 条 + document 集成 1 条（经 `Document::apply` 后投影全量一致），core **151**（总计 **379**）。桌面端接入：`apply_table`（走 `apply_edit`，纳入 undo/redo）+ 快捷键 Cmd+Option+↑/↓（增行）、←/→（增列）、Delete（删行）、Shift+Delete（删列）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证） |
+| 0.1.45 | 2026-10-16 | **代码块语法高亮**（Phase 3，SPEC §11.5/§12.2，D32）：新增 `mazha-core::highlight`——用 **syntect**（纯 Rust fancy-regex 引擎）把一段代码按语言逐行着色，`Highlighter::with_theme(name)` 持有内置 `SyntaxSet`，`highlight(code, lang) -> Vec<Vec<ColoredRun>>` 返回每行的 `(源区间相对行首, (r,g,b))`；语言未命中回退纯文本；不泄漏 syntect 类型（对外 `ColoredRun`/`(u8,u8,u8)`）。`mazha-core` 依赖 syntect（`default-features=false` + `default-fancy/default-syntaxes/default-themes`，无 onig C 依赖）。先测试后实现：5 条单测（rust 关键字多色、未知语言回退单色、空/多行状态、无语言纯文本、区间相对行首），core **156**（总计 **384**）。桌面端接入：`DocView` 惰性持有 `Highlighter`（按背景明度选深/浅内置主题），prepaint 把连续代码行聚段着色，`build_line_runs` 按着色区间切分显示文本逐段上色（等宽 + 弱底）；桌面端 fmt/clippy/build 全绿（本环境无法可视化验证渲染效果） |
 
 ---
 

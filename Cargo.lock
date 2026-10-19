@@ -1378,6 +1378,7 @@ dependencies = [
  "mazha-md",
  "mazha-store",
  "ropey",
+ "syntect",
  "tempfile",
  "thiserror 2.0.21",
 ]
