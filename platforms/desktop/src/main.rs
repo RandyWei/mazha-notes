@@ -364,6 +364,42 @@ struct FindState {
     /// 当前高亮匹配的下标（`matches` 内；越界钳到 0）。
     index: usize,
 }
+
+/// 命令面板状态（`Cmd+P` 展开；SPEC D38）。
+#[derive(Default)]
+#[allow(dead_code)]
+struct PaletteState {
+    /// 面板是否展开。
+    open: bool,
+    /// 输入框文本。
+    query: String,
+    /// 当前选中项下标（过滤后列表内）。
+    selected: usize,
+}
+
+/// 命令面板条目：标题 + 快捷键提示 + 动作标签。
+#[allow(dead_code)]
+struct PaletteItem {
+    title: String,
+    hint: String,
+    action: PaletteAction,
+}
+
+/// 命令面板可执行命令（按标签分派到 `DocView` 方法）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PaletteAction {
+    NewTab,
+    CloseTab,
+    CloseAllTabs,
+    OpenFile,
+    Save,
+    SaveAs,
+    ExportPdf,
+    Find,
+    ToggleTree,
+}
+
 #[allow(dead_code)]
 struct Tab {
     path: Option<PathBuf>,
@@ -469,6 +505,9 @@ struct DocView {
     tree_open: bool,
     /// 已打开文件的保存快照（脏状态用）
     saved_text: Option<String>,
+    /// 命令面板状态（`Cmd+P`，D38）。
+    #[allow(dead_code)]
+    cmd_palette: PaletteState,
 }
 
 impl DocView {
@@ -537,6 +576,7 @@ impl DocView {
             workspace: ws,
             tree_open: true,
             saved_text,
+            cmd_palette: PaletteState::default(),
         }
     }
 
@@ -1331,6 +1371,72 @@ impl DocView {
         }
     }
 
+    /// 命令面板：内置命令表（D38）。
+    fn palette_commands(&self) -> Vec<PaletteItem> {
+        use PaletteAction::*;
+        let mk = |title: &str, hint: &str, action: PaletteAction| PaletteItem {
+            title: title.to_string(),
+            hint: hint.to_string(),
+            action,
+        };
+        vec![
+            mk("新建标签页", "Cmd+T", NewTab),
+            mk("关闭标签页", "Cmd+W", CloseTab),
+            mk("关闭全部标签页", "Cmd+Shift+W", CloseAllTabs),
+            mk("打开文件…", "Cmd+O", OpenFile),
+            mk("保存", "Cmd+S", Save),
+            mk("另存为…", "Cmd+Shift+S", SaveAs),
+            mk("导出 PDF", "Cmd+E", ExportPdf),
+            mk("查找/替换", "Cmd+F", Find),
+            mk("切换文件树", "", ToggleTree),
+        ]
+    }
+
+    /// 命令面板：按查询过滤命令（大小写不敏感子串），返回匹配到的原下标。
+    fn palette_filtered(&self) -> Vec<usize> {
+        let q = self.cmd_palette.query.to_lowercase();
+        self.palette_commands()
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| q.is_empty() || it.title.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// 打开命令面板（清空查询、选中置首）。
+    fn open_palette(&mut self, cx: &mut Context<Self>) {
+        self.cmd_palette.open = true;
+        self.cmd_palette.query.clear();
+        self.cmd_palette.selected = 0;
+        cx.notify();
+    }
+
+    /// 关闭命令面板。
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        self.cmd_palette.open = false;
+        cx.notify();
+    }
+
+    /// 执行命令面板选中的命令。
+    fn run_palette_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
+        use PaletteAction::*;
+        self.cmd_palette.open = false;
+        match action {
+            NewTab => self.new_tab_empty(cx),
+            CloseTab => self.close_current_tab(cx),
+            CloseAllTabs => self.close_all_tabs(cx),
+            OpenFile => self.open_file_dialog(cx),
+            Save => self.save_current(cx),
+            SaveAs => self.save_as(cx),
+            ExportPdf => self.export_pdf(cx),
+            Find => self.open_find(cx),
+            ToggleTree => {
+                self.tree_open = !self.tree_open;
+                cx.notify();
+            }
+        }
+    }
+
     fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = FileDialog::new()
             .set_title("打开 Markdown")
@@ -1582,6 +1688,68 @@ impl Render for DocView {
         let line_count = self.doc.projection().len();
         let focus = self.focus.clone();
         // 查找/替换条（`Cmd+F` 展开）：查询框 + 替换框 + 匹配计数 + 大小写开关 + 提示
+        // 命令面板（`Cmd+P` 展开）：查询框 + 过滤后命令列表
+        let palette_overlay = if self.cmd_palette.open {
+            let filtered = self.palette_filtered();
+            let cmds = self.palette_commands();
+            let mut rows: Vec<gpui::AnyElement> = Vec::new();
+            for (rank, &idx) in filtered.iter().enumerate() {
+                let it = &cmds[idx];
+                let act = rank == self.cmd_palette.selected;
+                rows.push(
+                    div()
+                        .id(gpui::ElementId::Name(format!("pal-{idx}").into()))
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .flex()
+                        .justify_between()
+                        .when(act, |d| d.bg(palette.selection))
+                        .child(it.title.clone())
+                        .child(it.hint.clone())
+                        .into_any_element(),
+                );
+            }
+            Some(
+                div()
+                    .id("palette")
+                    .absolute()
+                    .top(px(60.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("palette-box")
+                            .w(px(480.))
+                            .max_h(px(320.))
+                            .flex()
+                            .flex_col()
+                            .border_1()
+                            .border_color(palette.border)
+                            .bg(palette.subtle)
+                            .child(
+                                div()
+                                    .id("palette-q")
+                                    .px_3()
+                                    .py_2()
+                                    .text_sm()
+                                    .border_b_1()
+                                    .border_color(palette.border)
+                                    .child(if self.cmd_palette.query.is_empty() {
+                                        "输入命令…".to_string()
+                                    } else {
+                                        self.cmd_palette.query.clone()
+                                    }),
+                            )
+                            .children(rows),
+                    ),
+            )
+        } else {
+            None
+        };
         let find_bar = if self.find.open {
             let query = self.find.query.clone();
             let replace = self.find.replace.clone();
@@ -1798,6 +1966,7 @@ impl Render for DocView {
             )
             // 查找/替换条（`Cmd+F` 展开时才渲染）
             .children(find_bar)
+            .children(palette_overlay)
             .child(DocElement { view: cx.entity() })
     }
 }
@@ -2008,6 +2177,12 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
 
+    // 命令面板展开时：所有按键优先交给面板处理
+    if view.cmd_palette.open {
+        handle_palette_key(view, event, cx);
+        return;
+    }
+
     // 查找条展开时：所有按键优先交给查找处理（避免输入查询时误编辑正文）
     if view.find.open {
         handle_find_key(view, event, cx);
@@ -2046,6 +2221,9 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             // 打开查找/替换条（展开时 Cmd+F 由 `handle_find_key` 关闭）
             "f" if m.platform => {
                 view.open_find(cx);
+            }
+            "p" if m.platform => {
+                view.open_palette(cx);
             }
             "o" if m.platform => {
                 view.open_file_dialog(cx);
@@ -2170,6 +2348,58 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
 /// 语义：`Enter`/`Shift+Enter` 上/下一个匹配、`Tab` 切换查找/替换框、`Backspace`/`Delete`
 /// 编辑聚焦框、`Esc` 关闭、`Cmd+F` 再按关闭、`Cmd+Enter` 替换当前、`Cmd+Shift+Enter`
 /// 替换全部、`Cmd+Alt+C` 切换大小写敏感；其余 `Cmd` 组合一律忽略（不在查找时改正文）。
+/// 命令面板展开时的按键处理（`handle_key` 在 `cmd_palette.open` 时全部转到这里）。
+///
+/// 语义：可打印字符追加到查询、`Backspace` 删除、`↑`/`↓` 移动选择、`Enter` 执行、
+/// `Esc`/`Cmd+P` 关闭；其余 `Cmd` 组合忽略。
+fn handle_palette_key(view: &mut DocView, event: &KeyDownEvent, cx: &mut Context<DocView>) {
+    let m = &event.keystroke.modifiers;
+    let key = event.keystroke.key.as_str();
+    // Cmd+P 再按：关闭
+    if m.platform && key == "p" {
+        view.close_palette(cx);
+        return;
+    }
+    // Esc：关闭
+    if key == "escape" {
+        view.close_palette(cx);
+        return;
+    }
+    let filtered = view.palette_filtered();
+    match key {
+        "up" => {
+            if !filtered.is_empty() {
+                view.cmd_palette.selected =
+                    (view.cmd_palette.selected + filtered.len() - 1) % filtered.len();
+            }
+        }
+        "down" => {
+            if !filtered.is_empty() {
+                view.cmd_palette.selected = (view.cmd_palette.selected + 1) % filtered.len();
+            }
+        }
+        "enter" | "return" => {
+            if let Some(&idx) = filtered.get(view.cmd_palette.selected) {
+                let action = view.palette_commands()[idx].action;
+                view.run_palette_action(action, cx);
+            }
+            return;
+        }
+        "backspace" => {
+            view.cmd_palette.query.pop();
+            view.cmd_palette.selected = 0;
+        }
+        _ => {
+            // 可打印 ASCII 直键兜底（命令面板无 IME）
+            if key.chars().count() == 1 && !key.chars().next().unwrap().is_control() {
+                view.cmd_palette.query.push(key.chars().next().unwrap());
+                view.cmd_palette.selected = 0;
+            }
+        }
+    }
+    cx.notify();
+}
+
 fn handle_find_key(view: &mut DocView, event: &KeyDownEvent, cx: &mut Context<DocView>) {
     let m = &event.keystroke.modifiers;
     let key = event.keystroke.key.as_str();
