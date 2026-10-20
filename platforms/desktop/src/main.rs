@@ -41,12 +41,12 @@ use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
     Highlighter, InlineMark, ProjectedLine, Projection, RunStyle, Selection, TableOp,
-    TextRun as DocTextRun,
+    TextRun as DocTextRun, Workspace,
     commands::{set_block, toggle_inline},
-    edit_table, find_all, replace_all_edit, Workspace,
+    edit_table, find_all, replace_all_edit,
 };
 use mazha_export::to_pdf;
-use mazha_store::{DocPath, Entry, EntryKind, FileSystemProvider};
+use mazha_store::FileSystemProvider;
 use rfd::FileDialog;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -391,6 +391,14 @@ struct DocView {
     highlighter: Option<Highlighter>,
     /// 查找/替换条状态（`Cmd+F` 展开）。
     find: FindState,
+    /// 工作区根（文件树）
+    workspace_root: Option<PathBuf>,
+    /// Workspace（本地文件系统）
+    workspace: Option<Workspace<FileSystemProvider>>,
+    /// 文件树是否展开
+    tree_open: bool,
+    /// 已打开文件的保存快照（脏状态用）
+    saved_text: Option<String>,
 }
 
 impl DocView {
@@ -402,6 +410,23 @@ impl DocView {
         };
         let theme = cx.theme();
         let palette = Palette::from_theme(theme);
+        let saved_text = path.is_some().then(|| text.clone());
+        // 设置工作区根为文件所在目录或命令行目录
+        let ws_root = path
+            .as_ref()
+            .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+            .or_else(|| {
+                std::env::args()
+                    .nth(1)
+                    .and_then(|a| PathBuf::from(a).parent().map(|x| x.to_path_buf()))
+            });
+        let (ws_root, ws) = ws_root
+            .and_then(|r| {
+                FileSystemProvider::open(&r)
+                    .ok()
+                    .map(|p| (Some(r.clone()), Some(Workspace::new(p))))
+            })
+            .unwrap_or((None, None));
         Self {
             path: path.cloned(),
             doc: Document::new(&text),
@@ -416,14 +441,43 @@ impl DocView {
             palette,
             highlighter: None,
             find: FindState::default(),
+            workspace_root: ws_root,
+            workspace: ws,
+            tree_open: true,
+            saved_text,
         }
     }
 
-    /// 窗口内标题栏文本。
+    fn is_dirty(&self) -> bool {
+        if self.path.is_none() {
+            return false;
+        }
+        match &self.saved_text {
+            Some(saved) => *saved != self.doc.text(),
+            None => true,
+        }
+    }
+
     fn header_text(&self) -> String {
+        let base = match &self.path {
+            Some(p) => p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            None => "内置示例".to_string(),
+        };
+        if self.is_dirty() {
+            format!("* {base}")
+        } else {
+            base
+        }
+    }
+
+    fn header_full_path(&self) -> String {
         match &self.path {
             Some(p) => p.display().to_string(),
-            None => "内置示例（只读）".to_string(),
+            None => "内置示例（未保存）".to_string(),
         }
     }
 
@@ -1169,21 +1223,85 @@ impl DocView {
         let result = to_pdf(&markdown);
         match result {
             Ok(pdf_doc) => {
-                // 使用 rfd 弹出保存文件对话框
                 if let Some(path) = FileDialog::new()
                     .set_title("导出 PDF")
                     .add_filter("PDF 文件", &["pdf"])
                     .set_file_name("document.pdf")
                     .save_file()
+                    && let Err(e) = std::fs::write(&path, &pdf_doc.bytes)
                 {
-                    // 写入 PDF 字节
-                    if let Err(e) = std::fs::write(&path, &pdf_doc.bytes) {
-                        eprintln!("导出 PDF 失败：{}", e);
-                    }
+                    eprintln!("导出 PDF 失败：{}", e);
                 }
             }
             Err(e) => {
                 eprintln!("PDF 编译失败：{}", e);
+            }
+        }
+    }
+
+    fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = FileDialog::new()
+            .set_title("打开 Markdown")
+            .add_filter("Markdown", &["md", "markdown", "txt"])
+            .pick_file()
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            self.path = Some(path.clone());
+            self.saved_text = Some(text.clone());
+            self.doc = Document::new(&text);
+            self.cursors = vec![Cursor::new(0)];
+            self.primary = 0;
+            // 更新工作区根
+            if let Some(parent) = path.parent() {
+                if self.workspace.is_none() {
+                    if let Ok(p) = FileSystemProvider::open(parent) {
+                        self.workspace_root = Some(parent.to_path_buf());
+                        self.workspace = Some(Workspace::new(p));
+                        self.tree_open = true;
+                    }
+                } else {
+                    self.workspace_root = Some(parent.to_path_buf());
+                }
+            }
+            self.layout = None;
+            self.highlighter = None;
+            cx.notify();
+        }
+    }
+
+    fn save_current(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.path.clone() {
+            if let Err(e) = std::fs::write(&path, self.doc.text().as_bytes()) {
+                eprintln!("保存失败：{}", e);
+            } else {
+                self.saved_text = Some(self.doc.text().to_string());
+                cx.notify();
+            }
+        } else {
+            self.save_as(cx);
+        }
+    }
+
+    fn save_as(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = FileDialog::new()
+            .set_title("另存为")
+            .add_filter("Markdown", &["md", "markdown"])
+            .set_file_name("document.md")
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&path, self.doc.text().as_bytes()) {
+                eprintln!("保存失败：{}", e);
+            } else {
+                self.path = Some(path.clone());
+                self.saved_text = Some(self.doc.text().to_string());
+                if let Some(parent) = path.parent()
+                    && let Ok(p) = FileSystemProvider::open(parent)
+                {
+                    self.workspace_root = Some(parent.to_path_buf());
+                    self.workspace = Some(Workspace::new(p));
+                    self.tree_open = true;
+                }
+                cx.notify();
             }
         }
     }
@@ -1248,11 +1366,20 @@ impl Render for DocView {
         };
 
         // 正文：可滚动 + 可聚焦（键盘事件入口）+ 鼠标选区
+        // 正文：可滚动 + 可聚焦（键盘事件入口）+ 鼠标选区
         div()
-            .id("doc")
+            .id("app")
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
+            .child(
+                div()
+                    .id("doc")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+            )
             .overflow_y_scrollbar()
             .bg(palette.background)
             .text_color(palette.foreground)
@@ -1314,8 +1441,9 @@ impl Render for DocView {
                     .text_sm()
                     .text_color(palette.muted)
                     .child(header)
+                    .child(format!("· {}", self.header_full_path()))
                     .child(format!(
-                        "· {line_count} 行 · 光标×{} · 点击定位 / Alt+点击增减光标 / ↑↓←→ 移动 / Shift 扩选 / Cmd+F 查找替换",
+                        "· {line_count} 行 · 光标×{} · Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换",
                         caret_count
                     )),
             )
@@ -1569,6 +1697,15 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             // 打开查找/替换条（展开时 Cmd+F 由 `handle_find_key` 关闭）
             "f" if m.platform => {
                 view.open_find(cx);
+            }
+            "o" if m.platform => {
+                view.open_file_dialog(cx);
+            }
+            "s" if m.platform && !shift => {
+                view.save_current(cx);
+            }
+            "s" if m.platform && shift => {
+                view.save_as(cx);
             }
             // 行内格式（Cmd+键）
             "b" if m.platform => {
