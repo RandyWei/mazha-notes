@@ -4,7 +4,7 @@
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
 - 最近更新：2026-10-19
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 首增量启动**（打开/保存 + 文件树侧栏）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
 - 当前版本：**0.1.52**（细节见 SPEC §15 变更记录；本节只列归总）
 
@@ -39,7 +39,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现（要点） | 待办 |
 |------|------|----------------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成 | 只读投影渲染 + 主题；光标/点击命中 + WYSIWYG 标记显隐（光标行显原文）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；IME 全实现（UTF-8↔UTF-16）；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色） | 文件管理/文件树、多标签页、命令面板（Phase 4）、横向滚动、排版渲染（见下） |
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 首增量） | 只读投影渲染 + 主题；光标/点击命中 + WYSIWYG 标记显隐（光标行显原文）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；IME 全实现（UTF-8↔UTF-16）；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开/保存 + 文件树侧栏（设计中）** | 文件管理续（重命名/删除/新建）、多标签页、命令面板（Phase 4） |
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6 / 8 / 7 |
 
 > 桌面端入口：`cargo run -- [path/to/file.md]`。本环境无法可视化验证渲染效果，逻辑改动靠核心单测 + 编译门禁保证。
