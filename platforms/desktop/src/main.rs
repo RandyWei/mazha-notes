@@ -1342,6 +1342,55 @@ impl DocView {
     }
 
     #[allow(dead_code)]
+    fn switch_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.active = idx;
+        let t = &self.tabs[self.active];
+        self.path = t.path.clone();
+        self.doc = Document::new(&t.doc.text());
+        self.cursors = t.cursors.clone();
+        self.primary = t.primary;
+        self.selecting = t.selecting;
+        self.layout = None;
+        self.highlighter = None;
+        self.find = FindState::default();
+        self.saved_text = t.saved_text.clone();
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let t = &self.tabs[0];
+        self.tabs = vec![Tab {
+            path: t.path.clone(),
+            doc: Document::new(&t.doc.text()),
+            cursors: t.cursors.clone(),
+            primary: t.primary,
+            selecting: t.selecting,
+            layout: None,
+            highlighter: None,
+            find: FindState::default(),
+            saved_text: t.saved_text.clone(),
+        }];
+        self.active = 0;
+        self.path = self.tabs[0].path.clone();
+        self.doc = Document::new(&self.tabs[0].doc.text());
+        self.cursors = self.tabs[0].cursors.clone();
+        self.primary = self.tabs[0].primary;
+        self.selecting = self.tabs[0].selecting;
+        self.layout = None;
+        self.highlighter = None;
+        self.find = FindState::default();
+        self.saved_text = self.tabs[0].saved_text.clone();
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
     fn close_current_tab(&mut self, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
             return;
@@ -1988,8 +2037,20 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             "t" if m.platform => {
                 view.new_tab_empty(cx);
             }
-            "w" if m.platform => {
+            k if m.platform && k.len() == 1 && k.chars().next().unwrap().is_ascii_digit() => {
+                let c = k.chars().next().unwrap();
+                if c == '0' {
+                    view.switch_tab(view.tabs.len().saturating_sub(1), cx);
+                } else if let Some(d) = c.to_digit(10) {
+                    let idx = (d as usize).saturating_sub(1);
+                    view.switch_tab(idx, cx);
+                }
+            }
+            "w" if m.platform && !shift => {
                 view.close_current_tab(cx);
+            }
+            "w" if m.platform && shift => {
+                view.close_all_tabs(cx);
             }
             "s" if m.platform && !shift => {
                 view.save_current(cx);
