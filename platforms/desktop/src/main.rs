@@ -1384,25 +1384,30 @@ impl DocView {
     }
 
     /// 导出当前文档为 PDF 并保存到文件。
-    fn export_pdf(&mut self, _cx: &mut Context<Self>) {
+    ///
+    /// 原生保存对话框经 `window.defer` 延迟（同 `open_file_dialog`），规避 gpui
+    /// 键盘布局回调的 `RefCell` 争用。
+    fn export_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let markdown = self.doc.text();
-        let result = to_pdf(&markdown);
-        match result {
-            Ok(pdf_doc) => {
-                if let Some(path) = FileDialog::new()
-                    .set_title("导出 PDF")
-                    .add_filter("PDF 文件", &["pdf"])
-                    .set_file_name("document.pdf")
-                    .save_file()
-                    && let Err(e) = std::fs::write(&path, &pdf_doc.bytes)
-                {
-                    eprintln!("导出 PDF 失败：{}", e);
+        window.defer(cx, move |_window, _cx| {
+            let result = to_pdf(&markdown);
+            match result {
+                Ok(pdf_doc) => {
+                    if let Some(path) = FileDialog::new()
+                        .set_title("导出 PDF")
+                        .add_filter("PDF 文件", &["pdf"])
+                        .set_file_name("document.pdf")
+                        .save_file()
+                        && let Err(e) = std::fs::write(&path, &pdf_doc.bytes)
+                    {
+                        eprintln!("导出 PDF 失败：{}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("PDF 编译失败：{}", e);
                 }
             }
-            Err(e) => {
-                eprintln!("PDF 编译失败：{}", e);
-            }
-        }
+        });
     }
 
     /// 命令面板：内置命令表（D38）。
@@ -1454,17 +1459,22 @@ impl DocView {
     }
 
     /// 执行命令面板选中的命令。
-    fn run_palette_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
+    fn run_palette_action(
+        &mut self,
+        action: PaletteAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use PaletteAction::*;
         self.cmd_palette.open = false;
         match action {
             NewTab => self.new_tab_empty(cx),
             CloseTab => self.close_current_tab(cx),
             CloseAllTabs => self.close_all_tabs(cx),
-            OpenFile => self.open_file_dialog(cx),
-            Save => self.save_current(cx),
-            SaveAs => self.save_as(cx),
-            ExportPdf => self.export_pdf(cx),
+            OpenFile => self.open_file_dialog(window, cx),
+            Save => self.save_current(window, cx),
+            SaveAs => self.save_as(window, cx),
+            ExportPdf => self.export_pdf(window, cx),
             Find => self.open_find(cx),
             ToggleTree => {
                 self.tree_open = !self.tree_open;
@@ -1474,18 +1484,27 @@ impl DocView {
                 self.outline_open = !self.outline_open;
                 cx.notify();
             }
-            MoveCurrentFile => self.move_current_file_dialog(cx),
+            MoveCurrentFile => self.move_current_file_dialog(window, cx),
         }
     }
 
-    fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = FileDialog::new()
-            .set_title("打开 Markdown")
-            .add_filter("Markdown", &["md", "markdown", "txt"])
-            .pick_file()
-        {
-            self.open_path(path, cx);
-        }
+    /// 打开 Markdown 文件对话框。
+    ///
+    /// **必须经 `window.defer` 延迟执行**：macOS 原生文件对话框（rfd）会重新查询键盘布局，
+    /// 触发 gpui 的 `on_keyboard_layout_change` 回调 `app.borrow_mut()`；若在按键回调里同步
+    /// 打开对话框，会与该回调争用同一 `RefCell` 而 panic（`app.rs` `RefCell already borrowed`）。
+    /// 延迟到当前事件借用释放后再弹，规避此冲突。
+    fn open_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        window.defer(cx, move |_window, cx| {
+            let picked = FileDialog::new()
+                .set_title("打开 Markdown")
+                .add_filter("Markdown", &["md", "markdown", "txt"])
+                .pick_file();
+            if let Some(path) = picked {
+                entity.update(cx, |view, cx| view.open_path(path, cx));
+            }
+        });
     }
 
     #[allow(dead_code)]
@@ -1633,7 +1652,7 @@ impl DocView {
         cx.notify();
     }
 
-    fn save_current(&mut self, cx: &mut Context<Self>) {
+    fn save_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.path.clone() {
             if let Err(e) = std::fs::write(&path, self.doc.text().as_bytes()) {
                 eprintln!("保存失败：{}", e);
@@ -1642,7 +1661,7 @@ impl DocView {
                 cx.notify();
             }
         } else {
-            self.save_as(cx);
+            self.save_as(window, cx);
         }
     }
 
@@ -1740,11 +1759,20 @@ impl DocView {
     }
 
     /// 移动当前文件到选定目录（命令面板入口）。
-    fn move_current_file_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(cur) = self.path.clone() else { return };
-        if let Some(dir) = FileDialog::new().set_title("移动到目录").pick_folder() {
-            self.move_file(cur, dir, cx);
-        }
+    /// 移动当前文件到选定目录（命令面板入口）。
+    ///
+    /// 同 `open_file_dialog`：原生对话框经 `window.defer` 延迟，规避 gpui 键盘布局
+    /// 回调的 `RefCell` 争用。
+    fn move_current_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        window.defer(cx, move |_window, cx| {
+            let cur = entity.read(cx).path.clone();
+            let Some(cur) = cur else { return };
+            let picked = FileDialog::new().set_title("移动到目录").pick_folder();
+            if let Some(dir) = picked {
+                entity.update(cx, |view, cx| view.move_file(cur, dir, cx));
+            }
+        });
     }
 
     /// 把文件移动到目标目录（文件树 CRUD）。
@@ -1779,28 +1807,34 @@ impl DocView {
         cx.notify();
     }
 
-    fn save_as(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = FileDialog::new()
-            .set_title("另存为")
-            .add_filter("Markdown", &["md", "markdown"])
-            .set_file_name("document.md")
-            .save_file()
-        {
-            if let Err(e) = std::fs::write(&path, self.doc.text().as_bytes()) {
+    /// 另存为：弹原生保存对话框（经 `window.defer` 延迟，规避键盘布局回调的 `RefCell` 争用）。
+    fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        window.defer(cx, move |_window, cx| {
+            let text = entity.read(cx).doc.text().to_string();
+            let picked = FileDialog::new()
+                .set_title("另存为")
+                .add_filter("Markdown", &["md", "markdown"])
+                .set_file_name("document.md")
+                .save_file();
+            let Some(path) = picked else { return };
+            if let Err(e) = std::fs::write(&path, text.as_bytes()) {
                 eprintln!("保存失败：{}", e);
             } else {
-                self.path = Some(path.clone());
-                self.saved_text = Some(self.doc.text().to_string());
-                if let Some(parent) = path.parent()
-                    && let Ok(p) = FileSystemProvider::open(parent)
-                {
-                    self.workspace_root = Some(parent.to_path_buf());
-                    self.workspace = Some(Workspace::new(p));
-                    self.tree_open = true;
-                }
-                cx.notify();
+                entity.update(cx, |view, cx| {
+                    view.path = Some(path.clone());
+                    view.saved_text = Some(view.doc.text().to_string());
+                    if let Some(parent) = path.parent()
+                        && let Ok(p) = FileSystemProvider::open(parent)
+                    {
+                        view.workspace_root = Some(parent.to_path_buf());
+                        view.workspace = Some(Workspace::new(p));
+                        view.tree_open = true;
+                    }
+                    cx.notify();
+                });
             }
-        }
+        });
     }
 
     /// Alt+Click：在点击位置添加新光标，或移除已有光标。
@@ -2142,87 +2176,102 @@ impl Render for DocView {
             .size_full()
             .flex()
             .flex_row()
+            .bg(palette.background)
+            .text_color(palette.foreground)
             .child(sidebar_el)
+            // 右侧主列：标签栏 + 信息条 + 查找/命令浮层 + 编辑区（纵向排列）
             .child(
                 div()
                     .id("doc")
-                    .size_full()
+                    .h_full()
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w(px(0.))
+                    .overflow_y_scrollbar()
                     .child(tabbar_el)
-            )
-            .overflow_y_scrollbar()
-            .bg(palette.background)
-            .text_color(palette.foreground)
-            .key_context("mazha-doc")
-            .track_focus(&focus)
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                handle_key(view, event, window, cx);
-            }))
-            // 左键按下：放置光标
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, event: &MouseDownEvent, window, cx| {
-                    if let Some(src) = view.hit_source(event.position) {
-                        if event.modifiers.alt {
-                            // Alt+Click: 添加/移除光标
-                            view.add_or_remove_cursor(src);
-                        } else {
-                            // 普通点击: 重置为单光标
-                            view.cursors = vec![Cursor::new(src)];
-                            view.primary = 0;
-                            view.selecting = true;
+                    .key_context("mazha-doc")
+                    .track_focus(&focus)
+                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                        handle_key(view, event, window, cx);
+                    }))
+                    // 左键按下：放置光标
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                            if let Some(src) = view.hit_source(event.position) {
+                                if event.modifiers.alt {
+                                    // Alt+Click: 添加/移除光标
+                                    view.add_or_remove_cursor(src);
+                                } else {
+                                    // 普通点击: 重置为单光标
+                                    view.cursors = vec![Cursor::new(src)];
+                                    view.primary = 0;
+                                    view.selecting = true;
+                                }
+                            }
+                            let focus = view.focus.clone();
+                            window.focus(&focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                    // 拖动中：持续更新主光标
+                    .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                        if !view.selecting {
+                            return;
                         }
-                    }
-                    let focus = view.focus.clone();
-                    window.focus(&focus, cx);
-                    cx.notify();
-                }),
+                        if let Some(src) = view.hit_source(event.position) {
+                            if let Some(c) = view.cursors.get_mut(view.primary) {
+                                c.caret = view.doc.snap_to_boundary(src);
+                                c.anchor = Some(c.anchor.unwrap_or(c.caret)); // 保持锚点
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    // 左键松开：结束拖选
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|view, _event: &MouseUpEvent, _, cx| {
+                            view.selecting = false;
+                            cx.notify();
+                        }),
+                    )
+                    // 顶部信息条
+                    .child(
+                        h_flex()
+                            .id("header")
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .h(px(28.))
+                            .border_b_1()
+                            .border_color(palette.border)
+                            .text_sm()
+                            .text_color(palette.muted)
+                            .child(
+                                self.tabs
+                                    .get(self.active)
+                                    .map(|t| t.name())
+                                    .unwrap_or_else(|| self.header_text()),
+                            )
+                            .child(format!(
+                                "· {}",
+                                self.tabs
+                                    .get(self.active)
+                                    .map(|t| t.full())
+                                    .unwrap_or_else(|| self.header_full_path())
+                            ))
+                            .child(format!(
+                                "· {line_count} 行 · 光标×{} · Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换",
+                                caret_count
+                            )),
+                    )
+                    // 查找/替换条（`Cmd+F` 展开时才渲染）
+                    .children(find_bar)
+                    .children(palette_overlay)
+                    .child(DocElement { view: cx.entity() }),
             )
-            // 拖动中：持续更新主光标
-            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
-                if !view.selecting { return; }
-                if let Some(src) = view.hit_source(event.position) {
-                    if let Some(c) = view.cursors.get_mut(view.primary) {
-                        c.caret = view.doc.snap_to_boundary(src);
-                        c.anchor = Some(c.anchor.unwrap_or(c.caret)); // 保持锚点
-                    }
-                    cx.notify();
-                }
-            }))
-            // 左键松开：结束拖选
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|view, _event: &MouseUpEvent, _, cx| {
-                    view.selecting = false;
-                    cx.notify();
-                }),
-            )
-            // 顶部信息条
-            .child(
-                h_flex()
-                    .id("header")
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .h(px(28.))
-                    .border_b_1()
-                    .border_color(palette.border)
-                    .text_sm()
-                    .text_color(palette.muted)
-                    .child(self.tabs.get(self.active).map(|t| t.name()).unwrap_or_else(|| self.header_text()))
-                    .child(format!("· {}", self.tabs.get(self.active).map(|t| t.full()).unwrap_or_else(|| self.header_full_path())))
-                    .child(format!(
-                        "· {line_count} 行 · 光标×{} · Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换",
-                        caret_count
-                    )),
-            )
-            // 查找/替换条（`Cmd+F` 展开时才渲染）
-            .children(find_bar)
-            .children(palette_overlay)
-            .child(DocElement { view: cx.entity() })
     }
 }
 
@@ -2428,7 +2477,12 @@ impl EntityInputHandler for DocView {
 ///
 /// 字符输入主要经 IME（`EntityInputHandler::replace_text_in_range`）送达；
 /// 这里兜底处理无 IME 的 ASCII 直键，以及退格/删除/回车/Tab/撤销/重做/全选。
-fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<DocView>) {
+fn handle_key(
+    view: &mut DocView,
+    event: &KeyDownEvent,
+    window: &mut Window,
+    cx: &mut Context<DocView>,
+) {
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
 
@@ -2457,7 +2511,7 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
 
     // 命令面板展开时：所有按键优先交给面板处理
     if view.cmd_palette.open {
-        handle_palette_key(view, event, cx);
+        handle_palette_key(view, event, window, cx);
         return;
     }
 
@@ -2508,7 +2562,7 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
                 cx.notify();
             }
             "o" if m.platform => {
-                view.open_file_dialog(cx);
+                view.open_file_dialog(window, cx);
             }
             "t" if m.platform => {
                 view.new_tab_empty(cx);
@@ -2529,10 +2583,10 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
                 view.close_all_tabs(cx);
             }
             "s" if m.platform && !shift => {
-                view.save_current(cx);
+                view.save_current(window, cx);
             }
             "s" if m.platform && shift => {
-                view.save_as(cx);
+                view.save_as(window, cx);
             }
             // 行内格式（Cmd+键）
             "b" if m.platform => {
@@ -2589,7 +2643,7 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
                 view.apply_table(TableOp::DeleteRow, cx);
             }
             "e" if m.platform => {
-                view.export_pdf(cx);
+                view.export_pdf(window, cx);
             }
             _ => {}
         }
@@ -2634,7 +2688,12 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
 ///
 /// 语义：可打印字符追加到查询、`Backspace` 删除、`↑`/`↓` 移动选择、`Enter` 执行、
 /// `Esc`/`Cmd+P` 关闭；其余 `Cmd` 组合忽略。
-fn handle_palette_key(view: &mut DocView, event: &KeyDownEvent, cx: &mut Context<DocView>) {
+fn handle_palette_key(
+    view: &mut DocView,
+    event: &KeyDownEvent,
+    window: &mut Window,
+    cx: &mut Context<DocView>,
+) {
     let m = &event.keystroke.modifiers;
     let key = event.keystroke.key.as_str();
     // Cmd+P 再按：关闭
@@ -2663,7 +2722,7 @@ fn handle_palette_key(view: &mut DocView, event: &KeyDownEvent, cx: &mut Context
         "enter" | "return" => {
             if let Some(&idx) = filtered.get(view.cmd_palette.selected) {
                 let action = view.palette_commands()[idx].action;
-                view.run_palette_action(action, cx);
+                view.run_palette_action(action, window, cx);
             }
             return;
         }
@@ -3448,10 +3507,11 @@ impl Element for DocElement {
                     .position_for_index(block.byte_of_col(col), layout.line_height)
             {
                 let caret_rect = bounds(
-                    point(line_x + p.x, row_top + p.y + px(2.)),
-                    size(px(1.5), layout.line_height - px(4.)),
+                    point(line_x + p.x, row_top + px(2.)),
+                    size(px(2.), layout.line_height - px(4.)),
                 );
-                window.paint_quad(fill(caret_rect, palette.accent));
+                // 光标用正文前景色（对比度最高），而非主题 accent（可能偏浅看不清）
+                window.paint_quad(fill(caret_rect, palette.foreground));
             }
         }
 
