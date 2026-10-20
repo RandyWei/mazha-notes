@@ -472,6 +472,15 @@ struct DocView {
 }
 
 impl DocView {
+    #[allow(dead_code)]
+    fn cur_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+    #[allow(dead_code)]
+    fn cur_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
     /// 读入文件（或内置示例）并构建文档，光标置于文首。
     fn new(path: Option<&PathBuf>, cx: &mut App) -> Self {
         let text = match path {
@@ -1333,14 +1342,43 @@ impl DocView {
     }
 
     #[allow(dead_code)]
+    fn new_tab_empty(&mut self, cx: &mut Context<Self>) {
+        self.tabs.push(Tab::new(String::new(), None));
+        self.active = self.tabs.len() - 1;
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
     fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            self.path = Some(path.clone());
-            self.saved_text = Some(text.clone());
+        let full = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // check existing
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if t.path
+                .as_ref()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                .as_ref()
+                == Some(&full)
+            {
+                self.active = i;
+                self.layout = None;
+                self.highlighter = None;
+                cx.notify();
+                return;
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(&full) {
+            self.tabs.push(Tab::new(text.clone(), Some(full.clone())));
+            self.active = self.tabs.len() - 1;
+            self.path = Some(full.clone());
             self.doc = Document::new(&text);
             self.cursors = vec![Cursor::new(0)];
             self.primary = 0;
-            if let Some(parent) = path.parent() {
+            self.selecting = false;
+            self.layout = None;
+            self.highlighter = None;
+            self.find = FindState::default();
+            self.saved_text = Some(text.clone());
+            if let Some(parent) = full.parent() {
                 if self.workspace.is_none() {
                     if let Ok(p) = FileSystemProvider::open(parent) {
                         self.workspace_root = Some(parent.to_path_buf());
@@ -1351,11 +1389,13 @@ impl DocView {
                     self.workspace_root = Some(parent.to_path_buf());
                 }
             }
-            self.layout = None;
-            self.highlighter = None;
-            self.find = FindState::default();
             cx.notify();
+            return;
         }
+        // fallback
+        self.tabs.push(Tab::new(String::new(), Some(full)));
+        self.active = self.tabs.len() - 1;
+        cx.notify();
     }
 
     fn save_current(&mut self, cx: &mut Context<Self>) {
@@ -1538,6 +1578,54 @@ impl Render for DocView {
             .flex()
             .flex_col()
             .children(sb);
+        // 标签栏
+        let mut tbc: Vec<gpui::AnyElement> = Vec::new();
+        for (i, t) in self.tabs.iter().enumerate() {
+            let name = t.name();
+            let act = i == self.active;
+            tbc.push(
+                div()
+                    .id(gpui::ElementId::Name(format!("tab-{i}").into()))
+                    .px_2()
+                    .py_0p5()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(act, |d| d.bg(palette.selection))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |v, _ev, _w, cx| {
+                            v.active = i;
+                            cx.notify();
+                        }),
+                    )
+                    .child(name)
+                    .into_any_element(),
+            );
+        }
+        tbc.push(
+            div()
+                .id("tab-new")
+                .px_2()
+                .py_0p5()
+                .cursor_pointer()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|v, _ev, _w, cx| {
+                        v.new_tab_empty(cx);
+                    }),
+                )
+                .child("+")
+                .into_any_element(),
+        );
+        let tabbar_el = h_flex()
+            .id("tabbar")
+            .w_full()
+            .h(px(26.))
+            .items_center()
+            .border_b_1()
+            .border_color(palette.border)
+            .bg(palette.subtle)
+            .children(tbc);
         div()
             .id("app")
             .size_full()
@@ -1551,6 +1639,7 @@ impl Render for DocView {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .child(tabbar_el)
             )
             .overflow_y_scrollbar()
             .bg(palette.background)
