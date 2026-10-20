@@ -670,6 +670,8 @@ interface Workspace {
 
 | D36 | Phase 4 文件管理（打开/保存 + 文件树侧栏） | **接入 `mazha-core::Workspace<S>`**：桌面端用 `Workspace<FileSystemProvider>`（本地文件系统）管理打开/保存/列目录。**工作区根**：优先用命令行传入的目录或文件所在目录；首次无上下文时弹出 `rfd` 选择文件夹设为工作区根。**文件树侧栏**：左侧可收起的树形列表，用 `Workspace::list`/`Workspace::list_markdown` 展示（按目录展开），仅列 `.md`/`.markdown`，目录在前文件在后、按名称排序。**打开/保存**：`Cmd+O` 打开 Markdown 用 `Workspace::open` 载入；`Cmd+S` 已有路径用 `Workspace::save` 覆盖，否则走 `Cmd+Shift+S` 另存为；`Cmd+Shift+S` 始终另存为。**脏状态**：对比快照标记未保存，标题栏显示 `*`，保存成功后清除。**错误处理**：`WorkspaceError::NotUtf8` 与 IO 错误给出提示。**兼容**：命令行传入单个 `.md` 仍直接打开（工作区根设为其父目录），无参数且未选工作区时保留内置示例。多标签页/命令面板/重命名删除新建留后续增量。 | 确认（Phase 4 首增量，见 §9.1/§10） |
 
+| D37 | Phase 4 多标签页 | **模型**：`DocView` 改为多文档（`Vec<Tab>`，每个 Tab 含 `path`/`doc`/`cursors`/`primary`/`find`/`saved_text`/`layout` 等状态），当前活动索引 `active`。**切换**：`Cmd+1..9` 切到第 N 个、`Cmd+0` 切到最后、`Cmd+[`/`]` 前后切换、`Cmd+Shift+[`/`]` 移动标签、`Cmd+W` 关闭当前（不关闭最后一个）、`Cmd+Shift+W` 关闭所有。**打开逻辑**：新文件/打开文件都新建 Tab 并设为活动；同一 `PathBuf` 若已存在则直接切换到该 Tab 而非重复打开。**保存**：`Cmd+S`/`Cmd+Shift+S` 作用于当前活动 Tab。**标题栏/状态栏**：显示当前 Tab 文件名与脏标记（`*`）、全路径。**内存**：关闭 Tab 时释放其状态（DocLayout/高亮缓存可丢弃），布局与投影复用现有逻辑。**兼容**：单文件命令行启动时仍初始化单个 Tab。 | 确认（Phase 4 第二增量） |
+
 ## 15. 变更记录
 
 | 版本 | 日期 | 变更内容 |
