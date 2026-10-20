@@ -1342,6 +1342,22 @@ impl DocView {
     }
 
     #[allow(dead_code)]
+    fn switch_tab_dir(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let mut idx = self.active as i32 + delta;
+        let n = self.tabs.len() as i32;
+        if idx < 0 {
+            idx = n - 1;
+        }
+        if idx >= n {
+            idx = 0;
+        }
+        self.switch_tab(idx as usize, cx);
+    }
+
+    #[allow(dead_code)]
     fn switch_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;
