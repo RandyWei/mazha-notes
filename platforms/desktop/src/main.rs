@@ -37,6 +37,7 @@ use std::sync::Arc;
 use gpui_kit::base::h_flex;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::prelude::*;
 use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
@@ -46,7 +47,8 @@ use mazha_core::{
     edit_table, find_all, replace_all_edit,
 };
 use mazha_export::to_pdf;
-use mazha_store::FileSystemProvider;
+#[allow(unused_imports)]
+use mazha_store::{DocPath, FileSystemProvider};
 use rfd::FileDialog;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -1244,14 +1246,19 @@ impl DocView {
             .set_title("打开 Markdown")
             .add_filter("Markdown", &["md", "markdown", "txt"])
             .pick_file()
-            && let Ok(text) = std::fs::read_to_string(&path)
         {
+            self.open_path(path, cx);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
             self.path = Some(path.clone());
             self.saved_text = Some(text.clone());
             self.doc = Document::new(&text);
             self.cursors = vec![Cursor::new(0)];
             self.primary = 0;
-            // 更新工作区根
             if let Some(parent) = path.parent() {
                 if self.workspace.is_none() {
                     if let Ok(p) = FileSystemProvider::open(parent) {
@@ -1265,6 +1272,7 @@ impl DocView {
             }
             self.layout = None;
             self.highlighter = None;
+            self.find = FindState::default();
             cx.notify();
         }
     }
@@ -1365,13 +1373,65 @@ impl Render for DocView {
             None
         };
 
-        // 正文：可滚动 + 可聚焦（键盘事件入口）+ 鼠标选区
-        // 正文：可滚动 + 可聚焦（键盘事件入口）+ 鼠标选区
+        // 文件树
+        let mut sb: Vec<gpui::AnyElement> = Vec::new();
+        sb.push(
+            div()
+                .id("sb-h")
+                .px_2()
+                .h(px(28.))
+                .items_center()
+                .border_b_1()
+                .border_color(palette.border)
+                .child("资源管理器")
+                .into_any_element(),
+        );
+        if self.tree_open
+            && let Some(ref ws) = self.workspace
+            && let Some(ref root) = self.workspace_root
+            && let Ok(list) = ws.list_markdown(&DocPath::root())
+        {
+            for entry in list {
+                let name = entry.name.clone();
+                let rel = entry.path.to_string();
+                let full = root.join(&rel);
+                let cur = self.path.as_ref().is_some_and(|cp| cp.ends_with(&rel));
+                sb.push(
+                    div()
+                        .id(gpui::ElementId::Name(format!("sb-{rel}").into()))
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(cur, |d| d.bg(palette.selection))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |view, _ev, _w, cx| {
+                                view.open_path(full.clone(), cx);
+                            }),
+                        )
+                        .child(name)
+                        .into_any_element(),
+                );
+            }
+        }
+        let sidebar_el = div()
+            .id("sidebar")
+            .w(px(220.))
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(palette.border)
+            .bg(palette.subtle)
+            .flex()
+            .flex_col()
+            .children(sb);
         div()
             .id("app")
             .size_full()
             .flex()
             .flex_row()
+            .child(sidebar_el)
             .child(
                 div()
                     .id("doc")
