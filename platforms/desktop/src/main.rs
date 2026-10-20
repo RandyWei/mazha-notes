@@ -1290,6 +1290,37 @@ impl DocView {
         }
     }
 
+    #[allow(dead_code)]
+    fn new_markdown_in_root(&mut self, cx: &mut Context<Self>) {
+        if let Some(_ws) = self.workspace.as_ref()
+            && let Some(ref root) = self.workspace_root
+        {
+            let mut name = "未命名.md".to_string();
+            let mut i = 1;
+            loop {
+                let candidate = root.join(&name);
+                if !candidate.exists() {
+                    break;
+                }
+                name = format!("未命名{}.md", i);
+                i += 1;
+                if i > 1000 {
+                    break;
+                }
+            }
+            let full = root.join(&name);
+            let _ = std::fs::write(
+                &full,
+                "# 新文档
+",
+            );
+            if let Ok(p) = FileSystemProvider::open(root) {
+                self.workspace = Some(Workspace::new(p));
+            }
+            self.open_path(full, cx);
+        }
+    }
+
     fn save_as(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = FileDialog::new()
             .set_title("另存为")
