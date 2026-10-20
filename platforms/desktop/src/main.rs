@@ -47,7 +47,7 @@ use mazha_core::{
     edit_table, find_all, replace_all_edit,
 };
 use mazha_export::to_pdf;
-#[allow(unused_imports)]
+#[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
 use rfd::FileDialog;
 
@@ -363,6 +363,70 @@ struct FindState {
     matches: Vec<Range<usize>>,
     /// 当前高亮匹配的下标（`matches` 内；越界钳到 0）。
     index: usize,
+}
+#[allow(dead_code)]
+struct Tab {
+    path: Option<PathBuf>,
+    doc: Document,
+    cursors: Vec<Cursor>,
+    primary: usize,
+    selecting: bool,
+    layout: Option<DocLayout>,
+    highlighter: Option<Highlighter>,
+    find: FindState,
+    saved_text: Option<String>,
+}
+
+#[allow(dead_code)]
+impl Tab {
+    fn new(text: String, path: Option<PathBuf>) -> Self {
+        let saved = if path.is_some() {
+            Some(text.clone())
+        } else {
+            None
+        };
+        Self {
+            path,
+            doc: Document::new(&text),
+            cursors: vec![Cursor::new(0)],
+            primary: 0,
+            selecting: false,
+            layout: None,
+            highlighter: None,
+            find: FindState::default(),
+            saved_text: saved,
+        }
+    }
+    fn is_dirty(&self) -> bool {
+        if self.path.is_none() {
+            return false;
+        }
+        match &self.saved_text {
+            Some(saved) => saved.as_str() != self.doc.text(),
+            None => true,
+        }
+    }
+    fn name(&self) -> String {
+        let base = match &self.path {
+            Some(p) => p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            None => "内置示例".to_string(),
+        };
+        if self.is_dirty() {
+            format!("* {base}")
+        } else {
+            base
+        }
+    }
+    fn full(&self) -> String {
+        match &self.path {
+            Some(p) => p.display().to_string(),
+            None => "内置示例（未保存）".to_string(),
+        }
+    }
 }
 
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
