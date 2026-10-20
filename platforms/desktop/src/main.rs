@@ -1962,6 +1962,9 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             "o" if m.platform => {
                 view.open_file_dialog(cx);
             }
+            "t" if m.platform => {
+                view.new_tab_empty(cx);
+            }
             "s" if m.platform && !shift => {
                 view.save_current(cx);
             }
