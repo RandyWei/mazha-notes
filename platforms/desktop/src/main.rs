@@ -398,6 +398,7 @@ enum PaletteAction {
     ExportPdf,
     Find,
     ToggleTree,
+    ToggleOutline,
     MoveCurrentFile,
 }
 
@@ -504,6 +505,8 @@ struct DocView {
     workspace: Option<Workspace<FileSystemProvider>>,
     /// 文件树是否展开
     tree_open: bool,
+    /// 大纲（目录导航）是否展开
+    outline_open: bool,
     /// 已打开文件的保存快照（脏状态用）
     saved_text: Option<String>,
     /// 命令面板状态（`Cmd+P`，D38）。
@@ -578,6 +581,7 @@ impl DocView {
             workspace_root: ws_root,
             workspace: ws,
             tree_open: true,
+            outline_open: true,
             saved_text,
             cmd_palette: PaletteState::default(),
             renaming: None,
@@ -1184,6 +1188,32 @@ impl DocView {
         cx.notify();
     }
 
+    /// 收集当前文档的大纲（标题列表）：`(级别, 标题文本, 源字节偏移)`。
+    ///
+    /// 数据来源是投影：每个 `ProjectedLine` 若 `block.heading` 为 `Some(level)`，
+    /// 则该行是标题行，其 `display_text()` 是已隐藏 `#` 标记后的可见标题文本。
+    fn outline_items(&mut self) -> Vec<(u8, String, usize)> {
+        let projection = self.doc.projection();
+        let mut out = Vec::new();
+        for line in &projection.lines {
+            if let Some(level) = line.block.heading {
+                let title = line.display_text();
+                let title = title.trim().to_string();
+                out.push((level, title, line.source_range.start));
+            }
+        }
+        out
+    }
+
+    /// 把光标移到指定源偏移（大纲/目录导航跳转用），并聚焦编辑区。
+    fn goto_source(&mut self, src: usize, cx: &mut Context<Self>) {
+        let src = self.doc.snap_to_boundary(src);
+        self.cursors = vec![Cursor::new(src)];
+        self.primary = 0;
+        self.selecting = false;
+        cx.notify();
+    }
+
     /// 跳到下一个匹配（循环）。
     fn find_next(&mut self, cx: &mut Context<Self>) {
         if self.find.matches.is_empty() {
@@ -1393,6 +1423,7 @@ impl DocView {
             mk("导出 PDF", "Cmd+E", ExportPdf),
             mk("查找/替换", "Cmd+F", Find),
             mk("切换文件树", "", ToggleTree),
+            mk("切换大纲", "Cmd+Shift+O", ToggleOutline),
             mk("移动当前文件…", "", MoveCurrentFile),
         ]
     }
@@ -1437,6 +1468,10 @@ impl DocView {
             Find => self.open_find(cx),
             ToggleTree => {
                 self.tree_open = !self.tree_open;
+                cx.notify();
+            }
+            ToggleOutline => {
+                self.outline_open = !self.outline_open;
                 cx.notify();
             }
             MoveCurrentFile => self.move_current_file_dialog(cx),
@@ -1902,6 +1937,64 @@ impl Render for DocView {
                 .child("资源管理器")
                 .into_any_element(),
         );
+        // 大纲（目录导航）：列出当前文档标题，按级别缩进，点击跳转
+        if self.outline_open {
+            sb.push(
+                div()
+                    .id("ol-h")
+                    .px_2()
+                    .h(px(24.))
+                    .items_center()
+                    .text_xs()
+                    .text_color(palette.border)
+                    .child("大纲")
+                    .into_any_element(),
+            );
+            let items = self.outline_items();
+            if items.is_empty() {
+                sb.push(
+                    div()
+                        .id("ol-empty")
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(palette.border)
+                        .child("（无标题）")
+                        .into_any_element(),
+                );
+            } else {
+                for (i, (level, title, src)) in items.into_iter().enumerate() {
+                    // 缩进按级别：level=1 无缩进，每级 +8px
+                    let indent = ((level.saturating_sub(1)) as f32) * 8.0 + 8.0;
+                    sb.push(
+                        div()
+                            .id(gpui::ElementId::Name(format!("ol-{i}").into()))
+                            .pl(px(indent))
+                            .pr_2()
+                            .py_0p5()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(palette.selection))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |view, _ev, _w, cx| {
+                                    view.goto_source(src, cx);
+                                }),
+                            )
+                            .child(title)
+                            .into_any_element(),
+                    );
+                }
+                sb.push(
+                    div()
+                        .id("ol-sep")
+                        .h(px(1.))
+                        .mt_1()
+                        .bg(palette.border)
+                        .into_any_element(),
+                );
+            }
+        }
         if self.tree_open
             && let Some(ref ws) = self.workspace
             && let Some(ref root) = self.workspace_root
@@ -2409,6 +2502,10 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             }
             "p" if m.platform => {
                 view.open_palette(cx);
+            }
+            "o" if m.platform && shift => {
+                view.outline_open = !view.outline_open;
+                cx.notify();
             }
             "o" if m.platform => {
                 view.open_file_dialog(cx);

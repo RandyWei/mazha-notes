@@ -534,7 +534,7 @@ interface Workspace {
 
 ### 9.2 后续 Phase（已确认排除出 MVP）
 
-- 大纲 / 目录导航、文档内搜索 → Phase 4
+- 大纲 / 目录导航（**已实现 0.1.53**：投影 `block.heading` → 侧栏标题列表 + 点击跳转，D39）、文档内搜索 → Phase 4
 - 主题 / 专注模式 / 打字机模式、字体字号 → Phase 4
 - CRDT + 云同步 + 存储 Provider + WASM 插件 → Phase 5
 - 移动端（iOS/Android）→ Phase 6
@@ -673,11 +673,13 @@ interface Workspace {
 | D37 | Phase 4 多标签页 | **模型**：`DocView` 改为多文档（`Vec<Tab>`，每个 Tab 含 `path`/`doc`/`cursors`/`primary`/`find`/`saved_text`/`layout` 等状态），当前活动索引 `active`。**切换**：`Cmd+1..9` 切到第 N 个、`Cmd+0` 切到最后、`Cmd+[`/`]` 前后切换、`Cmd+Shift+[`/`]` 移动标签、`Cmd+W` 关闭当前（不关闭最后一个）、`Cmd+Shift+W` 关闭所有。**打开逻辑**：新文件/打开文件都新建 Tab 并设为活动；同一 `PathBuf` 若已存在则直接切换到该 Tab 而非重复打开。**保存**：`Cmd+S`/`Cmd+Shift+S` 作用于当前活动 Tab。**标题栏/状态栏**：显示当前 Tab 文件名与脏标记（`*`）、全路径。**内存**：关闭 Tab 时释放其状态（DocLayout/高亮缓存可丢弃），布局与投影复用现有逻辑。**兼容**：单文件命令行启动时仍初始化单个 Tab。 | 确认（Phase 4 第二增量） |
 
 | D38 | Phase 4 命令面板 + 快捷键体系 | **命令面板**：`Cmd+P` 打开浮层，输入过滤命令与文件两类条目（前导 `>` 仅命令，无前导同时列出文件；`@`/`#` 留后续）。**命令集**：封装为 `Vec<Command>`（id/标题/快捷键/执行闭包），覆盖新建/打开/保存/另存为、切换/关闭标签、导出、查找、切换文件树。**匹配**：子串大小写不敏感 + 简单打分（前缀 > 词首 > 子串）。**交互**：`↑`/`↓` 选择、`Enter` 执行、`Esc` 关闭；输入框复用桌面静态文本处理（无 IME）。**快捷键体系**：`handle_key` 分派集中到命令 id，命令面板与既有快捷键共用同一命令表，避免两处维护。**范围**：MVP 只做命令面板 + 快捷键收敛，模糊匹配打分从简；文档内搜索/大纲留后续增量。 | 确认（Phase 4 第三增量） |
+| D39 | Phase 4 大纲 / 目录导航 | **数据来源**：复用投影，无需新解析——扫描当前活动 Tab 的 `Projection::lines`，凡 `ProjectedLine.block.heading == Some(level)` 者即标题行；标题文本取该行 `display_text()`（已隐藏 `#` 标记、去首尾空白），跳转目标取 `source_range.start`（标题行源字节偏移）。**层级**：按 `level`（1..=6）缩进（每级 +8px），只平铺不折叠。**交互**：侧栏「大纲」分区列出标题，点击调用 `goto_source(offset)` 把光标移到标题行并聚焦编辑区；`Cmd+Shift+O` 或命令面板「切换大纲」展开/收起。**范围**：只做当前文档大纲 + 点击跳转；标题搜索过滤、折叠展开、跟随滚动高亮留后续。 | 确认（Phase 4 第四增量） |
 
 ## 15. 变更记录
 
 | 版本 | 日期 | 变更内容 |
 |------|------|----------|
+| 0.1.53 | 2026-10-20 | **桌面大纲 / 目录导航**（Phase 4，SPEC §9.2/§14 D39）：纯 UI 增量，核心无改动。桌面端新增 `DocView.outline_open` 与 `outline_items()`（扫描 `Projection::lines` 中 `block.heading` 非空的行，取 `display_text()` 作标题、`source_range.start` 作跳转目标）、`goto_source(offset)`（光标移到指定源偏移）；侧栏新增「大纲」分区，标题按 `level` 缩进（每级 +8px）、点击跳转；`Cmd+Shift+O` 与命令面板「切换大纲」切换显隐。桌面端 fmt/clippy/build 全绿（本环境无法可视化验证） |
 | 0.1 | 2026-10-12 | 初始规范（规划版）：完成平台矩阵、总体架构、核心模块与契约草案、里程碑与决策记录 |
 | 0.1.1 | 2026-10-12 | Phase 1 启动：落地 `mazha-core` 最小可用内核（Document/Edit/Selection/ChangeSummary + undo/redo + 边界校验），契约 §6.1 同步实现态签名；接入 ropey 1.6 + thiserror 2；新增约定 AGENTS.md（规范驱动 + 必备注释 + CI 命令） |
 | 0.1.2 | 2026-10-12 | 内核迭代：落地 `OffsetMap`（可见区间模型 + src↔display 双向映射 + 交叉点稳定落点规则），契约 §6.1 补充实现细节；12 条新单测 |
