@@ -92,10 +92,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 3. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 4. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 88 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 89 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：fix(desktop): 布局/光标/原生对话框 panic（D41，Phase 4）>
+<本次提交：fix(desktop): 原生对话框改异步 AsyncFileDialog（D41 修正，Phase 4）>
+c46e7b3 fix(desktop): 布局/光标/原生对话框 panic（D41，Phase 4）
 f605595 docs: 归总 HANDOFF + SPEC D40（全工作区搜索列低优先规划）
 e63ea11 feat(desktop): 大纲/目录导航（侧栏标题列表+点击跳转，D39，Phase 4）
 62b80e1 feat(desktop): 文件 CRUD（重命名/删除/移动，D36 遗留，Phase 4）

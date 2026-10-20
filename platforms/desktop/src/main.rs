@@ -49,7 +49,7 @@ use mazha_core::{
 use mazha_export::to_pdf;
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
-use rfd::FileDialog;
+use rfd::AsyncFileDialog;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
 const SAMPLE: &str = "\
@@ -1385,21 +1385,22 @@ impl DocView {
 
     /// 导出当前文档为 PDF 并保存到文件。
     ///
-    /// 原生保存对话框经 `window.defer` 延迟（同 `open_file_dialog`），规避 gpui
-    /// 键盘布局回调的 `RefCell` 争用。
-    fn export_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let markdown = self.doc.text();
-        window.defer(cx, move |_window, _cx| {
-            let result = to_pdf(&markdown);
-            match result {
+    /// 异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框嵌套泵
+    /// runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。
+    fn export_pdf(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let markdown = self.doc.text().to_string();
+        cx.spawn(async move |_this, _cx| {
+            let picked = AsyncFileDialog::new()
+                .set_title("导出 PDF")
+                .add_filter("PDF 文件", &["pdf"])
+                .set_file_name("document.pdf")
+                .save_file()
+                .await;
+            let Some(handle) = picked else { return };
+            let path = handle.path().to_path_buf();
+            match to_pdf(&markdown) {
                 Ok(pdf_doc) => {
-                    if let Some(path) = FileDialog::new()
-                        .set_title("导出 PDF")
-                        .add_filter("PDF 文件", &["pdf"])
-                        .set_file_name("document.pdf")
-                        .save_file()
-                        && let Err(e) = std::fs::write(&path, &pdf_doc.bytes)
-                    {
+                    if let Err(e) = std::fs::write(&path, &pdf_doc.bytes) {
                         eprintln!("导出 PDF 失败：{}", e);
                     }
                 }
@@ -1407,7 +1408,8 @@ impl DocView {
                     eprintln!("PDF 编译失败：{}", e);
                 }
             }
-        });
+        })
+        .detach();
     }
 
     /// 命令面板：内置命令表（D38）。
@@ -1490,21 +1492,27 @@ impl DocView {
 
     /// 打开 Markdown 文件对话框。
     ///
-    /// **必须经 `window.defer` 延迟执行**：macOS 原生文件对话框（rfd）会重新查询键盘布局，
-    /// 触发 gpui 的 `on_keyboard_layout_change` 回调 `app.borrow_mut()`；若在按键回调里同步
-    /// 打开对话框，会与该回调争用同一 `RefCell` 而 panic（`app.rs` `RefCell already borrowed`）。
-    /// 延迟到当前事件借用释放后再弹，规避此冲突。
-    fn open_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entity = cx.entity();
-        window.defer(cx, move |_window, cx| {
-            let picked = FileDialog::new()
+    /// **关键约束（D41）**：绝不能在 gpui 回调里用 rfd 的**同步** `FileDialog`。macOS 同步
+    /// 对话框走 `NSApp runModal`，会**嵌套泵主 runloop**；其间系统重查键盘布局会回调 gpui 的
+    /// `on_keyboard_layout_change` → `app.borrow_mut()`，而此时 gpui 仍持有 app 的 `RefCell`，
+    /// 于是 panic（`app.rs` `RefCell already borrowed`）。`window.defer` 也无效，因为 defer 的闭包
+    /// 仍在同一次借用内执行。
+    ///
+    /// 正解：用 rfd 的**异步** `AsyncFileDialog`（macOS 走 `beginSheetModalForWindow`，不阻塞、
+    /// 不嵌套泵 runloop），在 gpui 的 `cx.spawn` 里 `await`；完成后经弱引用 `update` 回写结果。
+    fn open_file_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let picked = AsyncFileDialog::new()
                 .set_title("打开 Markdown")
                 .add_filter("Markdown", &["md", "markdown", "txt"])
-                .pick_file();
-            if let Some(path) = picked {
-                entity.update(cx, |view, cx| view.open_path(path, cx));
+                .pick_file()
+                .await;
+            if let Some(handle) = picked {
+                let path = handle.path().to_path_buf();
+                let _ = this.update(cx, |view, cx| view.open_path(path, cx));
             }
-        });
+        })
+        .detach();
     }
 
     #[allow(dead_code)]
@@ -1759,20 +1767,23 @@ impl DocView {
     }
 
     /// 移动当前文件到选定目录（命令面板入口）。
-    /// 移动当前文件到选定目录（命令面板入口）。
     ///
-    /// 同 `open_file_dialog`：原生对话框经 `window.defer` 延迟，规避 gpui 键盘布局
-    /// 回调的 `RefCell` 争用。
-    fn move_current_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entity = cx.entity();
-        window.defer(cx, move |_window, cx| {
-            let cur = entity.read(cx).path.clone();
-            let Some(cur) = cur else { return };
-            let picked = FileDialog::new().set_title("移动到目录").pick_folder();
-            if let Some(dir) = picked {
-                entity.update(cx, |view, cx| view.move_file(cur, dir, cx));
+    /// 同 `open_file_dialog`：用异步 `AsyncFileDialog` + `cx.spawn`，避免同步对话框嵌套泵
+    /// runloop 触发 gpui 键盘布局回调的 `RefCell` 争用（D41）。
+    fn move_current_file_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let cur = self.path.clone();
+        let Some(cur) = cur else { return };
+        cx.spawn(async move |this, cx| {
+            let picked = AsyncFileDialog::new()
+                .set_title("移动到目录")
+                .pick_folder()
+                .await;
+            if let Some(handle) = picked {
+                let dir = handle.path().to_path_buf();
+                let _ = this.update(cx, |view, cx| view.move_file(cur, dir, cx));
             }
-        });
+        })
+        .detach();
     }
 
     /// 把文件移动到目标目录（文件树 CRUD）。
@@ -1808,20 +1819,23 @@ impl DocView {
     }
 
     /// 另存为：弹原生保存对话框（经 `window.defer` 延迟，规避键盘布局回调的 `RefCell` 争用）。
-    fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entity = cx.entity();
-        window.defer(cx, move |_window, cx| {
-            let text = entity.read(cx).doc.text().to_string();
-            let picked = FileDialog::new()
+    /// 另存为：异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框
+    /// 嵌套泵 runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。
+    fn save_as(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.doc.text().to_string();
+        cx.spawn(async move |this, cx| {
+            let picked = AsyncFileDialog::new()
                 .set_title("另存为")
                 .add_filter("Markdown", &["md", "markdown"])
                 .set_file_name("document.md")
-                .save_file();
-            let Some(path) = picked else { return };
+                .save_file()
+                .await;
+            let Some(handle) = picked else { return };
+            let path = handle.path().to_path_buf();
             if let Err(e) = std::fs::write(&path, text.as_bytes()) {
                 eprintln!("保存失败：{}", e);
             } else {
-                entity.update(cx, |view, cx| {
+                let _ = this.update(cx, |view, cx| {
                     view.path = Some(path.clone());
                     view.saved_text = Some(view.doc.text().to_string());
                     if let Some(parent) = path.parent()
@@ -1834,7 +1848,8 @@ impl DocView {
                     cx.notify();
                 });
             }
-        });
+        })
+        .detach();
     }
 
     /// Alt+Click：在点击位置添加新光标，或移除已有光标。
