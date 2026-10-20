@@ -3,8 +3,8 @@
 > 每次提交代码时**同步更新本文件**（约定，见 `AGENTS.md`）。
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
-- 最近更新：2026-10-19
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 首增量启动**（打开/保存 + 文件树侧栏，多标签页/命令面板设计中）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
+- 最近更新：2026-10-20
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
 - 当前版本：**0.1.52**（细节见 SPEC §15 变更记录；本节只列归总）
 
@@ -39,7 +39,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现（要点） | 待办 |
 |------|------|----------------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 首增量） | 只读投影渲染 + 主题；光标/点击命中 + WYSIWYG 标记显隐（光标行显原文）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；IME 全实现（UTF-8↔UTF-16）；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开/保存 + 文件树侧栏（设计中）** | 文件管理续（重命名/删除/新建）、多标签页、命令面板（Phase 4） |
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + WYSIWYG 标记显隐（光标行显原文）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；IME 全实现（UTF-8↔UTF-16）；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）** | 大纲、文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6 / 8 / 7 |
 
 > 桌面端入口：`cargo run -- [path/to/file.md]`。本环境无法可视化验证渲染效果，逻辑改动靠核心单测 + 编译门禁保证。
@@ -87,21 +87,28 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. **Phase 4**：桌面**文件管理**（打开/保存/文件树，接 `mazha-core::Workspace`，已完成首增量）→ **多标签页**（D37，基础已落地）→ **命令面板 + 快捷键体系**（D38，进行中）；其后**大纲 / 文档内搜索 / 主题与专注模式**。
+1. **Phase 4 余项**：桌面**大纲 / 文档内搜索 / 主题与专注模式**（文件管理、多标签页 D37、命令面板 D38 均已落地）；文件树可择机深化为目录层级/拖拽移动。
 2. **渲染层深化**（R4）：数学排版（`ratex-*`）与图表 SVG（`mermaid-rs-renderer`）替换块级占位面板；脚注的点击跳转/自动编号/文末归集；软换行**横向滚动**（D33 已知限制）。
 3. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 4. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 69 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 85 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(md): 脚注解析与建模（[^label] 引用 + [^label]: body 定义，0.1.52，Phase 3）>
+<本次提交：feat(desktop): 文件 CRUD（重命名/删除/移动，D36 遗留，Phase 4）>
+81b0fb6 feat(desktop): 命令面板 Cmd+P（D38，命令集 + 过滤 + 执行）
+060f96f docs: Phase 4 命令面板设计（D38）
+7c7ffdb feat(desktop): 多标签页支持（标题栏/切换/关闭/新建，D37 基础）
+08323fa feat(desktop): 多标签页快捷键（Cmd+1..9/0、Cmd+W/Shift+W）
+ae14bb3 feat(desktop): 文件树新建 Markdown（最小）
+fb9ed20 feat(desktop): 文件树点击切换文档（最小可用）
+cb8fd3e docs: Phase 4 多标签页设计（D37）
+23f8012 feat(desktop): 文件管理首增量（Cmd+O/S/Shift+S + 脏状态，兼容 Workspace）
+1c2a393 feat(md): 脚注解析与建模（[^label] 引用 + [^label]: body 定义，0.1.52，Phase 3）
 6c7ea52 feat(md): 公式/图表解析与建模（$$…$$ / $…$ / mermaid 归类，0.1.51，Phase 3）
 1f42f08 fix(export): 多行代码块导出丢失换行（HTML/Typst，R8 同类缺陷）
 b6fd01b feat(core): 查找/替换（find_all/replace_all）+ 桌面 Cmd+F 查找条（0.1.49，Phase 3）
-dfa6b15 feat(desktop): 按视觉行上下移动（visual_vertical_target，软换行 D33 收尾，Phase 3）
-423f2db feat(desktop): 系统剪贴板 Cmd+C/X/V 复制/剪切/粘贴（0.1.47，Phase 3）
-d389872 feat(core): 软换行（显示列↔字节换算 + 桌面 shape_text 视觉行布局，D33，Phase 3）
+```
 c8136b7 feat(core): 代码块语法高亮（syntect Highlighter）+ 桌面着色（D32，Phase 3）
 25a4670 feat(core): 表格增删行列（TableOp/edit_table）+ 桌面快捷键（D31，Phase 3）
 3c497ff feat(desktop): 块级 widget 渲染（代码块面板/表格网格/分割线，Phase 3）

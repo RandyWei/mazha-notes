@@ -398,6 +398,7 @@ enum PaletteAction {
     ExportPdf,
     Find,
     ToggleTree,
+    MoveCurrentFile,
 }
 
 #[allow(dead_code)]
@@ -508,6 +509,8 @@ struct DocView {
     /// 命令面板状态（`Cmd+P`，D38）。
     #[allow(dead_code)]
     cmd_palette: PaletteState,
+    /// 正在重命名的文件树条目：`(原路径, 编辑中的新名)`；`None` 表示无。
+    renaming: Option<(PathBuf, String)>,
 }
 
 impl DocView {
@@ -577,6 +580,7 @@ impl DocView {
             tree_open: true,
             saved_text,
             cmd_palette: PaletteState::default(),
+            renaming: None,
         }
     }
 
@@ -1389,6 +1393,7 @@ impl DocView {
             mk("导出 PDF", "Cmd+E", ExportPdf),
             mk("查找/替换", "Cmd+F", Find),
             mk("切换文件树", "", ToggleTree),
+            mk("移动当前文件…", "", MoveCurrentFile),
         ]
     }
 
@@ -1434,6 +1439,7 @@ impl DocView {
                 self.tree_open = !self.tree_open;
                 cx.notify();
             }
+            MoveCurrentFile => self.move_current_file_dialog(cx),
         }
     }
 
@@ -1636,6 +1642,108 @@ impl DocView {
         }
     }
 
+    /// 开始重命名（文件树条目）。
+    fn start_rename(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.renaming = Some((path, name));
+        cx.notify();
+    }
+
+    /// 确认重命名。
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some((path, name)) = self.renaming.clone() {
+            self.renaming = None;
+            self.rename_file(path, &name, cx);
+        }
+    }
+
+    /// 取消重命名。
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = None;
+        cx.notify();
+    }
+
+    /// 删除指定路径的文件（文件树 CRUD）。
+    fn delete_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("删除失败：{}", e);
+        } else {
+            // 若当前打开的是该文件，清空为未保存示例（避免悬挂路径）
+            if self.path.as_ref().is_some_and(|p| p == &path) {
+                self.path = None;
+                self.saved_text = None;
+                self.layout = None;
+                self.highlighter = None;
+            }
+            self.refresh_workspace(cx);
+        }
+    }
+
+    /// 重命名指定文件（同目录下的新文件名）。
+    fn rename_file(&mut self, path: PathBuf, new_name: &str, cx: &mut Context<Self>) {
+        if new_name.trim().is_empty() {
+            return;
+        }
+        let Some(parent) = path.parent() else { return };
+        let target = parent.join(new_name.trim());
+        if target.exists() {
+            eprintln!("重命名失败：目标已存在");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&path, &target) {
+            eprintln!("重命名失败：{}", e);
+        } else {
+            if self.path.as_ref().is_some_and(|p| p == &path) {
+                self.path = Some(target.clone());
+            }
+            self.refresh_workspace(cx);
+        }
+    }
+
+    /// 移动当前文件到选定目录（命令面板入口）。
+    fn move_current_file_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(cur) = self.path.clone() else { return };
+        if let Some(dir) = FileDialog::new().set_title("移动到目录").pick_folder() {
+            self.move_file(cur, dir, cx);
+        }
+    }
+
+    /// 把文件移动到目标目录（文件树 CRUD）。
+    fn move_file(&mut self, path: PathBuf, target_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(name) = path.file_name() else { return };
+        let target = target_dir.join(name);
+        if target == path {
+            return;
+        }
+        if target.exists() {
+            eprintln!("移动失败：目标已存在");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&path, &target) {
+            eprintln!("移动失败：{}", e);
+        } else {
+            if self.path.as_ref().is_some_and(|p| p == &path) {
+                self.path = Some(target.clone());
+            }
+            self.refresh_workspace(cx);
+        }
+    }
+
+    /// 重建 Workspace（CRUD 后刷新文件树）。
+    fn refresh_workspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(ref root) = self.workspace_root
+            && let Ok(p) = FileSystemProvider::open(root.clone())
+        {
+            self.workspace = Some(Workspace::new(p));
+        }
+        self.layout = None;
+        cx.notify();
+    }
+
     fn save_as(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = FileDialog::new()
             .set_title("另存为")
@@ -1804,23 +1912,77 @@ impl Render for DocView {
                 let rel = entry.path.to_string();
                 let full = root.join(&rel);
                 let cur = self.path.as_ref().is_some_and(|cp| cp.ends_with(&rel));
-                sb.push(
-                    div()
-                        .id(gpui::ElementId::Name(format!("sb-{rel}").into()))
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .cursor_pointer()
-                        .when(cur, |d| d.bg(palette.selection))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(move |view, _ev, _w, cx| {
-                                view.open_path(full.clone(), cx);
-                            }),
-                        )
-                        .child(name)
-                        .into_any_element(),
-                );
+                // 重命名态：该行渲染为可编辑输入
+                let renaming_this = self.renaming.as_ref().is_some_and(|(rp, _)| rp == &full);
+                if renaming_this {
+                    let edit_text = self
+                        .renaming
+                        .as_ref()
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or_default();
+                    sb.push(
+                        div()
+                            .id(gpui::ElementId::Name(format!("sb-edit-{rel}").into()))
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .bg(palette.selection)
+                            .child(edit_text)
+                            .into_any_element(),
+                    );
+                } else {
+                    let full_open = full.clone();
+                    let full_ren = full.clone();
+                    let full_del = full.clone();
+                    sb.push(
+                        div()
+                            .id(gpui::ElementId::Name(format!("sb-{rel}").into()))
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .when(cur, |d| d.bg(palette.selection))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |view, _ev, _w, cx| {
+                                            view.open_path(full_open.clone(), cx);
+                                        }),
+                                    )
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |view, _ev, _w, cx| {
+                                            view.start_rename(full_ren.clone(), cx);
+                                        }),
+                                    )
+                                    .child("✎"),
+                            )
+                            .child(
+                                div()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |view, _ev, _w, cx| {
+                                            view.delete_file(full_del.clone(), cx);
+                                        }),
+                                    )
+                                    .child("✕"),
+                            )
+                            .into_any_element(),
+                    );
+                }
             }
         }
         let sidebar_el = div()
@@ -2176,6 +2338,29 @@ impl EntityInputHandler for DocView {
 fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<DocView>) {
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
+
+    // 重命名文件树条目时：按键作为文本编辑（Enter 确认、Esc 取消、Backspace 删除）
+    if view.renaming.is_some() {
+        let key = event.keystroke.key.as_str();
+        match key {
+            "enter" | "return" => view.commit_rename(cx),
+            "escape" => view.cancel_rename(cx),
+            "backspace" => {
+                if let Some((_, t)) = view.renaming.as_mut() {
+                    t.pop();
+                }
+                cx.notify();
+            }
+            k if k.chars().count() == 1 && !k.chars().next().unwrap().is_control() => {
+                if let Some((_, t)) = view.renaming.as_mut() {
+                    t.push(k.chars().next().unwrap());
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+        return;
+    }
 
     // 命令面板展开时：所有按键优先交给面板处理
     if view.cmd_palette.open {
