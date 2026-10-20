@@ -431,6 +431,10 @@ impl Tab {
 
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
 struct DocView {
+    #[allow(dead_code)]
+    tabs: Vec<Tab>,
+    #[allow(dead_code)]
+    active: usize,
     /// 打开的文件路径（`None` = 使用内置示例）。
     path: Option<PathBuf>,
     /// 文档（源文本真相 + 投影缓存）。
@@ -493,7 +497,20 @@ impl DocView {
                     .map(|p| (Some(r.clone()), Some(Workspace::new(p))))
             })
             .unwrap_or((None, None));
+        let t = Tab {
+            path: path.cloned(),
+            doc: Document::new(&text),
+            cursors: vec![Cursor::new(0)],
+            primary: 0,
+            selecting: false,
+            layout: None,
+            highlighter: None,
+            find: FindState::default(),
+            saved_text: path.is_some().then(|| text.clone()),
+        };
         Self {
+            tabs: vec![t],
+            active: 0,
             path: path.cloned(),
             doc: Document::new(&text),
             cursors: vec![Cursor::new(0)],
