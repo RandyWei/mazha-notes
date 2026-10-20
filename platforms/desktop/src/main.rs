@@ -1342,6 +1342,29 @@ impl DocView {
     }
 
     #[allow(dead_code)]
+    fn close_current_tab(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.tabs.remove(self.active);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        // sync to current fields
+        let t = &self.tabs[self.active];
+        self.path = t.path.clone();
+        self.doc = Document::new(&t.doc.text());
+        self.cursors = t.cursors.clone();
+        self.primary = t.primary;
+        self.selecting = t.selecting;
+        self.layout = t.layout.clone();
+        self.highlighter = None;
+        self.find = FindState::default();
+        self.saved_text = t.saved_text.clone();
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
     fn new_tab_empty(&mut self, cx: &mut Context<Self>) {
         self.tabs.push(Tab::new(String::new(), None));
         self.active = self.tabs.len() - 1;
@@ -1964,6 +1987,9 @@ fn handle_key(view: &mut DocView, event: &KeyDownEvent, _: &mut Window, cx: &mut
             }
             "t" if m.platform => {
                 view.new_tab_empty(cx);
+            }
+            "w" if m.platform => {
+                view.close_current_tab(cx);
             }
             "s" if m.platform && !shift => {
                 view.save_current(cx);
