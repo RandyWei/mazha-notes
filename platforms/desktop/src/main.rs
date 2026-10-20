@@ -43,9 +43,10 @@ use mazha_core::{
     Highlighter, InlineMark, ProjectedLine, Projection, RunStyle, Selection, TableOp,
     TextRun as DocTextRun,
     commands::{set_block, toggle_inline},
-    edit_table, find_all, replace_all_edit,
+    edit_table, find_all, replace_all_edit, Workspace,
 };
 use mazha_export::to_pdf;
+use mazha_store::{DocPath, Entry, EntryKind, FileSystemProvider};
 use rfd::FileDialog;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
