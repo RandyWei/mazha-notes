@@ -1577,7 +1577,7 @@ impl DocView {
 impl Render for DocView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette;
-        let header = self.header_text();
+        let _header = self.header_text();
         let caret_count = self.cursors.len();
         let line_count = self.doc.projection().len();
         let focus = self.focus.clone();
@@ -1789,8 +1789,8 @@ impl Render for DocView {
                     .border_color(palette.border)
                     .text_sm()
                     .text_color(palette.muted)
-                    .child(header)
-                    .child(format!("· {}", self.header_full_path()))
+                    .child(self.tabs.get(self.active).map(|t| t.name()).unwrap_or_else(|| self.header_text()))
+                    .child(format!("· {}", self.tabs.get(self.active).map(|t| t.full()).unwrap_or_else(|| self.header_full_path())))
                     .child(format!(
                         "· {line_count} 行 · 光标×{} · Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换",
                         caret_count
