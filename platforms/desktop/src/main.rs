@@ -4164,11 +4164,12 @@ impl Element for DocElement {
             let line_px = block.line_height;
             let line_x = layout.origin.x + block.indent;
 
-            // 引用块：只对**最外层**引用（depth==1）画背景和左竖线并加上下内边距。
-            // 嵌套引用（depth>1）不画额外背景和竖线，避免层级之间出现分隔线。
-            if block.proj.block.quote_depth == 1 {
+            // 引用块：所有层级都画左竖线和背景；仅最外层加上下内边距，
+            // 避免嵌套引用之间产生多余的间隔分隔。
+            if block.proj.block.quote_depth > 0 {
                 let pad_x = px(4.);
-                let pad_y = px(2.);
+                let is_outer = block.proj.block.quote_depth == 1;
+                let pad_y = if is_outer { px(2.) } else { px(0.) };
                 let left = layout.origin.x + pad_x;
                 let right = element_bounds.origin.x + element_bounds.size.width - pad_x;
                 if right > left {
