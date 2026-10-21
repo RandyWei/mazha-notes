@@ -8,9 +8,9 @@
 //! - **只读投影渲染**：语法标记默认隐藏（由 core 投影决定，UI 不解析 Markdown）；
 //! - **光标**：点击文本放置光标（整篇命中 → [`OffsetMap`] → 源字节偏移），
 //!   方向键/Home/End 移动；
-//! - **WYSIWYG 标记显隐**（SPEC §11.2）：默认渲染投影（标记隐藏）；光标落在某个
-//!   `[文字](目标)` 链接内时，**该链接**临时展开为原始 Markdown（`inline_links` /
-//!   `reveal_link_line`），离开后复原；整行原文显示（§11.2 全量版）仍留后续；
+//! - **WYSIWYG 标记显隐**（SPEC §11.2）：默认渲染投影（标记隐藏）；光标落在链接、
+//!   粗体、斜体、删除线、行内代码内时，**该格式组**临时展开为原始 Markdown
+//!   （`inline_reveals` / `reveal_inline`），离开后复原；整行原文显示（§11.2 全量版）仍留后续；
 //! - **链接打开**：Cmd+点击链接调系统默认浏览器（`DocView::link_at`）；
 //! - **跨行选区**（SPEC §11.2）：鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`，
 //!   经核心 `Projection::selection_display_ranges` 折算成每行显示列区间再画高亮。
@@ -49,7 +49,7 @@ use mazha_core::{
     edit_table, find_all, replace_all_edit,
 };
 use mazha_export::to_pdf;
-use mazha_md::{SpanRole, parse_inline};
+use mazha_md::{SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
 use rfd::AsyncFileDialog;
@@ -155,6 +155,7 @@ impl Palette {
 }
 
 /// 一行内可展开/可点击的链接组：`[文字](目标)`（偏移均**相对行首**）。
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InlineLink {
     /// 整组源区间（`[` 起、`)` 止）。
@@ -165,11 +166,19 @@ struct InlineLink {
     markers: Vec<Range<usize>>,
 }
 
+/// 行内可展开的格式组（粗体/斜体/删除线/行内代码），偏移均**相对行首**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineReveal {
+    /// 整组源区间。
+    range: Range<usize>,
+    /// 需要展开的标记片段（如 `**`、`*`、`~~`、`` ` ``）。
+    markers: Vec<Range<usize>>,
+    /// 链接目标（仅链接组有值，用于 Cmd+点击）。
+    link_dest: Option<Range<usize>>,
+}
+
 /// 解析一行源文本里的完整链接组（输出偏移相对行首）。
-///
-/// 复用 `mazha_md::parse_inline`（保证与投影同源），只认闭合的 `[文字](目标)`：
-/// 三个 `LinkMarker` 依次是 `[`、`](`、`)`，中间夹一个 `LinkDest`。目标为空
-/// （`[x]()`）不产生组，避免光标经过时展开出空壳；图片（Widget）不在此列。
+#[allow(dead_code)]
 fn inline_links(line_src: &str) -> Vec<InlineLink> {
     let spans = parse_inline(line_src, 0..line_src.len());
     let markers: Vec<&mazha_md::SyntaxSpan> = spans
@@ -214,6 +223,109 @@ fn inline_links(line_src: &str) -> Vec<InlineLink> {
     links
 }
 
+/// 解析行内可展开的格式组（链接、粗体、斜体、删除线、行内代码）。
+fn inline_reveals(line_src: &str) -> Vec<InlineReveal> {
+    let spans = parse_inline(line_src, 0..line_src.len());
+    let mut reveals = Vec::new();
+
+    // 链接组
+    let markers: Vec<&mazha_md::SyntaxSpan> = spans
+        .iter()
+        .filter(|s| s.role == SpanRole::LinkMarker)
+        .collect();
+    for chunk in markers.as_chunks::<3>().0 {
+        let (open, mid, close) = (chunk[0], chunk[1], chunk[2]);
+        if line_src.get(open.range.clone()) != Some("[")
+            || line_src.get(mid.range.clone()) != Some("](")
+            || line_src.get(close.range.clone()) != Some(")")
+        {
+            continue;
+        }
+        let Some(dest_span) = spans.iter().find(|s| {
+            s.role == SpanRole::LinkDest
+                && s.range.start >= mid.range.end
+                && s.range.end <= close.range.start
+        }) else {
+            continue;
+        };
+        let dest = trim_ascii_range(line_src, dest_span.range.clone());
+        if dest.is_empty() {
+            continue;
+        }
+        let mut marks = vec![
+            open.range.clone(),
+            mid.range.clone(),
+            close.range.clone(),
+            dest_span.range.clone(),
+        ];
+        marks.sort_by_key(|r| r.start);
+        reveals.push(InlineReveal {
+            range: open.range.start..close.range.end,
+            markers: marks,
+            link_dest: Some(dest),
+        });
+    }
+
+    // 粗体、斜体、删除线、行内代码：标记与内容同角色，标记为 Marker
+    for span in &spans {
+        if span.kind != SpanKind::Marker {
+            continue;
+        }
+        let role = span.role;
+        if !matches!(
+            role,
+            SpanRole::Strong | SpanRole::Emphasis | SpanRole::Strikethrough | SpanRole::InlineCode
+        ) {
+            continue;
+        }
+        // 找到同角色的一对标记，确定范围
+        let _pair_start: Option<usize> = None;
+        let _pair_end: Option<usize> = None;
+        // 简单做法：收集所有同角色 Marker，成对处理
+        // 但更准确的是找到与此标记配对的另一个
+    }
+
+    // 收集配对的标记
+    let mut used = vec![false; spans.len()];
+    for i in 0..spans.len() {
+        if used[i] {
+            continue;
+        }
+        let s = &spans[i];
+        if s.kind != SpanKind::Marker {
+            continue;
+        }
+        let role = s.role;
+        if !matches!(
+            role,
+            SpanRole::Strong | SpanRole::Emphasis | SpanRole::Strikethrough | SpanRole::InlineCode
+        ) {
+            continue;
+        }
+        // 找配对的同角色 Marker
+        if let Some(j) = (i + 1..spans.len())
+            .find(|&k| !used[k] && spans[k].kind == SpanKind::Marker && spans[k].role == role)
+        {
+            used[i] = true;
+            used[j] = true;
+            let r1 = spans[i].range.clone();
+            let r2 = spans[j].range.clone();
+            let start = r1.start.min(r2.start);
+            let end = r1.end.max(r2.end);
+            let mut marks = vec![r1, r2];
+            marks.sort_by_key(|r| r.start);
+            reveals.push(InlineReveal {
+                range: start..end,
+                markers: marks,
+                link_dest: None,
+            });
+        }
+    }
+
+    reveals.sort_by_key(|r| r.range.start);
+    reveals
+}
+
 /// 把区间两端的 ASCII 空白裁掉（链接目标常写成 `( https://x )`）。
 fn trim_ascii_range(s: &str, mut r: Range<usize>) -> Range<usize> {
     let bytes = s.as_bytes();
@@ -226,7 +338,7 @@ fn trim_ascii_range(s: &str, mut r: Range<usize>) -> Range<usize> {
     r
 }
 
-/// 生成"链接原文展开"的行副本：把 `link` 的隐藏标记还原成可见文本。
+/// 生成"原文展开"的行副本：把标记还原成可见文本（链接、粗体、斜体、删除线、行内代码）。
 ///
 /// 只改 `runs`（追加标记片段）与 `offset_map`（按新可见区间重建），`source_range`
 /// 与块样式不变。标记片段按源偏移与既有 run 归并，并重算 `display_start`。
@@ -234,27 +346,26 @@ fn trim_ascii_range(s: &str, mut r: Range<usize>) -> Range<usize> {
 /// 边界校验），绝对映射由 [`BlockGeom::source_of_col`] 加回行起点。
 ///
 /// 返回 `None` 表示该行不宜展开（见函数内两条守卫），调用方继续按投影渲染。
-fn reveal_link_line(
+fn reveal_inline(
     line: &ProjectedLine,
     line_src: &str,
-    link: &InlineLink,
+    reveal: &InlineReveal,
 ) -> Option<ProjectedLine> {
     let base = line.source_range.start;
     // 守卫 1：标记必须确实被投影隐藏。代码块整行都是可见文本（不解析行内语法），
-    // 若照插会把 `[` / `](` / URL 重复显示一遍。
-    let markers_hidden = link.markers.iter().all(|m| {
+    // 若照插会把标记重复显示一遍。
+    let markers_hidden = reveal.markers.iter().all(|m| {
         let (a, b) = (base + m.start, base + m.end);
         !line
             .runs
             .iter()
             .any(|r| r.source_range.start < b && a < r.source_range.end)
     });
-    // 守卫 2：没有可见片段（Front-matter 元数据行、公式块内容行）时，插入标记会
-    // 把整行变成几段孤立符号，不如不展开。
+    // 守卫 2：没有可见片段（Front-matter 元数据行、公式块内容行）时，不展开。
     if !markers_hidden || line.runs.is_empty() {
         return None;
     }
-    let mut inserts: Vec<DocTextRun> = link
+    let mut inserts: Vec<DocTextRun> = reveal
         .markers
         .iter()
         .filter_map(|r| {
@@ -319,10 +430,10 @@ struct BlockGeom {
     prefix_bytes: usize,
     /// 左缩进（引用深度、列表缩进），行内 x 坐标需加上它才是块内绝对 x。
     indent: Pixels,
-    /// 本块是否处于"链接原文展开"态（光标在链接内）。
+    /// 本块是否处于"原文展开"态（光标在链接/粗体/斜体/删除线/行内代码内）。
     ///
-    /// 展开态的 `proj` 是 [`reveal_link_line`] 生成的副本：URL 与 `[`/`](`/`)`
-    /// 重新变为可见文本（同行其它标记仍隐藏）；`offset_map` 以**行首为基准**
+    /// 展开态的 `proj` 是 [`reveal_inline`] 生成的副本：标记重新变为可见文本
+    /// （同行其它标记仍隐藏）；`offset_map` 以**行首为基准**
     /// （见 [`BlockGeom::source_of_col`] 的加回逻辑）。
     revealed: bool,
     /// 光标在本块时的行内**显示列**（`None` = 光标不在本块；仅一块为 `Some`）。
@@ -1718,10 +1829,6 @@ impl DocView {
     }
 
     /// 命中窗口坐标处的**链接目标**（Cmd+点击用）；不在链接上返回 `None`。
-    ///
-    /// 先用布局命中到源偏移，再解析该行源码里的完整链接组（与展开原文同一套
-    /// [`inline_links`]），避免 UI 侧另写一份 Markdown 语法。展开态（光标在链接内）
-    /// 与投影态都成立：前者 `source_of_col` 走原文映射，后者会吸附到隐藏标记起点。
     fn link_at(&self, position: Point<Pixels>) -> Option<String> {
         let layout = self.layout.as_ref()?;
         let (row, col) = layout.hit(position)?;
@@ -1730,11 +1837,11 @@ impl DocView {
         let src = block.source_of_col(col);
         let line_src = self.doc.try_slice(range.clone()).ok()?;
         let rel = src.saturating_sub(range.start).min(line_src.len());
-        let link = inline_links(&line_src)
+        let reveal = inline_reveals(&line_src)
             .into_iter()
-            .find(|l| rel >= l.range.start && rel <= l.range.end)?;
-        // 目标两侧的 `<...>` 是 Markdown 的可选包裹，打开时要剥掉
-        let raw = line_src.get(link.dest.clone())?.trim();
+            .find(|r| rel >= r.range.start && rel <= r.range.end && r.link_dest.is_some())?;
+        let dest = reveal.link_dest.as_ref()?;
+        let raw = line_src.get(dest.clone())?.trim();
         let url = raw
             .strip_prefix('<')
             .and_then(|u| u.strip_suffix('>'))
@@ -3694,10 +3801,10 @@ impl Element for DocElement {
                     (line, projection.lines[line].source_range.clone())
                 };
                 let caret_line_src = view.doc.slice(caret_line_range.clone()).into_owned();
-                // 光标落在 `[文字](目标)` 组内（含刚敲完 `)` 的组尾）才展开
-                let caret_link = inline_links(&caret_line_src).into_iter().find(|l| {
-                    caret >= caret_line_range.start + l.range.start
-                        && caret <= caret_line_range.start + l.range.end
+                // 光标落在可展开组内（链接、粗体、斜体、删除线、行内代码）才展开
+                let caret_reveal = inline_reveals(&caret_line_src).into_iter().find(|r| {
+                    caret >= caret_line_range.start + r.range.start
+                        && caret <= caret_line_range.start + r.range.end
                 });
                 let projection = view.doc.projection();
                 let caret_pos = projection.source_to_doc_pos(caret);
@@ -3816,12 +3923,12 @@ impl Element for DocElement {
                 // 先记几何，update 返回后再解析 `[ ]`/`[x]` 的源字节区间。
                 let mut task_cand: Vec<(Range<usize>, Pixels, Pixels, Pixels)> = Vec::new();
                 for (idx, line) in projection.lines.iter().enumerate() {
-                    // 光标在链接内：把该链接的标记与 URL 展开成可见原文；其它行仍按投影
-                    // 隐藏标记（光标移开链接后自动复原）。
+                    // 光标在可展开组内：把标记还原成可见原文；其它行仍按投影
+                    // 隐藏标记（光标移开后自动复原）。
                     let revealed_line = if idx == caret_line {
-                        caret_link
+                        caret_reveal
                             .as_ref()
-                            .and_then(|link| reveal_link_line(line, &caret_line_src, link))
+                            .and_then(|r| reveal_inline(line, &caret_line_src, r))
                     } else {
                         None
                     };
@@ -4180,7 +4287,10 @@ impl Element for DocElement {
                     );
                     window.paint_quad(fill(band, palette.quote_bg));
                     window.paint_quad(fill(
-                        bounds(point(left, row_top - pad_y), size(px(3.), height + pad_y * 2.)),
+                        bounds(
+                            point(left, row_top - pad_y),
+                            size(px(3.), height + pad_y * 2.),
+                        ),
                         palette.border,
                     ));
                 }
@@ -4340,7 +4450,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
-    use super::{DisplayPos, Document, inline_links, reveal_link_line};
+    use super::{DisplayPos, Document, inline_links, inline_reveals, reveal_inline};
 
     /// 完整链接应被识别为一组：区间覆盖 `[`..`)`，目标去掉两侧空白。
     #[test]
@@ -4384,8 +4494,12 @@ mod tests {
             projection.lines[0].clone()
         };
         let line_src = doc.slice(line.source_range.clone()).into_owned();
-        let link = inline_links(&line_src).pop().expect("应识别到链接");
-        let revealed = reveal_link_line(&line, &line_src, &link).expect("段落链接应可展开");
+        let reveal = inline_reveals(&line_src)
+            .into_iter()
+            .find(|r| r.link_dest.is_some())
+            .expect("应识别到链接");
+        let dest = reveal.link_dest.clone().unwrap();
+        let revealed = reveal_inline(&line, &line_src, &reveal).expect("段落链接应可展开");
 
         // 投影态：强调/链接标记与 URL 都隐藏
         assert_eq!(line.display_text(), "粗 文档 尾巴");
@@ -4393,7 +4507,7 @@ mod tests {
         assert_eq!(revealed.display_text(), "粗 [文档](https://a.com) 尾巴");
 
         // URL 逐字符与源偏移对齐（展开后 1 显示字符 = 1 源字节）
-        for rel in link.dest.clone() {
+        for rel in dest {
             if !line_src.is_char_boundary(rel) {
                 continue;
             }
@@ -4416,11 +4530,12 @@ mod tests {
             projection.lines[1].clone()
         };
         let line_src = doc.slice(line.source_range.clone()).into_owned();
-        let link = inline_links(&line_src)
-            .pop()
+        let link = inline_reveals(&line_src)
+            .into_iter()
+            .find(|r| r.link_dest.is_some())
             .expect("代码文本里也能识别出链接组");
         assert!(
-            reveal_link_line(&line, &line_src, &link).is_none(),
+            reveal_inline(&line, &line_src, &link).is_none(),
             "代码块行不应展开"
         );
     }
