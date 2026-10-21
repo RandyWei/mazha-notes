@@ -11,6 +11,8 @@ description = "码札桌面端（GPUI + gpui-kit，见 SPEC §7.1）"
 [dependencies]
 # 共享核心：源文本真相 + 投影（路径依赖，独立于根 workspace 构建）
 mazha-core = { path = "../../crates/mazha-core" }
+# 行内解析：光标在链接内时展开原文、Cmd+点击取链接目标（见 `inline_links`）
+mazha-md = { path = "../../crates/mazha-md" }
 # 存储抽象（Workspace/FileSystemProvider/DocPath）
 mazha-store = { path = "../../crates/mazha-store" }
 # PDF 导出

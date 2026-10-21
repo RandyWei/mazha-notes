@@ -8,8 +8,10 @@
 //! - **只读投影渲染**：语法标记默认隐藏（由 core 投影决定，UI 不解析 Markdown）；
 //! - **光标**：点击文本放置光标（整篇命中 → [`OffsetMap`] → 源字节偏移），
 //!   方向键/Home/End 移动；
-//! - **WYSIWYG 标记显隐**（SPEC §11.2）：光标所在行渲染**原始 Markdown**（标记可见），
-//!   其余行渲染投影（标记隐藏）；
+//! - **WYSIWYG 标记显隐**（SPEC §11.2）：默认渲染投影（标记隐藏）；光标落在某个
+//!   `[文字](目标)` 链接内时，**该链接**临时展开为原始 Markdown（`inline_links` /
+//!   `reveal_link_line`），离开后复原；整行原文显示（§11.2 全量版）仍留后续；
+//! - **链接打开**：Cmd+点击链接调系统默认浏览器（`DocView::link_at`）；
 //! - **跨行选区**（SPEC §11.2）：鼠标拖选 + Shift+方向键，选区为源字节 `Range<usize>`，
 //!   经核心 `Projection::selection_display_ranges` 折算成每行显示列区间再画高亮。
 //! - **多光标**：Alt+Click 增删光标，编辑命令对所有光标生效。
@@ -41,12 +43,13 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
-    Highlighter, InlineMark, ProjectedLine, Projection, RunStyle, Selection, TableOp,
+    Highlighter, InlineMark, OffsetMap, ProjectedLine, Projection, RunStyle, Selection, TableOp,
     TextRun as DocTextRun, Workspace,
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit,
 };
 use mazha_export::to_pdf;
+use mazha_md::{SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
 use rfd::AsyncFileDialog;
@@ -116,6 +119,8 @@ struct Palette {
     background: Hsla,
     /// 弱底色（代码块、行内代码背景）。
     subtle: Hsla,
+    /// 引用块整行浅底（比 `subtle` 更淡，避免压过正文）。
+    quote_bg: Hsla,
     /// 选区高亮底色（accent 的低透明度）。
     selection: Hsla,
 }
@@ -135,6 +140,11 @@ impl Palette {
                 a: 0.25,
                 ..theme.muted
             },
+            // 引用块底色：比弱底色更淡，整行铺满时不至于抢占文字对比度
+            quote_bg: Hsla {
+                a: 0.10,
+                ..theme.muted
+            },
             // 选区底色：accent 的低透明度，跟随强调色随主题变化
             selection: Hsla {
                 a: 0.25,
@@ -142,6 +152,156 @@ impl Palette {
             },
         }
     }
+}
+
+/// 一行内可展开/可点击的链接组：`[文字](目标)`（偏移均**相对行首**）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineLink {
+    /// 整组源区间（`[` 起、`)` 止）。
+    range: Range<usize>,
+    /// 目标 URL 区间（已去除两侧空白；空目标不产生链接组）。
+    dest: Range<usize>,
+    /// 组内被投影隐藏、展开时需要还原为可见文本的片段（`[` / `](` / URL / `)`）。
+    markers: Vec<Range<usize>>,
+}
+
+/// 解析一行源文本里的完整链接组（输出偏移相对行首）。
+///
+/// 复用 `mazha_md::parse_inline`（保证与投影同源），只认闭合的 `[文字](目标)`：
+/// 三个 `LinkMarker` 依次是 `[`、`](`、`)`，中间夹一个 `LinkDest`。目标为空
+/// （`[x]()`）不产生组，避免光标经过时展开出空壳；图片（Widget）不在此列。
+fn inline_links(line_src: &str) -> Vec<InlineLink> {
+    let spans = parse_inline(line_src, 0..line_src.len());
+    let markers: Vec<&mazha_md::SyntaxSpan> = spans
+        .iter()
+        .filter(|s| s.role == SpanRole::LinkMarker)
+        .collect();
+    let mut links = Vec::new();
+    // 每个链接恰好 3 个 LinkMarker，按序成组
+    for chunk in markers.as_chunks::<3>().0 {
+        let (open, mid, close) = (chunk[0], chunk[1], chunk[2]);
+        // 结构校验：防御解析器行为变化，避免误把其它标记当链接
+        if line_src.get(open.range.clone()) != Some("[")
+            || line_src.get(mid.range.clone()) != Some("](")
+            || line_src.get(close.range.clone()) != Some(")")
+        {
+            continue;
+        }
+        let Some(dest_span) = spans.iter().find(|s| {
+            s.role == SpanRole::LinkDest
+                && s.range.start >= mid.range.end
+                && s.range.end <= close.range.start
+        }) else {
+            continue;
+        };
+        let dest = trim_ascii_range(line_src, dest_span.range.clone());
+        if dest.is_empty() {
+            continue;
+        }
+        let mut marks = vec![
+            open.range.clone(),
+            mid.range.clone(),
+            close.range.clone(),
+            dest_span.range.clone(),
+        ];
+        marks.sort_by_key(|r| r.start);
+        links.push(InlineLink {
+            range: open.range.start..close.range.end,
+            dest,
+            markers: marks,
+        });
+    }
+    links
+}
+
+/// 把区间两端的 ASCII 空白裁掉（链接目标常写成 `( https://x )`）。
+fn trim_ascii_range(s: &str, mut r: Range<usize>) -> Range<usize> {
+    let bytes = s.as_bytes();
+    while r.start < r.end && bytes[r.start].is_ascii_whitespace() {
+        r.start += 1;
+    }
+    while r.end > r.start && bytes[r.end - 1].is_ascii_whitespace() {
+        r.end -= 1;
+    }
+    r
+}
+
+/// 生成"链接原文展开"的行副本：把 `link` 的隐藏标记还原成可见文本。
+///
+/// 只改 `runs`（追加标记片段）与 `offset_map`（按新可见区间重建），`source_range`
+/// 与块样式不变。标记片段按源偏移与既有 run 归并，并重算 `display_start`。
+/// 重建的 `offset_map` 使用**行内相对偏移**（`from_visible_runs` 只需要行内文本做
+/// 边界校验），绝对映射由 [`BlockGeom::source_of_col`] 加回行起点。
+///
+/// 返回 `None` 表示该行不宜展开（见函数内两条守卫），调用方继续按投影渲染。
+fn reveal_link_line(
+    line: &ProjectedLine,
+    line_src: &str,
+    link: &InlineLink,
+) -> Option<ProjectedLine> {
+    let base = line.source_range.start;
+    // 守卫 1：标记必须确实被投影隐藏。代码块整行都是可见文本（不解析行内语法），
+    // 若照插会把 `[` / `](` / URL 重复显示一遍。
+    let markers_hidden = link.markers.iter().all(|m| {
+        let (a, b) = (base + m.start, base + m.end);
+        !line
+            .runs
+            .iter()
+            .any(|r| r.source_range.start < b && a < r.source_range.end)
+    });
+    // 守卫 2：没有可见片段（Front-matter 元数据行、公式块内容行）时，插入标记会
+    // 把整行变成几段孤立符号，不如不展开。
+    if !markers_hidden || line.runs.is_empty() {
+        return None;
+    }
+    let mut inserts: Vec<DocTextRun> = link
+        .markers
+        .iter()
+        .filter_map(|r| {
+            let text = line_src.get(r.clone())?;
+            (!text.is_empty()).then(|| DocTextRun {
+                source_range: (base + r.start)..(base + r.end),
+                display_start: 0,
+                style: RunStyle::Normal,
+                text: text.to_string(),
+            })
+        })
+        .collect();
+    inserts.sort_by_key(|r| r.source_range.start);
+
+    // 按源顺序归并：插入的标记片段与投影可见片段不会重叠（标记本就被隐藏）
+    let mut runs: Vec<DocTextRun> = Vec::with_capacity(line.runs.len() + inserts.len());
+    let mut chars = 0usize;
+    let mut ins = inserts.into_iter().peekable();
+    let push = |runs: &mut Vec<DocTextRun>, mut r: DocTextRun, chars: &mut usize| {
+        r.display_start = *chars;
+        *chars += r.text.chars().count();
+        runs.push(r);
+    };
+    for run in &line.runs {
+        while ins
+            .peek()
+            .is_some_and(|next| next.source_range.start < run.source_range.start)
+        {
+            let Some(next) = ins.next() else { break };
+            push(&mut runs, next, &mut chars);
+        }
+        push(&mut runs, run.clone(), &mut chars);
+    }
+    for next in ins {
+        push(&mut runs, next, &mut chars);
+    }
+
+    let visible: Vec<Range<usize>> = runs
+        .iter()
+        .map(|r| (r.source_range.start - base)..(r.source_range.end - base))
+        .collect();
+    let offset_map =
+        OffsetMap::from_visible_runs(line_src, &visible).unwrap_or_else(|_| OffsetMap::empty());
+    let mut out = line.clone();
+    out.runs = runs;
+    out.offset_map = offset_map;
+    Some(out)
 }
 
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
@@ -159,6 +319,12 @@ struct BlockGeom {
     prefix_bytes: usize,
     /// 左缩进（引用深度、列表缩进），行内 x 坐标需加上它才是块内绝对 x。
     indent: Pixels,
+    /// 本块是否处于"链接原文展开"态（光标在链接内）。
+    ///
+    /// 展开态的 `proj` 是 [`reveal_link_line`] 生成的副本：URL 与 `[`/`](`/`)`
+    /// 重新变为可见文本（同行其它标记仍隐藏）；`offset_map` 以**行首为基准**
+    /// （见 [`BlockGeom::source_of_col`] 的加回逻辑）。
+    revealed: bool,
     /// 光标在本块时的行内**显示列**（`None` = 光标不在本块；仅一块为 `Some`）。
     ///
     /// 由 `Projection::source_to_doc_pos` 于 prepaint 阶段算好，paint 直接据此画竖线。
@@ -206,10 +372,29 @@ impl BlockGeom {
         if self.proj.offset_map.display_len() == 0 {
             return self.proj.source_range.start;
         }
-        self.proj
-            .offset_map
-            .display_to_source(DisplayPos(col))
-            .clamp(self.proj.source_range.start, self.proj.source_range.end)
+        let raw = self.proj.offset_map.display_to_source(DisplayPos(col));
+        // 展开态的映射以行首为基准（行内文本做字符边界校验），补回行起点
+        let src = if self.revealed {
+            self.proj.source_range.start + raw
+        } else {
+            raw
+        };
+        src.clamp(self.proj.source_range.start, self.proj.source_range.end)
+    }
+
+    /// 源字节偏移 → 本块显示列（供光标定位、IME 候选框、上下移动取列）。
+    ///
+    /// 两种状态都经 `OffsetMap::source_to_display`：展开态以行首为基准，投影态用绝对
+    /// 偏移；落在隐藏标记内时吸附到标记起点（与光标规则一致）。
+    fn col_of_source(&self, src: usize) -> usize {
+        let src = src.clamp(self.proj.source_range.start, self.proj.source_range.end);
+        // 展开态的 OffsetMap 以行首为基准；投影态是整篇绝对偏移
+        let base = if self.revealed {
+            self.proj.source_range.start
+        } else {
+            0
+        };
+        self.proj.offset_map.source_to_display(src - base).get()
     }
 }
 
@@ -379,7 +564,8 @@ fn visual_vertical_target(
     let pos = projection.source_to_doc_pos(caret);
     let block = layout.blocks.get(pos.line)?;
     let line_px = layout.block_line_height(pos.line);
-    let byte = block.byte_of_col(pos.col);
+    // 用块几何取列：展开态（光标在链接内）显示文本更长，源列不能直接用投影列
+    let byte = block.byte_of_col(block.col_of_source(caret));
     let p = block.shaped.position_for_index(byte, line_px)?;
     // position_for_index 的 y = 视觉行号 × 行高（行顶），除以该块行高即得块内视觉行
     let cur_row = (p.y / line_px) as usize;
@@ -851,13 +1037,19 @@ impl DocView {
         let projection = self.doc.projection();
         for c in &mut self.cursors {
             let pos = projection.source_to_doc_pos(c.caret);
+            // 展开态（光标在链接内）显示列更长：取块几何换算后的列，保持视觉水平位置
+            let col = self
+                .layout
+                .as_ref()
+                .and_then(|l| l.blocks.get(pos.line))
+                .map_or(pos.col, |b| b.col_of_source(c.caret));
             let target_line = if step < 0 {
                 pos.line.checked_sub(1)
             } else {
                 (pos.line + 1 < projection.len()).then_some(pos.line + 1)
             };
             let new_caret = match target_line {
-                Some(line) => projection.doc_pos_to_source(DocPos { line, col: pos.col }),
+                Some(line) => projection.doc_pos_to_source(DocPos { line, col }),
                 // 越界：上移落到文首，下移落到文末
                 None => {
                     if step < 0 {
@@ -1523,6 +1715,31 @@ impl DocView {
         // 显示字符列 → 源字节偏移（空行等无显示文本的行落到行首）
         let src = self.doc.snap_to_boundary(block.source_of_col(col));
         Some(src)
+    }
+
+    /// 命中窗口坐标处的**链接目标**（Cmd+点击用）；不在链接上返回 `None`。
+    ///
+    /// 先用布局命中到源偏移，再解析该行源码里的完整链接组（与展开原文同一套
+    /// [`inline_links`]），避免 UI 侧另写一份 Markdown 语法。展开态（光标在链接内）
+    /// 与投影态都成立：前者 `source_of_col` 走原文映射，后者会吸附到隐藏标记起点。
+    fn link_at(&self, position: Point<Pixels>) -> Option<String> {
+        let layout = self.layout.as_ref()?;
+        let (row, col) = layout.hit(position)?;
+        let block = &layout.blocks[row];
+        let range = block.proj.source_range.clone();
+        let src = block.source_of_col(col);
+        let line_src = self.doc.try_slice(range.clone()).ok()?;
+        let rel = src.saturating_sub(range.start).min(line_src.len());
+        let link = inline_links(&line_src)
+            .into_iter()
+            .find(|l| rel >= l.range.start && rel <= l.range.end)?;
+        // 目标两侧的 `<...>` 是 Markdown 的可选包裹，打开时要剥掉
+        let raw = line_src.get(link.dest.clone())?.trim();
+        let url = raw
+            .strip_prefix('<')
+            .and_then(|u| u.strip_suffix('>'))
+            .unwrap_or(raw);
+        (!url.is_empty()).then(|| url.to_string())
     }
 
     /// 导出当前文档为 PDF 并保存到文件。
@@ -2363,6 +2580,13 @@ impl Render for DocView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                            // Cmd+点击（Windows/Linux 为 Ctrl+点击）链接：交给系统默认应用打开，不移动光标
+                            if event.modifiers.secondary()
+                                && let Some(url) = view.link_at(event.position)
+                            {
+                                cx.open_url(&url);
+                                return;
+                            }
                             // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（命中失败则继续放光标）
                             view.toggle_task_at(event.position, cx);
                             if let Some(src) = view.hit_source(event.position) {
@@ -2605,9 +2829,10 @@ impl EntityInputHandler for DocView {
         let layout = self.layout.as_ref()?;
         let b0 = layout.blocks.get(p0.line)?;
         let line0 = layout.block_line_height(p0.line);
+        // 列一律经块几何换算（展开态显示文本更长，投影列会画偏）
         let pos0 = b0
             .shaped
-            .position_for_index(b0.byte_of_col(p0.col), line0)
+            .position_for_index(b0.byte_of_col(b0.col_of_source(start)), line0)
             .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
         let x0 = layout.origin.x + b0.indent + pos0.x;
         let y0 = layout.origin.y + layout.row_top(layout.row_starts[p0.line]) + pos0.y;
@@ -2616,7 +2841,7 @@ impl EntityInputHandler for DocView {
                 let line1 = layout.block_line_height(p1.line);
                 let pos1 = b1
                     .shaped
-                    .position_for_index(b1.byte_of_col(p1.col), line1)
+                    .position_for_index(b1.byte_of_col(b1.col_of_source(end)), line1)
                     .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
                 (
                     layout.origin.x + b1.indent + pos1.x,
@@ -3122,7 +3347,8 @@ fn to_gpui_run(
         }
         RunStyle::InlineCode => {
             font = mono_font.clone();
-            color = palette.accent;
+            // 正文前景色：主题 accent 在浅/深色底下对比度偏低（看起来"颜色太浅"）
+            color = palette.foreground;
             background = Some(palette.subtle);
         }
         // 行内公式体（D34 ④）：斜体 + 主题色，与普通文本区分
@@ -3458,8 +3684,22 @@ impl Element for DocElement {
             self.view.update(cx, |view, _| {
                 // 需先取所有光标的源偏移，随后 projection() 会可变借用 view.doc（借用不相交）
                 let caret_sources: Vec<usize> = view.cursors.iter().map(|c| c.caret).collect();
-                let projection = view.doc.projection();
                 let caret = view.cursors[view.primary].caret;
+                // 光标所在行源码：用于"光标在链接内时展开该链接的原文"（SPEC §11.2 的
+                // 链接局部版本）。先借投影取行号/行区间（借用立即结束），再切出行文本，
+                // 避免为一行复制整篇文档。
+                let (caret_line, caret_line_range) = {
+                    let projection = view.doc.projection();
+                    let line = projection.line_of_source(caret);
+                    (line, projection.lines[line].source_range.clone())
+                };
+                let caret_line_src = view.doc.slice(caret_line_range.clone()).into_owned();
+                // 光标落在 `[文字](目标)` 组内（含刚敲完 `)` 的组尾）才展开
+                let caret_link = inline_links(&caret_line_src).into_iter().find(|l| {
+                    caret >= caret_line_range.start + l.range.start
+                        && caret <= caret_line_range.start + l.range.end
+                });
+                let projection = view.doc.projection();
                 let caret_pos = projection.source_to_doc_pos(caret);
                 // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
                 let caret_lines: Vec<usize> = caret_sources
@@ -3576,6 +3816,31 @@ impl Element for DocElement {
                 // 先记几何，update 返回后再解析 `[ ]`/`[x]` 的源字节区间。
                 let mut task_cand: Vec<(Range<usize>, Pixels, Pixels, Pixels)> = Vec::new();
                 for (idx, line) in projection.lines.iter().enumerate() {
+                    // 光标在链接内：把该链接的标记与 URL 展开成可见原文；其它行仍按投影
+                    // 隐藏标记（光标移开链接后自动复原）。
+                    let revealed_line = if idx == caret_line {
+                        caret_link
+                            .as_ref()
+                            .and_then(|link| reveal_link_line(line, &caret_line_src, link))
+                    } else {
+                        None
+                    };
+                    let is_revealed = revealed_line.is_some();
+                    let line = revealed_line.as_ref().unwrap_or(line);
+                    // 展开态显示文本 = 整行源码（含标记），光标列按行内字节直接换算
+                    let caret_col = if is_revealed {
+                        // 展开态仍有其它隐藏标记（同行其它链接/强调），按展开后的
+                        // OffsetMap 换算，不能假设显示字节 == 源字节
+                        Some(
+                            line.offset_map
+                                .source_to_display(caret.saturating_sub(line.source_range.start))
+                                .get(),
+                        )
+                    } else if caret_pos.line == idx {
+                        Some(caret_pos.col)
+                    } else {
+                        None
+                    };
                     let (text, runs) = build_line_runs(
                         line,
                         &base_font,
@@ -3597,8 +3862,8 @@ impl Element for DocElement {
                     let rows = shaped.wrap_boundaries().len() + 1;
 
                     // 光标行（内容坐标）：position_for_index 的 y = 视觉行号 × 行高（行顶）
-                    if caret_pos.line == idx {
-                        let cbyte = prefix_bytes + line.display_byte_of_col(caret_pos.col);
+                    if let Some(col) = caret_col {
+                        let cbyte = prefix_bytes + line.display_byte_of_col(col);
                         if let Some(p) = shaped.position_for_index(cbyte, line_px) {
                             caret_row = Some((top_acc + p.y, line_px));
                         }
@@ -3651,7 +3916,17 @@ impl Element for DocElement {
                     // 行内图片占位：`![alt](url)` 整段被投影隐藏，画个小标签补上可见性
                     let mut image_chips = Vec::new();
                     for w in &line.widgets {
-                        let byte = prefix_bytes + line.display_byte_of_col(w.display_col);
+                        // 展开态显示文本与源逐字节对齐；投影态用投影给的显示列
+                        let byte = prefix_bytes
+                            + if is_revealed {
+                                let rel =
+                                    w.source_range.start.saturating_sub(line.source_range.start);
+                                line.display_byte_of_col(
+                                    line.offset_map.source_to_display(rel).get(),
+                                )
+                            } else {
+                                line.display_byte_of_col(w.display_col)
+                            };
                         let Some(p) = shaped.position_for_index(byte, line_px) else {
                             continue;
                         };
@@ -3684,14 +3959,39 @@ impl Element for DocElement {
                     row_acc += rows;
                     // 块内各行同高：内容 y 累计 = 行高 × 视觉行数
                     top_acc += line_px * rows as f32;
+                    // 选区显示列：展开态显示文本变长（URL/标记可见），按源区间在本行内重算
+                    let selection_cols = if is_revealed {
+                        let (start, end) = (line.source_range.start, line.source_range.end);
+                        let mut agg: Option<Range<usize>> = None;
+                        for sel in &selection {
+                            let s = sel.start.clamp(start, end);
+                            let e = sel.end.clamp(start, end);
+                            if s >= e {
+                                continue;
+                            }
+                            let cs = line.offset_map.source_to_display(s - start).get();
+                            let ce = line.offset_map.source_to_display(e - start).get();
+                            match &mut agg {
+                                Some(a) => {
+                                    a.start = a.start.min(cs);
+                                    a.end = a.end.max(ce);
+                                }
+                                None => agg = Some(cs..ce),
+                            }
+                        }
+                        agg
+                    } else {
+                        sel_by_line[idx].clone()
+                    };
                     v.push(BlockGeom {
                         proj: line.clone(),
                         shaped: Arc::new(shaped),
                         rows,
                         prefix_bytes,
                         indent,
-                        caret_col: (caret_pos.line == idx).then_some(caret_pos.col),
-                        selection: sel_by_line[idx].clone(),
+                        revealed: is_revealed,
+                        caret_col,
+                        selection: selection_cols,
                         line_height: line_px,
                         marker,
                         check,
@@ -3864,6 +4164,20 @@ impl Element for DocElement {
             let line_px = block.line_height;
             let line_x = layout.origin.x + block.indent;
 
+            // 引用块：整行铺一层浅底（先画底，再画选区/文字）。逐逻辑行绘制，
+            // 相邻引用行自然连成整块；左右各留 4px 内边距避免贴边。
+            if block.proj.block.quote_depth > 0 {
+                let left = layout.origin.x + px(4.);
+                let right = element_bounds.origin.x + element_bounds.size.width - px(4.);
+                if right > left {
+                    let band = bounds(
+                        point(left, row_top),
+                        size(right - left, line_px * block.rows as f32),
+                    );
+                    window.paint_quad(fill(band, palette.quote_bg));
+                }
+            }
+
             // 选区高亮：`selection` 是本块的显示列区间；按视觉行拆成多段矩形
             if let Some(cols) = &block.selection {
                 let b0 = block.byte_of_col(cols.start);
@@ -4013,4 +4327,93 @@ fn main() {
         })
         .expect("打开窗口失败");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
+    use super::{DisplayPos, Document, inline_links, reveal_link_line};
+
+    /// 完整链接应被识别为一组：区间覆盖 `[`..`)`，目标去掉两侧空白。
+    #[test]
+    fn inline_links_groups_full_link() {
+        let src = "前 [文档]( https://a.com ) 后";
+        let links = inline_links(src);
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        assert_eq!(&src[link.range.clone()], "[文档]( https://a.com )");
+        assert_eq!(&src[link.dest.clone()], "https://a.com");
+        // 4 段标记：`[`、`](`、URL、`)`
+        assert_eq!(link.markers.len(), 4);
+    }
+
+    /// 未闭合 / 空目标不算链接（避免光标经过时展开出空壳）。
+    #[test]
+    fn inline_links_rejects_incomplete_and_empty() {
+        assert!(inline_links("[文档](https://a.com").is_empty());
+        assert!(inline_links("[x]()").is_empty());
+        assert!(inline_links("[x](   )").is_empty());
+    }
+
+    /// 同一行多个链接互不干扰，目标偏移各自正确。
+    #[test]
+    fn inline_links_multiple() {
+        let src = "[一](a) [二](b)";
+        let links = inline_links(src);
+        assert_eq!(links.len(), 2);
+        assert_eq!(&src[links[0].dest.clone()], "a");
+        assert_eq!(&src[links[1].dest.clone()], "b");
+    }
+
+    /// 展开只还原当前链接的标记；同行强调标记仍隐藏，且偏移映射按展开后的显示文本成立。
+    #[test]
+    fn reveal_restores_only_active_link() {
+        let text = "**粗** [文档](https://a.com) 尾巴";
+        let mut doc = Document::new(text);
+        let line = {
+            let projection = doc.projection();
+            assert_eq!(projection.lines.len(), 1);
+            projection.lines[0].clone()
+        };
+        let line_src = doc.slice(line.source_range.clone()).into_owned();
+        let link = inline_links(&line_src).pop().expect("应识别到链接");
+        let revealed = reveal_link_line(&line, &line_src, &link).expect("段落链接应可展开");
+
+        // 投影态：强调/链接标记与 URL 都隐藏
+        assert_eq!(line.display_text(), "粗 文档 尾巴");
+        // 展开态：链接恢复为原文，强调标记仍隐藏
+        assert_eq!(revealed.display_text(), "粗 [文档](https://a.com) 尾巴");
+
+        // URL 逐字符与源偏移对齐（展开后 1 显示字符 = 1 源字节）
+        for rel in link.dest.clone() {
+            if !line_src.is_char_boundary(rel) {
+                continue;
+            }
+            let col = revealed.offset_map.source_to_display(rel).get();
+            assert_eq!(
+                revealed.offset_map.display_to_source(DisplayPos(col)),
+                rel,
+                "源偏移 {rel} 的展开显示列 {col} 应可逆"
+            );
+        }
+    }
+
+    /// 代码块行整行是可见文本：不能再插入标记（否则 `[`/`](`/URL 会重复显示）。
+    #[test]
+    fn reveal_skips_code_block_line() {
+        let text = "```\n[a](b)\n```\n";
+        let mut doc = Document::new(text);
+        let line = {
+            let projection = doc.projection();
+            projection.lines[1].clone()
+        };
+        let line_src = doc.slice(line.source_range.clone()).into_owned();
+        let link = inline_links(&line_src)
+            .pop()
+            .expect("代码文本里也能识别出链接组");
+        assert!(
+            reveal_link_line(&line, &line_src, &link).is_none(),
+            "代码块行不应展开"
+        );
+    }
 }

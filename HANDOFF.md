@@ -6,7 +6,7 @@
 - 最近更新：2026-10-21
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.55**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.56**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -39,7 +39,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现（要点） | 待办 |
 |------|------|----------------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + WYSIWYG 标记显隐（光标行显原文）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，侧栏标题列表+点击跳转，Cmd+Shift+O）** | 文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **链接局部展开**（光标在 `[文字](目标)` 内时该链接显示原文，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，侧栏标题列表+点击跳转，Cmd+Shift+O）** | 文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6 / 8 / 7 |
 
 > 桌面端入口：`cargo run -- [path/to/file.md]`。本环境无法可视化验证渲染效果，逻辑改动靠核心单测 + 编译门禁保证。
@@ -92,10 +92,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 3. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 4. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 89 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 91 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：fix(desktop): 滚动/命中/IME 修复（0.1.55，Phase 4）>
+<本次提交：feat(desktop): 链接局部展开/Cmd+点击 + 配色（0.1.56，Phase 4）>
+2624097 fix(desktop): 滚动/命中/IME 修复（0.1.55，Phase 4）
 5ddbf5f fix(desktop): 原生对话框改用异步 AsyncFileDialog（D41 修正，Phase 4）
 c46e7b3 fix(desktop): 布局/光标/原生对话框 panic（D41，Phase 4）
 f605595 docs: 归总 HANDOFF + SPEC D40（全工作区搜索列低优先规划）

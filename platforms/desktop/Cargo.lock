@@ -4380,6 +4380,7 @@ dependencies = [
  "gpui-kit",
  "mazha-core",
  "mazha-export",
+ "mazha-md",
  "mazha-store",
  "rfd",
 ]
