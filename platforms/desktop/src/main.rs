@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui_kit::base::h_flex;
-use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -168,6 +168,21 @@ struct BlockGeom {
     /// 由 `Projection::selection_display_ranges` 于 prepaint 阶段算好，paint 直接按
     /// 视觉行换算屏幕 x（经 `display_byte_of_col`）。
     selection: Option<Range<usize>>,
+    /// 本块**每个视觉行**的高度：正文 = [`LINE_HEIGHT`]，标题/代码按字号放大。
+    ///
+    /// 标题字号大于正文，若沿用统一行高会与相邻行重叠，故逐块记录；
+    /// 命中测试、选区、光标、绘制都以它为准（块内各行同高）。
+    line_height: Pixels,
+    /// 列表符号（`•` / `N.`；已在 prepaint shape 好，任务项为 `None`——改画复选框）。
+    ///
+    /// 绘制在 [`BlockGeom::indent`] 左侧预留的标记区内（见 [`block_indent`]）。
+    marker: Option<Box<ShapedLine>>,
+    /// 任务项的勾（`✓`，已完成时画在复选框内；未完成为 `None`）。
+    check: Option<Box<ShapedLine>>,
+    /// 行内图片占位小标签：`(窗口坐标 (x, y), 已 shape 文本)`。
+    ///
+    /// `![alt](url)` 整段被投影隐藏，若不画占位屏幕上就是空白，故补一个可见标签。
+    image_chips: Vec<(Point<Pixels>, Box<ShapedLine>)>,
 }
 
 impl BlockGeom {
@@ -181,9 +196,24 @@ impl BlockGeom {
         self.proj
             .display_col_of_byte(byte.saturating_sub(self.prefix_bytes))
     }
+
+    /// 显示列 → 源字节偏移（钳在本块 `source_range` 内）。
+    ///
+    /// 空行、以及只含被隐藏语法的行（图片行、围栏行、分割线等）的 `OffsetMap` 没有任何
+    /// 可落点，`display_to_source` 会退回 0（文档开头），导致点击或上下移动误跳文首；
+    /// 这里显式落到本行起点。非空行也把结果钳进本行范围，避免跨行串位。
+    fn source_of_col(&self, col: usize) -> usize {
+        if self.proj.offset_map.display_len() == 0 {
+            return self.proj.source_range.start;
+        }
+        self.proj
+            .offset_map
+            .display_to_source(DisplayPos(col))
+            .clamp(self.proj.source_range.start, self.proj.source_range.end)
+    }
 }
 
-/// 整篇文档的布局几何：块序列 + 光标原点 + 统一行高 + 视觉行累积。
+/// 整篇文档的布局几何：块序列 + 光标原点 + 视觉行顶边表 + 视觉行累积。
 ///
 /// 在 [`DocElement::prepaint`] 中构建，经 `cx.defer` 回存到 [`DocView`]，
 /// 供鼠标命中测试在事件回调里读取。
@@ -193,14 +223,106 @@ struct DocLayout {
     blocks: Vec<BlockGeom>,
     /// 块级 widget 的装饰（代码块/表格/分割线；SPEC §11.5、D30）。
     widgets: Vec<WidgetDecor>,
-    /// 内容左上角（窗口坐标）。
+    /// 内容左上角（窗口坐标，已含滚动偏移）。
     origin: Point<Pixels>,
-    /// 统一行高。
+    /// 基准行高（正文字号对应的行高；逐块实际行高见 [`BlockGeom::line_height`]）。
     line_height: Pixels,
     /// 每个块**首视觉行**的全局行号；末位为总视觉行数（长度 = `blocks.len() + 1`）。
     ///
     /// 软换行下逻辑行 ≠ 视觉行：命中测试/绘制都以它把"全局视觉行"映射回块。
     row_starts: Vec<usize>,
+    /// 每个全局**视觉行**的顶边（内容坐标 y；长度 = 总视觉行数 + 1，末位 = 内容总高）。
+    ///
+    /// 标题按字号放大后行高不一，不能用"行号 × 统一行高"换算 y，故用累计顶边表
+    /// 二分定位（见 [`DocLayout::row_at`]）。
+    row_tops: Vec<Pixels>,
+    /// 光标所在视觉行的 `(顶边, 行高)`（内容坐标）；`None` = 布局时尚无光标。
+    ///
+    /// 供编辑区滚动跟随（见 [`DocView::caret_scroll_key`]）。
+    caret_row: Option<(Pixels, Pixels)>,
+    /// 任务复选框：`(窗口坐标矩形, `[ ]`/`[x]` 的源字节区间)`；点击可切换完成状态。
+    task_boxes: Vec<(Bounds<Pixels>, Range<usize>)>,
+    /// 滚动视口（滚动容器的窗口坐标 bounds；prepaint 从 `ScrollHandle` 读取）。
+    ///
+    /// 内容随滚动上移后仅凭 `origin` 无法区分"标签栏/信息条"与"已滚出视口的内容"，
+    /// 命中测试用它把点击先限定在编辑区视口内。
+    viewport: Bounds<Pixels>,
+}
+
+impl DocLayout {
+    /// 内容总高度（末行顶边 + 底部留白）；`DocElement` 据此上报可滚动高度。
+    fn total_height(&self) -> Pixels {
+        self.row_tops.last().copied().unwrap_or(Pixels::ZERO) + BASE
+    }
+
+    /// 把**内容坐标** y 映射到全局视觉行（越界钳到首/末行）。
+    fn row_at(&self, y: Pixels) -> Option<usize> {
+        let total = *self.row_starts.last()?;
+        if total == 0 {
+            return None;
+        }
+        // row_tops 升序且末位是内容高度（不含留白）：取最后一个 <= y 的下标再钳到 [0, total-1]
+        let idx = self.row_tops.partition_point(|&t| t <= y);
+        Some(idx.saturating_sub(1).min(total - 1))
+    }
+
+    /// 某全局视觉行的顶边（内容坐标）。
+    fn row_top(&self, row: usize) -> Pixels {
+        self.row_tops.get(row).copied().unwrap_or(Pixels::ZERO)
+    }
+
+    /// 某全局视觉行的行高（顶边表相邻差；越界退化为基准行高）。
+    fn row_height(&self, row: usize) -> Pixels {
+        match (self.row_tops.get(row), self.row_tops.get(row + 1)) {
+            (Some(&a), Some(&b)) => b - a,
+            _ => self.line_height,
+        }
+    }
+
+    /// 块首视觉行的行高（块内各行同高；越界退化为基准行高）。
+    fn block_line_height(&self, block_idx: usize) -> Pixels {
+        self.row_starts
+            .get(block_idx)
+            .map_or(self.line_height, |&r| self.row_height(r))
+    }
+
+    /// 从窗口坐标命中一个**显示位置**（块序号 + 行内显示字符列）。
+    ///
+    /// 软换行下先由 `row_tops`/`row_starts` 把窗口 y 二分定位到块与块内视觉行，
+    /// 再取块内相对坐标交给 [`WrappedLine::closest_index_for_position`] 求字节偏移，
+    /// 最后换算成显示列。
+    fn hit(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        // 先限定在编辑区视口内：标签栏/信息条与已滚出视口的内容都不放光标
+        if position.x < self.viewport.left()
+            || position.x > self.viewport.right()
+            || position.y < self.viewport.top()
+            || position.y > self.viewport.bottom()
+        {
+            return None;
+        }
+        let rel_y = position.y - self.origin.y;
+        // 落在内容末尾以下也不放光标（行映射会钳到末行，但那会误改光标位置）
+        if rel_y < Pixels::ZERO || rel_y >= self.total_height() {
+            return None;
+        }
+        let row = self.row_at(rel_y)?;
+        // row_starts[i] <= row < row_starts[i+1] → 块 i（首元素为 0，故减一后非负）
+        let block_idx = self.row_starts.partition_point(|&s| s <= row) - 1;
+        let block = &self.blocks[block_idx];
+        let line_px = self.block_line_height(block_idx);
+        // 块内相对 y（含所在视觉行的偏移；行内 x 需再减块缩进）
+        let block_top = self.row_top(self.row_starts[block_idx]);
+        let rel_x = position.x - self.origin.x - block.indent;
+        let local_y = rel_y - block_top;
+        let byte = block
+            .shaped
+            .closest_index_for_position(point(rel_x, local_y), line_px)
+            .unwrap_or_else(|ix| ix);
+        Some((block_idx, block.col_of_byte(byte)))
+    }
 }
 
 /// 块级 widget 的绘制装饰（由核心 [`mazha_core::Projection::block_widgets`] 投影而来）。
@@ -238,37 +360,6 @@ enum WidgetDecorKind {
     },
 }
 
-impl DocLayout {
-    /// 从窗口坐标命中一个**显示位置**（块序号 + 行内显示字符列）。
-    ///
-    /// 软换行下先由 `row_starts` 把全局视觉行二分定位到块，再取块内视觉行的相对坐标
-    /// 交给 [`WrappedLine::closest_index_for_position`] 求字节偏移，最后换算成显示列。
-    fn hit(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
-        if self.blocks.is_empty() {
-            return None;
-        }
-        let total = *self.row_starts.last()?;
-        if total == 0 {
-            return None;
-        }
-        let rel_y = position.y - self.origin.y;
-        let row = (rel_y / self.line_height).floor().max(0.) as usize;
-        let row = row.min(total - 1);
-        // row_starts[i] <= row < row_starts[i+1] → 块 i（首元素为 0，故减一后非负）
-        let block_idx = self.row_starts.partition_point(|&s| s <= row) - 1;
-        let block = &self.blocks[block_idx];
-        let local_row = row - self.row_starts[block_idx];
-        // 行内 x 需减去该块缩进；y 只要落在该视觉行内即可（取行中点）
-        let rel_x = position.x - self.origin.x - block.indent;
-        let local_y = self.line_height * local_row as f32 + self.line_height / 2.;
-        let byte = block
-            .shaped
-            .closest_index_for_position(point(rel_x, local_y), self.line_height)
-            .unwrap_or_else(|ix| ix);
-        Some((block_idx, block.col_of_byte(byte)))
-    }
-}
-
 /// 在软换行布局下，把某处位置向上/向下移动一个**视觉行**，尽量保留水平像素位置。
 ///
 /// 返回新的源字节偏移；已是全文首/末个视觉行时返回 `None`（调用方保持原位）。
@@ -287,9 +378,11 @@ fn visual_vertical_target(
 ) -> Option<usize> {
     let pos = projection.source_to_doc_pos(caret);
     let block = layout.blocks.get(pos.line)?;
+    let line_px = layout.block_line_height(pos.line);
     let byte = block.byte_of_col(pos.col);
-    let p = block.shaped.position_for_index(byte, layout.line_height)?;
-    let cur_row = (p.y / layout.line_height) as usize;
+    let p = block.shaped.position_for_index(byte, line_px)?;
+    // position_for_index 的 y = 视觉行号 × 行高（行顶），除以该块行高即得块内视觉行
+    let cur_row = (p.y / line_px) as usize;
     let abs_x = block.indent + p.x;
     let global = *layout.row_starts.get(pos.line)? + cur_row;
     let total = *layout.row_starts.last()?;
@@ -304,13 +397,15 @@ fn visual_vertical_target(
     let tblock = layout.blocks.get(block_idx)?;
     let local_row = target_global - *layout.row_starts.get(block_idx)?;
     let local_x = (abs_x - tblock.indent).max(Pixels::ZERO);
-    let local_y = layout.line_height * local_row as f32 + layout.line_height / 2.;
+    // 目标行行高可能与当前块不同（如正文→标题），取目标块行高算行中点
+    let tline_px = layout.block_line_height(block_idx);
+    let local_y = tline_px * local_row as f32 + tline_px / 2.;
     let tbyte = tblock
         .shaped
-        .closest_index_for_position(point(local_x, local_y), layout.line_height)
+        .closest_index_for_position(point(local_x, local_y), tline_px)
         .unwrap_or_else(|ix| ix);
     let tcol = tblock.col_of_byte(tbyte);
-    Some(tblock.proj.offset_map.display_to_source(DisplayPos(tcol)))
+    Some(tblock.source_of_col(tcol))
 }
 
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
@@ -485,6 +580,16 @@ struct DocView {
     selecting: bool,
     /// 最近一次渲染的布局几何（供鼠标命中测试读取）。
     layout: Option<DocLayout>,
+    /// 编辑区滚动句柄：由 `#editor` 滚动容器 `track_scroll` 绑定，
+    /// prepaint 的 clamp 会回填其视口 bounds / 滚动量（可见区、光标跟随用）。
+    scroll: gpui::ScrollHandle,
+    /// 上一帧算出的内容总高（`DocElement::request_layout` 上报的可滚动高度）。
+    ///
+    /// 行数/宽度变了才变，变化时 prepaint 补 `notify()` 一帧收敛。
+    content_height: Pixels,
+    /// 上次滚动跟随的光标行 `(顶边, 行高)`（内容坐标）；变化才再次介入滚动，
+    /// 避免把用户手动滚上去的视口又拽回来。
+    caret_scroll_key: Option<(Pixels, Pixels)>,
     /// 焦点句柄：键盘事件只在获得焦点后送达。
     focus: FocusHandle,
     /// 系统字体族（正文 run 的字体）。
@@ -571,6 +676,9 @@ impl DocView {
             primary: 0,
             selecting: false,
             layout: None,
+            scroll: gpui::ScrollHandle::default(),
+            content_height: Pixels::ZERO,
+            caret_scroll_key: None,
             focus: cx.focus_handle(),
             ui_font: theme.font_family.clone(),
             mono_font: theme.mono_font_family.clone(),
@@ -1024,22 +1132,6 @@ impl DocView {
         cx.notify();
     }
 
-    /// 所有光标处插入普通字符（IME 提交/直接按键）。有选区则先删除选区。
-    fn insert_char(&mut self, ch: char, cx: &mut Context<Self>) {
-        for c in &mut self.cursors {
-            let range = c.selection().unwrap_or(c.caret..c.caret);
-            let at = range.start;
-            let mut text = String::new();
-            text.push(ch);
-            if self.doc.apply(Edit::Replace { range, text }).is_ok() {
-                c.caret = self.doc.snap_to_boundary(at + ch.len_utf8());
-                c.anchor = None;
-                c.marked = None;
-            }
-        }
-        cx.notify();
-    }
-
     /// 复制：把所有光标选中的文本（按文档顺序、以换行拼接）写入系统剪贴板。
     ///
     /// 无任何选区时不做任何事（空选区不覆盖剪贴板，与多数编辑器一致）。
@@ -1310,6 +1402,25 @@ impl DocView {
         }
     }
 
+    /// 计算 IME 写入/替换的目标区间（源字节）。
+    ///
+    /// 优先级：调用方给的 UTF-16 区间 → 当前组合（marked）区间 → 选区/光标。
+    /// `setMarkedText:`/`insertText:` 在**更新或提交组合**时通常传 `NSNotFound`
+    /// （映射为 `None`），此时必须替换已有 marked 区间；若退回到光标处，组合的每一帧
+    /// 都会再插入一份（表现为拼音字母逐个上屏、文档里堆满 "y" "yp" "yps"）。
+    fn ime_target(&self, range: Option<Range<usize>>) -> Range<usize> {
+        if let Some(r) = range
+            && let Some((start, end)) = self.source_range_from_utf16(r)
+        {
+            return start..end;
+        }
+        if let Some(marked) = self.primary_cursor().marked.clone() {
+            return marked;
+        }
+        let caret = self.cursors[self.primary].caret;
+        self.primary_selection().unwrap_or(caret..caret)
+    }
+
     /// UTF-8 字节区间 → UTF-16 单元区间（IME 选区查询用）。
     ///
     /// 越界时钳到文档末尾；保证 `lo <= hi`。
@@ -1370,17 +1481,48 @@ impl DocView {
         Some((lo_byte, hi_byte))
     }
 
+    /// 点击任务复选框：命中则把源文本里的 `[ ]` ↔ `[x]`（`[X]` 归一为 `[ ]`），返回是否命中。
+    ///
+    /// 复选框矩形与其源字节区间来自 prepaint 记录的 [`DocLayout::task_boxes`]；
+    /// `[ ]`/`[x]` 等长替换，光标偏移无需调整，但按契约仍走 `apply_edit` 统一收敛。
+    fn toggle_task_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let target = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.task_boxes.iter().find(|(r, _)| r.contains(&position)))
+            .map(|(_, range)| range.clone());
+        let Some(range) = target else {
+            return false;
+        };
+        let Ok(cur) = self.doc.try_slice(range.clone()).map(|s| s.into_owned()) else {
+            return false;
+        };
+        let new = match cur.as_str() {
+            "[ ]" => "[x]",
+            "[x]" | "[X]" => "[ ]",
+            // 防御：几何与源文本对不上（布局刚失效）时不动文档
+            _ => return false,
+        };
+        let caret = self.cursors[self.primary].caret;
+        self.apply_edit(
+            Edit::Replace {
+                range,
+                text: new.to_string(),
+            },
+            caret,
+            cx,
+        );
+        true
+    }
+
     /// 从窗口坐标命中一个**源字节偏移**（整篇命中：先算显示索引，再经 OffsetMap 映射）。
     fn hit_source(&self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout.as_ref()?;
         let (row, col) = layout.hit(position)?;
         let block = &layout.blocks[row];
-        // 显示字符列 → 源字节偏移
-        let source_offset = block.proj.offset_map.display_to_source(DisplayPos(col));
-        Some(
-            self.doc
-                .snap_to_boundary(source_offset.min(block.proj.source_range.end)),
-        )
+        // 显示字符列 → 源字节偏移（空行等无显示文本的行落到行首）
+        let src = self.doc.snap_to_boundary(block.source_of_col(col));
+        Some(src)
     }
 
     /// 导出当前文档为 PDF 并保存到文件。
@@ -1544,6 +1686,7 @@ impl DocView {
         self.primary = t.primary;
         self.selecting = t.selecting;
         self.layout = None;
+        self.caret_scroll_key = None;
         self.highlighter = None;
         self.find = FindState::default();
         self.saved_text = t.saved_text.clone();
@@ -1574,6 +1717,7 @@ impl DocView {
         self.primary = self.tabs[0].primary;
         self.selecting = self.tabs[0].selecting;
         self.layout = None;
+        self.caret_scroll_key = None;
         self.highlighter = None;
         self.find = FindState::default();
         self.saved_text = self.tabs[0].saved_text.clone();
@@ -1623,6 +1767,7 @@ impl DocView {
             {
                 self.active = i;
                 self.layout = None;
+                self.caret_scroll_key = None;
                 self.highlighter = None;
                 cx.notify();
                 return;
@@ -1637,6 +1782,7 @@ impl DocView {
             self.primary = 0;
             self.selecting = false;
             self.layout = None;
+            self.caret_scroll_key = None;
             self.highlighter = None;
             self.find = FindState::default();
             self.saved_text = Some(text.clone());
@@ -1739,6 +1885,7 @@ impl DocView {
                 self.path = None;
                 self.saved_text = None;
                 self.layout = None;
+                self.caret_scroll_key = None;
                 self.highlighter = None;
             }
             self.refresh_workspace(cx);
@@ -1815,6 +1962,7 @@ impl DocView {
             self.workspace = Some(Workspace::new(p));
         }
         self.layout = None;
+        self.caret_scroll_key = None;
         cx.notify();
     }
 
@@ -1873,7 +2021,9 @@ impl DocView {
 }
 
 impl Render for DocView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 编辑区滚动：`ScrollHandle` 在 `DocElement::prepaint`（与 `Scrollable` 同一
+        // 元素栈上下文）取回并回存到 `self.scroll`，供光标 scroll-into-view 使用
         let palette = self.palette;
         let _header = self.header_text();
         let caret_count = self.cursors.len();
@@ -2203,17 +2353,18 @@ impl Render for DocView {
                     .flex_col()
                     .flex_1()
                     .min_w(px(0.))
-                    .overflow_y_scrollbar()
                     .child(tabbar_el)
                     .key_context("mazha-doc")
                     .track_focus(&focus)
                     .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                         handle_key(view, event, window, cx);
                     }))
-                    // 左键按下：放置光标
+                    // 左键按下：先试任务复选框切换，再放置光标
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                            // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（命中失败则继续放光标）
+                            view.toggle_task_at(event.position, cx);
                             if let Some(src) = view.hit_source(event.position) {
                                 if event.modifiers.alt {
                                     // Alt+Click: 添加/移除光标
@@ -2285,20 +2436,49 @@ impl Render for DocView {
                     // 查找/替换条（`Cmd+F` 展开时才渲染）
                     .children(find_bar)
                     .children(palette_overlay)
-                    .child(DocElement { view: cx.entity() }),
+                    // 正文滚动区：滚动**只包正文**——标签栏/信息条不随之卷走。
+                    // 自己 `track_scroll` 绑定 `self.scroll`：可见区/滚动量回填到该句柄，
+                    // 供命中测试与光标滚动跟随使用；DocElement 上报绝对像素高度，
+                    // 内容超视口才有滚动量（D65）。
+                    .child(
+                        // 外层只负责定位：滚动条叠加在视口上（不随内容位移），
+                        // 内层才是滚动容器（内容随 `self.scroll` 滚动）。
+                        div()
+                            .id("editor")
+                            .relative()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(
+                                div()
+                                    .id("editor-scroll")
+                                    .absolute()
+                                    .inset_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .child(DocElement { view: cx.entity() }),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::vertical(&self.scroll)
+                                        .id("editor-scrollbar")
+                                        .viewport_from_layout(),
+                                ),
+                            ),
+                    ),
             )
     }
 }
 
 /// IME / 文本输入契约：把 macOS/系统 IME 的组合、提交、选区查询桥接到源文本模型。
 ///
-/// 偏移约定：GPUI 传入的 `Range<usize>` 是 **UTF-8 字节偏移**（相对整篇文档），
-/// 与本视图 `caret`/`anchor`/`Document::apply` 的表示一致，无需转换。
-/// 选区查询（`selected_text_range`/`text_for_range`）需转成 UTF-16 供 AppKit。
+/// 偏移约定：`EntityInputHandler` 的区间参数/返回值一律是 **UTF-16 码元下标**
+/// （AppKit `NSRange` 语义），而本视图的 `caret`/`anchor`/`Document::apply` 用源文本
+/// **UTF-8 字节偏移**。因此每个方法都必须显式换算；漏换算会在含中文的文档里错位，
+/// 并可能让输入法无法建立组合（表现为输入法把字母直接上屏）。
 impl EntityInputHandler for DocView {
-    /// 查询 `range`（UTF-8 字节）对应的文本，供 IME 剪贴/转换使用。
+    /// 查询 `range`（UTF-16）对应的文本，供 IME 剪贴/转换使用。
     ///
-    /// `adjusted_range` 回填"实际取用"的区间（IME 据此调整 marked text）。
+    /// `adjusted_range` 回填"实际取用"的区间（UTF-16，IME 据此调整 marked text）。
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -2306,11 +2486,10 @@ impl EntityInputHandler for DocView {
         _: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let start = self.doc.snap_to_boundary(range.start);
-        let end = self.doc.snap_to_boundary(range.end);
-        let snapped = start.min(end)..start.max(end);
-        let text = self.doc.try_slice(snapped.clone()).ok()?.into_owned();
-        *adjusted_range = Some(snapped);
+        let (start, end) = self.source_range_from_utf16(range)?;
+        let text = self.doc.try_slice(start..end).ok()?.into_owned();
+        let (u_lo, u_hi) = self.utf16_range(start, end);
+        *adjusted_range = Some(u_lo..u_hi);
         Some(text)
     }
 
@@ -2340,9 +2519,14 @@ impl EntityInputHandler for DocView {
         })
     }
 
-    /// IME 组合文本（marked text）对应的源字节范围；`None` = 无组合。
+    /// IME 组合文本（marked text）对应的 **UTF-16** 区间；`None` = 无组合。
+    ///
+    /// 内部 `marked` 存的是源字节区间，返回给 AppKit 前必须换算成 UTF-16，
+    /// 否则 `setMarkedText:` 的替换区间会与文档错位，组合文本会不断被追加/错删。
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.primary_cursor().marked.clone()
+        let marked = self.primary_cursor().marked.clone()?;
+        let (lo, hi) = self.utf16_range(marked.start, marked.end);
+        Some(lo..hi)
     }
 
     /// IME 取消组合：删除 marked 区间文本，光标回到组合起点。
@@ -2354,7 +2538,7 @@ impl EntityInputHandler for DocView {
         }
     }
 
-    /// 用 `text` 替换 `range`（`None` = 当前选区）。IME 每次提交字符都走这里。
+    /// 用 `text` 替换 `range`（UTF-16；`None` = 当前选区）。IME 每次提交字符都走这里。
     fn replace_text_in_range(
         &mut self,
         range: Option<Range<usize>>,
@@ -2362,14 +2546,14 @@ impl EntityInputHandler for DocView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = range.unwrap_or_else(|| {
-            self.primary_selection()
-                .unwrap_or(self.cursors[self.primary].caret..self.cursors[self.primary].caret)
-        });
+        let target = self.ime_target(range.clone());
         self.replace_selection_with_inner(target, text, cx);
     }
 
     /// 替换并进入组合状态：写入 `new_text`，把该区间标记为 marked，并设定组合内选区。
+    /// 替换并进入组合状态：写入 `new_text`，把该区间标记为 marked，并设定组合内选区。
+    ///
+    /// `range`/`new_selected_range` 都是 UTF-16（后者相对 `new_text` 起点）。
     fn replace_and_mark_text_in_range(
         &mut self,
         range: Option<Range<usize>>,
@@ -2378,19 +2562,20 @@ impl EntityInputHandler for DocView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = range.unwrap_or_else(|| {
-            self.primary_selection()
-                .unwrap_or(self.cursors[self.primary].caret..self.cursors[self.primary].caret)
-        });
+        let target = self.ime_target(range.clone());
         let start = target.start;
         self.replace_selection_with_inner(target, new_text, cx);
         let marked_end = start + new_text.len();
         let c = self.primary_cursor_mut();
         c.marked = (marked_end > start).then_some(start..marked_end);
-        // 组合内选区：相对 marked 起点的 UTF-8 偏移，转成绝对源偏移
+        // 组合内选区：相对 marked 起点的 UTF-16 下标 → 相对字节 → 绝对源偏移
         if let Some(rel) = new_selected_range {
-            let abs_start = self.doc.snap_to_boundary(start + rel.start);
-            let abs_end = self.doc.snap_to_boundary(start + rel.end);
+            let abs_start = self
+                .doc
+                .snap_to_boundary(start + utf16_index_to_byte(new_text, rel.start));
+            let abs_end = self
+                .doc
+                .snap_to_boundary(start + utf16_index_to_byte(new_text, rel.end));
             let c = self.primary_cursor_mut();
             c.anchor = Some(abs_start);
             c.caret = abs_end;
@@ -2419,35 +2604,35 @@ impl EntityInputHandler for DocView {
         };
         let layout = self.layout.as_ref()?;
         let b0 = layout.blocks.get(p0.line)?;
+        let line0 = layout.block_line_height(p0.line);
         let pos0 = b0
             .shaped
-            .position_for_index(b0.byte_of_col(p0.col), layout.line_height)
+            .position_for_index(b0.byte_of_col(p0.col), line0)
             .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
         let x0 = layout.origin.x + b0.indent + pos0.x;
-        let y0 = layout.origin.y + layout.line_height * layout.row_starts[p0.line] as f32 + pos0.y;
+        let y0 = layout.origin.y + layout.row_top(layout.row_starts[p0.line]) + pos0.y;
         let (x1, y1) = match layout.blocks.get(p1.line) {
             Some(b1) => {
+                let line1 = layout.block_line_height(p1.line);
                 let pos1 = b1
                     .shaped
-                    .position_for_index(b1.byte_of_col(p1.col), layout.line_height)
+                    .position_for_index(b1.byte_of_col(p1.col), line1)
                     .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
                 (
                     layout.origin.x + b1.indent + pos1.x,
-                    layout.origin.y
-                        + layout.line_height * layout.row_starts[p1.line] as f32
-                        + pos1.y,
+                    layout.origin.y + layout.row_top(layout.row_starts[p1.line]) + pos1.y,
                 )
             }
             None => (x0, y0),
         };
         // 跨视觉行的候选框：取起止点包络（含起点所在视觉行的高度）
         let top = y0.min(y1);
-        let height = (y0.max(y1) + layout.line_height) - top;
+        let height = (y0.max(y1) + line0) - top;
         let width = if x1 > x0 { x1 - x0 } else { x0 - x1 };
         let width = if width < px(2.) { px(2.) } else { width };
         Some(bounds(
             point(x0.min(x1), top),
-            size(width, height.max(layout.line_height)),
+            size(width, height.max(line0)),
         ))
     }
 
@@ -2486,6 +2671,20 @@ impl EntityInputHandler for DocView {
         let text = self.doc.text();
         Some(text.encode_utf16().count())
     }
+}
+
+/// 字符串内的 UTF-16 下标 → UTF-8 字节偏移（越界钳到末尾）。
+///
+/// IME 的组合内选区以 UTF-16 表示且相对刚提交的 `new_text`，而文档模型用字节偏移。
+fn utf16_index_to_byte(text: &str, index: usize) -> usize {
+    let mut u16_seen = 0usize;
+    for (byte, ch) in text.char_indices() {
+        if u16_seen >= index {
+            return byte;
+        }
+        u16_seen += ch.len_utf16();
+    }
+    text.len()
 }
 
 /// 键盘事件 → 光标移动 / 编辑命令 / 撤销重做 / 全选。
@@ -2684,11 +2883,9 @@ fn handle_key(
         "tab" => {
             view.insert_tab(cx);
         }
-        // ASCII 直键兜底（IME 未接管时）：仅可打印单字符
-        key if key.chars().count() == 1 && !key.chars().next().unwrap().is_control() => {
-            let ch = key.chars().next().unwrap();
-            view.insert_char(ch, cx);
-        }
+        // 可打印字符不在这里插入：交给 IME（`replace_text_in_range`）。
+        // 若在这里直插，会抢在输入法组合之前把字母写进文档（中文输入法下表现为
+        // "字母直接上屏、无法组词"），且英文输入时也会与 IME 提交重复。
         _ => return,
     }
     cx.notify();
@@ -2873,7 +3070,7 @@ fn find_field(id: &'static str, value: &str, focused: bool, palette: &Palette) -
         .child(shown)
 }
 
-/// 把 core 的块样式映射为排版字号（标题放大、行内代码等距）。
+/// 把 core 的块样式映射为排版字号（标题放大、代码块等宽字号）。
 fn block_font_size(block: &BlockStyle, base: Pixels, mono: Pixels) -> Pixels {
     match block.heading {
         Some(1) => base * 1.75,
@@ -2882,11 +3079,19 @@ fn block_font_size(block: &BlockStyle, base: Pixels, mono: Pixels) -> Pixels {
         Some(4) => base * 1.1,
         Some(5) => base * 1.05,
         Some(6) => base * 1.0,
-        _ => {
-            let _ = mono; // 代码块行按等宽字号渲染（见 build_line_runs）
-            base
-        }
+        // 代码块整行等宽字号（行内代码仍是正文行高内的 run 样式，不放大）
+        _ if block.code_block => mono,
+        _ => base,
     }
+}
+
+/// 本块**每个视觉行**的行高：字号 × 1.5（标题 × 1.6 留出上下呼吸），且不小于 [`LINE_HEIGHT`]。
+///
+/// 标题字号大于正文，若仍用统一行高，字形会溢出行盒压到相邻行（见 `WrappedLine::paint`
+/// 的垂直居中：`padding_top = (line_height - ascent - descent) / 2`）。
+fn block_line_px(block: &BlockStyle, font_size: Pixels) -> Pixels {
+    let factor = if block.heading.is_some() { 1.6 } else { 1.5 };
+    (font_size * factor).max(LINE_HEIGHT)
 }
 
 /// 把一个 core [`TextRun`]（片段 + 样式）转成 gpui 的 [`gpui::TextRun`]（字形级样式）。
@@ -2896,8 +3101,6 @@ fn to_gpui_run(
     run: &DocTextRun,
     base_font: &Font,
     mono_font: &Font,
-    _mono_size: Pixels,
-    _base_size: Pixels,
     palette: &Palette,
 ) -> (String, gpui::TextRun) {
     // 默认按正文样式；代码块整体覆盖为等宽字体（字号统一在 shape_line 时按块应用）
@@ -2957,12 +3160,12 @@ fn to_gpui_run(
 ///
 /// 返回 `(完整可见文本, gpui_runs)`。引用前缀 `> ` 用 muted 色，其余用片段自身样式。
 /// `highlight` 为代码块行的语法高亮片段（相对该行显示文本；`None` = 不高亮）。
+///
+/// 块级样式（标题整块加粗、已完成任务删除线 + 弱化）在这里逐 run 施加。
 fn build_line_runs(
     line: &ProjectedLine,
     base_font: &Font,
     mono_font: &Font,
-    mono_size: Pixels,
-    base_size: Pixels,
     palette: &Palette,
     highlight: Option<&[ColoredRun]>,
 ) -> (SharedString, Vec<gpui::TextRun>) {
@@ -2982,8 +3185,6 @@ fn build_line_runs(
         });
         text.push_str(prefix);
     }
-
-    let size = block_font_size(&line.block, base_size, mono_size);
 
     // 代码块行 + 有语法高亮：按高亮区间切分可见文本，逐段着色（等宽 + 弱底色）。
     if line.block.code_block
@@ -3007,19 +3208,35 @@ fn build_line_runs(
             });
             text.push_str(seg);
         }
-        return (text.into(), runs);
+    } else {
+        // 其余情况（含未高亮的代码块）：按投影片段拼接
+        for run in &line.runs {
+            let mut gp = to_gpui_run(run, base_font, mono_font, palette);
+            if line.block.code_block {
+                // 代码块行：强制等宽字体 + 整行弱底色
+                gp.1.font = mono_font.clone();
+                gp.1.background_color = Some(palette.subtle);
+            }
+            text.push_str(&gp.0);
+            runs.push(gp.1);
+        }
     }
 
-    // 其余情况（含未高亮的代码块）：按投影片段拼接
-    for run in &line.runs {
-        let mut gp = to_gpui_run(run, base_font, mono_font, mono_size, size, palette);
-        if line.block.code_block {
-            // 代码块行：强制等宽字体 + 整行弱底色
-            gp.1.font = mono_font.clone();
-            gp.1.background_color = Some(palette.subtle);
+    // 标题整块加粗（gpui 字体权重按 run 施加；字号在 shape 时按块给定）
+    if line.block.heading.is_some() {
+        for r in &mut runs {
+            r.font = r.font.clone().bold();
         }
-        text.push_str(&gp.0);
-        runs.push(gp.1);
+    }
+    // 已完成任务：整行删除线 + 弱化色，一眼区分"做完的待办"
+    if line.block.task == Some(true) {
+        for r in &mut runs {
+            r.color = palette.muted;
+            r.strikethrough = Some(StrikethroughStyle {
+                thickness: px(1.),
+                color: Some(palette.muted),
+            });
+        }
     }
 
     // 分割线：不在此处画字符，改由 `paint` 依块级 widget 画一条真实细线（SPEC §11.5、D30）。
@@ -3097,6 +3314,17 @@ fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
         x += base;
     }
     x
+}
+
+/// 任务复选框矩形：放在 [`block_indent`] 为列表项预留的 `1.5*BASE` 标记区中央（12×12）。
+///
+/// `zone_right` = 标记区右缘（即块文本左缘 `indent + origin.x`）；`line_top`/`line_px` =
+/// 该行顶边与行高（窗口坐标），框随行垂直居中。prepaint（命中）与 paint 共用，避免两处漂移。
+fn task_box_rect(zone_right: Pixels, line_top: Pixels, line_px: Pixels) -> Bounds<Pixels> {
+    let zone = BASE * 1.5;
+    let box_x = zone_right - zone + (zone - px(12.)) / 2.;
+    let box_y = line_top + (line_px - px(12.)) / 2.;
+    bounds(point(box_x, box_y), size(px(12.), px(12.)))
 }
 
 /// 在装饰面板右上角画语言标签（代码块/图表共用）：距右边框 6px、距上边框 3px。
@@ -3186,10 +3414,14 @@ impl Element for DocElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // 高度 = 上一帧算出的内容总高（prepaint 末尾回填，变化时补一帧收敛）。
+        // 这里曾上报 `relative(1.)`：在自适应容器里解析为 0，滚动区 content_size 恒为 0、
+        // scroll_max ≤ 0，整篇文档就滚不动了（D65）。
+        let content_height = self.view.read(cx).content_height;
         let style = Style {
             size: Size {
                 width: Length::Definite(relative(1.)),
-                height: Length::Definite(relative(1.)),
+                height: Length::Definite(content_height.into()),
             },
             ..Style::default()
         };
@@ -3222,156 +3454,281 @@ impl Element for DocElement {
 
         // update 提供 &mut DocView（投影缓存需惰性建立），闭包返回几何数据避免借用越界
         let content_width_total = bounds.size.width;
-        let (blocks, widgets, row_starts) = self.view.update(cx, |view, _| {
-            // 需先取所有光标的源偏移，随后 projection() 会可变借用 view.doc（借用不相交）
-            let caret_sources: Vec<usize> = view.cursors.iter().map(|c| c.caret).collect();
-            let projection = view.doc.projection();
-            let caret = view.cursors[view.primary].caret;
-            let caret_pos = projection.source_to_doc_pos(caret);
-            // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
-            let caret_lines: Vec<usize> = caret_sources
-                .iter()
-                .map(|&s| projection.line_of_source(s))
-                .collect();
-            // 块级 widget 装饰：光标在其内=编辑态（不画装饰），否则=渲染态（画装饰）
-            let widgets: Vec<WidgetDecor> = projection
-                .block_widgets()
-                .iter()
-                .map(|w| {
-                    let editing = caret_lines.iter().any(|&l| w.line_range.contains(&l));
-                    let indent = projection
-                        .lines
-                        .get(w.line_range.start)
-                        .map_or(indent_base, |l| block_indent(l, indent_base));
-                    // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画（代码块/图表共用）
-                    let shape_label = |lang: &str| {
+        let (blocks, widgets, row_starts, row_tops, caret_row, task_cand) =
+            self.view.update(cx, |view, _| {
+                // 需先取所有光标的源偏移，随后 projection() 会可变借用 view.doc（借用不相交）
+                let caret_sources: Vec<usize> = view.cursors.iter().map(|c| c.caret).collect();
+                let projection = view.doc.projection();
+                let caret = view.cursors[view.primary].caret;
+                let caret_pos = projection.source_to_doc_pos(caret);
+                // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
+                let caret_lines: Vec<usize> = caret_sources
+                    .iter()
+                    .map(|&s| projection.line_of_source(s))
+                    .collect();
+                // 块级 widget 装饰：光标在其内=编辑态（不画装饰），否则=渲染态（画装饰）
+                let widgets: Vec<WidgetDecor> = projection
+                    .block_widgets()
+                    .iter()
+                    .map(|w| {
+                        let editing = caret_lines.iter().any(|&l| w.line_range.contains(&l));
+                        let indent = projection
+                            .lines
+                            .get(w.line_range.start)
+                            .map_or(indent_base, |l| block_indent(l, indent_base));
+                        // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画（代码块/图表共用）
+                        let shape_label = |lang: &str| {
+                            let run = gpui::TextRun {
+                                len: lang.len(),
+                                font: mono_font.clone(),
+                                color: palette.muted,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            Box::new(window.text_system().shape_line(
+                                lang.to_string().into(),
+                                mono_size,
+                                &[run],
+                                None,
+                            ))
+                        };
+                        let kind = match &w.kind {
+                            BlockWidgetKind::Code { lang, .. } => WidgetDecorKind::Code {
+                                label: lang.as_deref().map(shape_label),
+                            },
+                            // 图表块（mermaid 等）：同样画语言标签，便于用户知道该块的语言
+                            BlockWidgetKind::Chart { lang } => WidgetDecorKind::Chart {
+                                label: Some(shape_label(lang)),
+                            },
+                            BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
+                            BlockWidgetKind::Rule => WidgetDecorKind::Rule,
+                            BlockWidgetKind::Math => WidgetDecorKind::Math,
+                        };
+                        WidgetDecor {
+                            kind,
+                            line_range: w.line_range.clone(),
+                            indent,
+                            editing,
+                        }
+                    })
+                    .collect();
+                // 选区高亮：用核心的文档级映射把每个选区的源区间分解成"每行显示列区间"，
+                // 再按行归并（多光标可能同行重叠）。这样 paint 阶段无需再做源→显示换算。
+                let mut sel_by_line: Vec<Option<Range<usize>>> = vec![None; projection.lines.len()];
+                for sel in &selection {
+                    for ldr in
+                        projection.selection_display_ranges(Selection::new(sel.start, sel.end))
+                    {
+                        match &mut sel_by_line[ldr.line] {
+                            Some(existing) => {
+                                existing.start = existing.start.min(ldr.cols.start);
+                                existing.end = existing.end.max(ldr.cols.end);
+                            }
+                            none => *none = Some(ldr.cols),
+                        }
+                    }
+                }
+                // 代码块语法高亮：把连续代码行聚成一段，按语言一次性着色（SPEC §11.5、§12.2）。
+                // 浅色主题用浅色高亮主题，深色主题用深色主题。
+                let theme_name = if palette.background.l < 0.5 {
+                    "base16-ocean.dark"
+                } else {
+                    "InspiredGitHub"
+                };
+                let highlighter = view
+                    .highlighter
+                    .get_or_insert_with(|| Highlighter::with_theme(theme_name));
+                let mut code_hl: Vec<Option<Vec<ColoredRun>>> = vec![None; projection.lines.len()];
+                let mut ci = 0usize;
+                while ci < projection.lines.len() {
+                    if !projection.lines[ci].block.code_block {
+                        ci += 1;
+                        continue;
+                    }
+                    let start = ci;
+                    let lang = projection.lines[ci].block.code_lang.clone();
+                    let mut code = String::new();
+                    while ci < projection.lines.len() && projection.lines[ci].block.code_block {
+                        if ci > start {
+                            code.push('\n');
+                        }
+                        code.push_str(&projection.lines[ci].display_text());
+                        ci += 1;
+                    }
+                    let highlighted = highlighter.highlight(&code, lang.as_deref());
+                    for (k, spans) in highlighted.into_iter().enumerate() {
+                        if let Some(slot) = code_hl.get_mut(start + k) {
+                            *slot = Some(spans);
+                        }
+                    }
+                }
+                let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
+                let mut row_starts: Vec<usize> = Vec::with_capacity(projection.lines.len() + 1);
+                // 每个全局视觉行的顶边（内容坐标）：标题/代码行高放大后不能再用"行号 × 统一行高"
+                let mut row_tops: Vec<Pixels> = Vec::with_capacity(projection.lines.len() + 1);
+                let mut row_acc = 0usize;
+                // 内容坐标 y 累计（逐块行高可能不同）
+                let mut top_acc = Pixels::ZERO;
+                // 光标所在视觉行（内容坐标；供 paint 做滚动跟随，见 DocView::caret_scroll_key）
+                let mut caret_row: Option<(Pixels, Pixels)> = None;
+                // 任务复选框候选：`(源行区间, 缩进, 块顶, 行高)`；源文本在 projection 借用期读不了，
+                // 先记几何，update 返回后再解析 `[ ]`/`[x]` 的源字节区间。
+                let mut task_cand: Vec<(Range<usize>, Pixels, Pixels, Pixels)> = Vec::new();
+                for (idx, line) in projection.lines.iter().enumerate() {
+                    let (text, runs) = build_line_runs(
+                        line,
+                        &base_font,
+                        &mono_font,
+                        &palette,
+                        code_hl[idx].as_deref(),
+                    );
+                    // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
+                    let prefix_bytes = text.len().saturating_sub(line.display_text().len());
+                    // 逐块字号/行高：标题按级别放大，行高同步放大，避免字形压到相邻行
+                    let font_size = block_font_size(&line.block, base_size, mono_size);
+                    let line_px = block_line_px(&line.block, font_size);
+                    let indent = block_indent(line, indent_base);
+                    // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
+                    let wrap_width = (content_width_total - indent - BASE).max(px(48.));
+                    // 逐 run 字体（粗/斜/等宽族）由 build_line_runs 决定，**不再统一覆盖**：
+                    // 覆盖会把代码块的等宽族、标题的粗体都抹平，看起来就是"md 没渲染"。
+                    let shaped = shape_wrapped_line(window, text, font_size, &runs, wrap_width);
+                    let rows = shaped.wrap_boundaries().len() + 1;
+
+                    // 光标行（内容坐标）：position_for_index 的 y = 视觉行号 × 行高（行顶）
+                    if caret_pos.line == idx {
+                        let cbyte = prefix_bytes + line.display_byte_of_col(caret_pos.col);
+                        if let Some(p) = shaped.position_for_index(cbyte, line_px) {
+                            caret_row = Some((top_acc + p.y, line_px));
+                        }
+                    }
+                    // 列表符号：任务项改画复选框（见 paint），其余 shape 成文本右对齐进标记区
+                    let marker = if line.block.bullet.is_some() && line.block.task.is_none() {
+                        let sym = match line.block.bullet.as_ref() {
+                            Some(b) if b.ordered => format!("{}.", b.number),
+                            _ => "•".to_string(),
+                        };
                         let run = gpui::TextRun {
-                            len: lang.len(),
-                            font: mono_font.clone(),
+                            len: sym.len(),
+                            font: base_font.clone(),
                             color: palette.muted,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
                         };
-                        Box::new(window.text_system().shape_line(
-                            lang.to_string().into(),
-                            mono_size,
+                        Some(Box::new(window.text_system().shape_line(
+                            sym.into(),
+                            font_size,
                             &[run],
                             None,
-                        ))
+                        )))
+                    } else {
+                        None
                     };
-                    let kind = match &w.kind {
-                        BlockWidgetKind::Code { lang, .. } => WidgetDecorKind::Code {
-                            label: lang.as_deref().map(shape_label),
-                        },
-                        // 图表块（mermaid 等）：同样画语言标签，便于用户知道该块的语言
-                        BlockWidgetKind::Chart { lang } => WidgetDecorKind::Chart {
-                            label: Some(shape_label(lang)),
-                        },
-                        BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
-                        BlockWidgetKind::Rule => WidgetDecorKind::Rule,
-                        BlockWidgetKind::Math => WidgetDecorKind::Math,
+                    // 已完成任务的勾（空框由 paint 画矩形，勾单独 shape 居中放进框内）
+                    let check = if line.block.task == Some(true) {
+                        let run = gpui::TextRun {
+                            len: "✓".len(),
+                            font: base_font.clone(),
+                            color: palette.foreground,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        Some(Box::new(window.text_system().shape_line(
+                            "✓".into(),
+                            font_size,
+                            &[run],
+                            None,
+                        )))
+                    } else {
+                        None
                     };
-                    WidgetDecor {
-                        kind,
-                        line_range: w.line_range.clone(),
+                    if line.block.task.is_some() {
+                        task_cand.push((line.source_range.clone(), indent, top_acc, line_px));
+                    }
+                    // 行内图片占位：`![alt](url)` 整段被投影隐藏，画个小标签补上可见性
+                    let mut image_chips = Vec::new();
+                    for w in &line.widgets {
+                        let byte = prefix_bytes + line.display_byte_of_col(w.display_col);
+                        let Some(p) = shaped.position_for_index(byte, line_px) else {
+                            continue;
+                        };
+                        let chip_text = w.kind.placeholder();
+                        let run = gpui::TextRun {
+                            len: chip_text.len(),
+                            font: base_font.clone(),
+                            color: palette.muted,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let chip = window.text_system().shape_line(
+                            chip_text.into(),
+                            font_size,
+                            &[run],
+                            None,
+                        );
+                        image_chips.push((
+                            point(
+                                bounds.origin.x + indent + p.x,
+                                bounds.origin.y + top_acc + p.y,
+                            ),
+                            Box::new(chip),
+                        ));
+                    }
+
+                    row_starts.push(row_acc);
+                    row_tops.push(top_acc);
+                    row_acc += rows;
+                    // 块内各行同高：内容 y 累计 = 行高 × 视觉行数
+                    top_acc += line_px * rows as f32;
+                    v.push(BlockGeom {
+                        proj: line.clone(),
+                        shaped: Arc::new(shaped),
+                        rows,
+                        prefix_bytes,
                         indent,
-                        editing,
-                    }
-                })
-                .collect();
-            // 选区高亮：用核心的文档级映射把每个选区的源区间分解成"每行显示列区间"，
-            // 再按行归并（多光标可能同行重叠）。这样 paint 阶段无需再做源→显示换算。
-            let mut sel_by_line: Vec<Option<Range<usize>>> = vec![None; projection.lines.len()];
-            for sel in &selection {
-                for ldr in projection.selection_display_ranges(Selection::new(sel.start, sel.end)) {
-                    match &mut sel_by_line[ldr.line] {
-                        Some(existing) => {
-                            existing.start = existing.start.min(ldr.cols.start);
-                            existing.end = existing.end.max(ldr.cols.end);
-                        }
-                        none => *none = Some(ldr.cols),
-                    }
+                        caret_col: (caret_pos.line == idx).then_some(caret_pos.col),
+                        selection: sel_by_line[idx].clone(),
+                        line_height: line_px,
+                        marker,
+                        check,
+                        image_chips,
+                    });
                 }
-            }
-            // 代码块语法高亮：把连续代码行聚成一段，按语言一次性着色（SPEC §11.5、§12.2）。
-            // 浅色主题用浅色高亮主题，深色主题用深色主题。
-            let theme_name = if palette.background.l < 0.5 {
-                "base16-ocean.dark"
-            } else {
-                "InspiredGitHub"
-            };
-            let highlighter = view
-                .highlighter
-                .get_or_insert_with(|| Highlighter::with_theme(theme_name));
-            let mut code_hl: Vec<Option<Vec<ColoredRun>>> = vec![None; projection.lines.len()];
-            let mut ci = 0usize;
-            while ci < projection.lines.len() {
-                if !projection.lines[ci].block.code_block {
-                    ci += 1;
-                    continue;
-                }
-                let start = ci;
-                let lang = projection.lines[ci].block.code_lang.clone();
-                let mut code = String::new();
-                while ci < projection.lines.len() && projection.lines[ci].block.code_block {
-                    if ci > start {
-                        code.push('\n');
-                    }
-                    code.push_str(&projection.lines[ci].display_text());
-                    ci += 1;
-                }
-                let highlighted = highlighter.highlight(&code, lang.as_deref());
-                for (k, spans) in highlighted.into_iter().enumerate() {
-                    if let Some(slot) = code_hl.get_mut(start + k) {
-                        *slot = Some(spans);
-                    }
-                }
-            }
-            let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
-            let mut row_starts: Vec<usize> = Vec::with_capacity(projection.lines.len() + 1);
-            let mut row_acc = 0usize;
-            for (idx, line) in projection.lines.iter().enumerate() {
-                let (text, runs) = build_line_runs(
-                    line,
-                    &base_font,
-                    &mono_font,
-                    mono_size,
-                    base_size,
-                    &palette,
-                    code_hl[idx].as_deref(),
-                );
-                // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
-                let prefix_bytes = text.len().saturating_sub(line.display_text().len());
-                // 用统一字体排版，保证行高一致（粗斜体/等宽在 runs 内体现）
-                let line_font = base_font.clone();
-                let uniform_runs: Vec<gpui::TextRun> = runs
-                    .into_iter()
-                    .map(|mut r| {
-                        r.font = line_font.clone();
-                        r
-                    })
-                    .collect();
-                let indent = block_indent(line, indent_base);
-                // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
-                let wrap_width = (content_width_total - indent - BASE).max(px(48.));
-                let shaped = shape_wrapped_line(window, text, base_size, &uniform_runs, wrap_width);
-                let rows = shaped.wrap_boundaries().len() + 1;
                 row_starts.push(row_acc);
-                row_acc += rows;
-                v.push(BlockGeom {
-                    proj: line.clone(),
-                    shaped: Arc::new(shaped),
-                    rows,
-                    prefix_bytes,
-                    indent,
-                    caret_col: (caret_pos.line == idx).then_some(caret_pos.col),
-                    selection: sel_by_line[idx].clone(),
-                });
+                row_tops.push(top_acc);
+                (v, widgets, row_starts, row_tops, caret_row, task_cand)
+            });
+
+        // 滚动视口：滚动容器（`#editor` 的 `track_scroll`）是本元素的祖先，
+        // 其布局先于本元素完成，此刻 `ScrollHandle::bounds()` 即为滚动视口。
+        let viewport = self.view.read(cx).scroll.bounds();
+
+        // 任务复选框的源字节区间：`[ ]`/`[x]` 埋在源行（`- [ ] 文本`）里，
+        // 等 update 返回（projection 已释放）再读 doc，并算出窗口坐标矩形。
+        let mut task_boxes = Vec::new();
+        for (range, indent, top, line_px) in task_cand {
+            let Ok(src) = self.view.read(cx).doc.try_slice(range.clone()) else {
+                continue;
+            };
+            let Some(brel) = src.find('[') else {
+                continue;
+            };
+            let Some(erel) = src[brel..].find(']').map(|e| brel + e) else {
+                continue;
+            };
+            // 只认任务复选位（`[ ]`/`[x]`/`[X]`），避免把行内 `[链接]` 误当复选框
+            if !matches!(&src[brel + 1..erel], " " | "x" | "X") {
+                continue;
             }
-            row_starts.push(row_acc);
-            (v, widgets, row_starts)
-        });
+            task_boxes.push((
+                task_box_rect(bounds.origin.x + indent, bounds.origin.y + top, line_px),
+                range.start + brel..range.start + erel + 1,
+            ));
+        }
 
         DocLayout {
             blocks,
@@ -3379,6 +3736,10 @@ impl Element for DocElement {
             origin: bounds.origin,
             line_height: LINE_HEIGHT,
             row_starts,
+            row_tops,
+            caret_row,
+            task_boxes,
+            viewport,
         }
     }
 
@@ -3395,32 +3756,64 @@ impl Element for DocElement {
         let layout = prepaint.clone();
         let palette = self.view.read(cx).palette;
 
-        // 回存几何，供鼠标命中测试（`DocView::hit_source`）读取
+        // 回存几何供鼠标命中测试（`DocView::hit_source`），同时做两件事：
+        // ① 内容高度回填（request_layout 用它上报可滚动高度，变化时补一帧收敛）；
+        // ② 光标滚动跟随：仅当光标行几何变化时介入，避免与手动滚动手动打架。
         let layout_for_view = layout.clone();
+        let total_height = layout.total_height();
+        let caret_target = layout.caret_row;
         let view = self.view.clone();
         window.defer(cx, move |_, cx| {
-            view.update(cx, |v, _| {
+            view.update(cx, |v, cx| {
                 v.layout = Some(layout_for_view);
+                if v.content_height != total_height {
+                    v.content_height = total_height;
+                    cx.notify(); // 高度变了：重排滚动区（内容超视口才会有滚动量）
+                }
+                if let Some((top, row_h)) = caret_target
+                    && v.caret_scroll_key != Some((top, row_h))
+                {
+                    let sc = v.scroll.clone();
+                    let viewport_h = sc.bounds().size.height;
+                    if viewport_h > Pixels::ZERO {
+                        const MARGIN: Pixels = px(8.);
+                        let cur = sc.offset(); // y ∈ [-max_offset, 0]
+                        // 行完全落在上下留白内才不动；否则把它拉回留白内（最少滚动）
+                        let want = if top + cur.y > viewport_h - MARGIN - row_h {
+                            -(top + row_h + MARGIN - viewport_h)
+                        } else if top + cur.y < MARGIN {
+                            -(top - MARGIN)
+                        } else {
+                            cur.y
+                        };
+                        let want = want.clamp(-sc.max_offset().y, Pixels::ZERO);
+                        if want != cur.y {
+                            sc.set_offset(point(cur.x, want));
+                            // set_offset 只改句柄、不触发重绘；不 notify 的话画面仍停在
+                            // 旧偏移，表现为"方向键按了但视口不跟随"
+                            cx.notify();
+                        }
+                        v.caret_scroll_key = Some((top, row_h));
+                    }
+                }
             });
         });
 
         // 先画块级 widget 装饰（面板/网格/分割线），再画文本，保证文字在上层。
         // 渲染态画装饰；编辑态（光标已在块内）不画，露出可编辑内容（SPEC §11.5）。
-        // 装饰块的纵向范围按**视觉行**累计（`row_starts`），软换行下同样正确。
+        // 纵向范围按 `row_tops`（逐行顶边表）取，软换行/可变行高下都正确。
         if !layout.widgets.is_empty() {
             let content_right = element_bounds.origin.x + element_bounds.size.width - BASE;
             for w in &layout.widgets {
-                let top =
-                    layout.origin.y + LINE_HEIGHT * layout.row_starts[w.line_range.start] as f32;
-                let bottom =
-                    layout.origin.y + LINE_HEIGHT * layout.row_starts[w.line_range.end] as f32;
+                let top = layout.origin.y + layout.row_top(layout.row_starts[w.line_range.start]);
+                let bottom = layout.origin.y + layout.row_top(layout.row_starts[w.line_range.end]);
                 let left = layout.origin.x + w.indent;
                 let right = content_right.max(left + px(24.));
                 let rect = bounds(point(left, top), size(right - left, bottom - top));
                 match &w.kind {
                     // 分割线：在行垂直中线画一条细线（取代旧的 "─" 文本占位）
                     WidgetDecorKind::Rule => {
-                        let y = top + LINE_HEIGHT / 2.;
+                        let y = top + (bottom - top) / 2.;
                         window.paint_quad(fill(
                             bounds(point(left, y), size(right - left, px(1.))),
                             palette.border,
@@ -3451,7 +3844,7 @@ impl Element for DocElement {
                         window.paint_quad(fill(rect, palette.subtle));
                         paint_rect_border(window, rect, palette.border, px(1.));
                         for line in (w.line_range.start + 1)..w.line_range.end {
-                            let y = layout.origin.y + LINE_HEIGHT * layout.row_starts[line] as f32;
+                            let y = layout.origin.y + layout.row_top(layout.row_starts[line]);
                             window.paint_quad(fill(
                                 bounds(point(left, y), size(right - left, px(1.))),
                                 palette.border,
@@ -3463,10 +3856,12 @@ impl Element for DocElement {
             }
         }
 
-        // 逐块绘制：选区高亮底 → 文本 → 光标竖线（均按视觉行定位）
+        // 逐块绘制：选区高亮底 → 列表符号/复选框/图片占位 → 文本 → 光标竖线
         for (idx, block) in layout.blocks.iter().enumerate() {
             let first_row = layout.row_starts[idx];
-            let row_top = layout.origin.y + LINE_HEIGHT * first_row as f32;
+            // 块首视觉行顶边（窗口坐标）；块内各行同高 = block.line_height
+            let row_top = layout.origin.y + layout.row_top(first_row);
+            let line_px = block.line_height;
             let line_x = layout.origin.x + block.indent;
 
             // 选区高亮：`selection` 是本块的显示列区间；按视觉行拆成多段矩形
@@ -3488,27 +3883,65 @@ impl Element for DocElement {
                         } else {
                             block
                                 .shaped
-                                .position_for_index(s, layout.line_height)
+                                .position_for_index(s, line_px)
                                 .map_or(Pixels::ZERO, |p| p.x)
                         };
                         let x1 = block
                             .shaped
-                            .position_for_index(e, layout.line_height)
+                            .position_for_index(e, line_px)
                             .map_or(Pixels::ZERO, |p| p.x);
                         let width = if x1 > x0 { x1 - x0 } else { Pixels::ZERO };
-                        let y = row_top + layout.line_height * r as f32;
+                        let y = row_top + line_px * r as f32;
                         window.paint_quad(fill(
-                            bounds(point(line_x + x0, y), size(width, layout.line_height)),
+                            bounds(point(line_x + x0, y), size(width, line_px)),
                             palette.selection,
                         ));
                     }
                 }
             }
 
+            // 列表符号：右对齐到标记区右缘（`block_indent` 为列表预留的 1.5*BASE），纵向随行居中
+            if let Some(marker) = &block.marker {
+                let mx = line_x - px(4.) - marker.width();
+                let _ = marker.paint(
+                    point(mx, row_top),
+                    line_px,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            // 任务复选框：空框描边；已完成再把预 shape 的勾居中放进去
+            if block.proj.block.task.is_some() {
+                let box_rect = task_box_rect(line_x, row_top, line_px);
+                paint_rect_border(window, box_rect, palette.muted, px(1.));
+                if let Some(check) = &block.check {
+                    let check_x = box_rect.origin.x + (box_rect.size.width - check.width()) / 2.;
+                    let _ = check.paint(
+                        point(check_x, row_top),
+                        line_px,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            // 行内图片占位标签（弱底小方块）
+            for (chip_pos, chip) in &block.image_chips {
+                let rect = bounds(
+                    point(chip_pos.x - px(4.), chip_pos.y),
+                    size(chip.width() + px(8.), line_px),
+                );
+                window.paint_quad(fill(rect, palette.subtle));
+                let _ = chip.paint(*chip_pos, line_px, TextAlign::Left, None, window, cx);
+            }
+
             // 文本本体（`WrappedLine::paint` 内部按换行边界逐视觉行绘制）
             let _ = block.shaped.paint(
                 point(line_x, row_top),
-                layout.line_height,
+                line_px,
                 TextAlign::Left,
                 None,
                 window,
@@ -3519,11 +3952,12 @@ impl Element for DocElement {
             if let Some(col) = block.caret_col
                 && let Some(p) = block
                     .shaped
-                    .position_for_index(block.byte_of_col(col), layout.line_height)
+                    .position_for_index(block.byte_of_col(col), line_px)
             {
+                // p.y = 光标所在视觉行在块内的顶边偏移（软换行下不再画错行）
                 let caret_rect = bounds(
-                    point(line_x + p.x, row_top + px(2.)),
-                    size(px(2.), layout.line_height - px(4.)),
+                    point(line_x + p.x, row_top + p.y + px(2.)),
+                    size(px(2.), line_px - px(4.)),
                 );
                 // 光标用正文前景色（对比度最高），而非主题 accent（可能偏浅看不清）
                 window.paint_quad(fill(caret_rect, palette.foreground));
