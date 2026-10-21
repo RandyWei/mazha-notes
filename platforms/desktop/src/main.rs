@@ -140,10 +140,11 @@ impl Palette {
                 a: 0.25,
                 ..theme.muted
             },
-            // 引用块底色：比弱底色更淡，整行铺满时不至于抢占文字对比度
+            // 引用块底色：由**前景色**低透明度混合（主题 muted 在浅色下接近白色，
+            // 用它铺底几乎看不见；前景色在浅/深主题下都与背景有足够反差）
             quote_bg: Hsla {
-                a: 0.10,
-                ..theme.muted
+                a: 0.06,
+                ..theme.foreground
             },
             // 选区底色：accent 的低透明度，跟随强调色随主题变化
             selection: Hsla {
@@ -4166,15 +4167,18 @@ impl Element for DocElement {
 
             // 引用块：整行铺一层浅底（先画底，再画选区/文字）。逐逻辑行绘制，
             // 相邻引用行自然连成整块；左右各留 4px 内边距避免贴边。
+            // 左侧再压一条竖线：纯浅底在部分主题下对比度不足，竖线给出明确边界。
             if block.proj.block.quote_depth > 0 {
                 let left = layout.origin.x + px(4.);
                 let right = element_bounds.origin.x + element_bounds.size.width - px(4.);
                 if right > left {
-                    let band = bounds(
-                        point(left, row_top),
-                        size(right - left, line_px * block.rows as f32),
-                    );
+                    let height = line_px * block.rows as f32;
+                    let band = bounds(point(left, row_top), size(right - left, height));
                     window.paint_quad(fill(band, palette.quote_bg));
+                    window.paint_quad(fill(
+                        bounds(point(left, row_top), size(px(3.), height)),
+                        palette.border,
+                    ));
                 }
             }
 

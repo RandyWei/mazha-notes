@@ -6,7 +6,7 @@
 - 最近更新：2026-10-21
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.56**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.57**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -92,10 +92,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 3. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 4. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 91 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 92 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(desktop): 链接局部展开/Cmd+点击 + 配色（0.1.56，Phase 4）>
+<本次提交：fix(desktop): 引用块底色浅色主题不可见（0.1.57，Phase 4）>
+2b005dd feat(desktop): 链接局部展开/Cmd+点击 + 配色（0.1.56，Phase 4）
 2624097 fix(desktop): 滚动/命中/IME 修复（0.1.55，Phase 4）
 5ddbf5f fix(desktop): 原生对话框改用异步 AsyncFileDialog（D41 修正，Phase 4）
 c46e7b3 fix(desktop): 布局/光标/原生对话框 panic（D41，Phase 4）
