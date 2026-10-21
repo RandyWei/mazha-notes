@@ -4164,12 +4164,12 @@ impl Element for DocElement {
             let line_px = block.line_height;
             let line_x = layout.origin.x + block.indent;
 
-            // 引用块：整行铺一层浅底（先画底，再画选区/文字）。逐逻辑行绘制，
-            // 相邻引用行自然连成整块；左右各留 4px 内边距避免贴边，上下各加 2px 留白。
-            // 左侧再压一条竖线：纯浅底在部分主题下对比度不足，竖线给出明确边界。
+            // 引用块：只对**最外层**引用（depth==1）加上下内边距，嵌套引用不加
+            // 以免不同层级之间产生额外空隙或分隔线；左侧仍保留竖线和水平留白。
             if block.proj.block.quote_depth > 0 {
                 let pad_x = px(4.);
-                let pad_y = px(2.);
+                let is_outer = block.proj.block.quote_depth == 1;
+                let pad_y = if is_outer { px(2.) } else { px(0.) };
                 let left = layout.origin.x + pad_x;
                 let right = element_bounds.origin.x + element_bounds.size.width - pad_x;
                 if right > left {
@@ -4180,10 +4180,7 @@ impl Element for DocElement {
                     );
                     window.paint_quad(fill(band, palette.quote_bg));
                     window.paint_quad(fill(
-                        bounds(
-                            point(left, row_top - pad_y),
-                            size(px(3.), height + pad_y * 2.),
-                        ),
+                        bounds(point(left, row_top - pad_y), size(px(3.), height + pad_y * 2.)),
                         palette.border,
                     ));
                 }
