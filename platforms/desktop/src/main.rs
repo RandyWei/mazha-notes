@@ -4492,6 +4492,12 @@ impl Element for DocElement {
             let row_top = layout.origin.y + layout.row_top(first_row);
             let line_px = block.line_height;
             let line_x = layout.origin.x + block.indent;
+            // 代码块文本整体右移 12px 让出面板内边距；光标/选区必须跟文本同一起点，
+            // 否则光标会压在左侧字符上、行末光标也停在最后一个字之前（只差 12px）。
+            let mut text_x = line_x;
+            if block.proj.block.code_block {
+                text_x += px(12.);
+            }
 
             // 引用块：所有层级都画左竖线和背景；仅最外层加上下内边距，
             // 避免嵌套引用之间产生多余的间隔分隔。
@@ -4547,7 +4553,7 @@ impl Element for DocElement {
                         let width = if x1 > x0 { x1 - x0 } else { Pixels::ZERO };
                         let y = row_top + line_px * r as f32;
                         window.paint_quad(fill(
-                            bounds(point(line_x + x0, y), size(width, line_px)),
+                            bounds(point(text_x + x0, y), size(width, line_px)),
                             palette.selection,
                         ));
                     }
@@ -4593,10 +4599,6 @@ impl Element for DocElement {
             }
 
             // 文本本体（`WrappedLine::paint` 内部按换行边界逐视觉行绘制）
-            let mut text_x = line_x;
-            if block.proj.block.code_block {
-                text_x += px(12.);
-            }
             let _ = block.shaped.paint(
                 point(text_x, row_top),
                 line_px,
@@ -4650,7 +4652,7 @@ impl Element for DocElement {
             {
                 // p.y = 光标所在视觉行在块内的顶边偏移（软换行下不再画错行）
                 let caret_rect = bounds(
-                    point(line_x + p.x, row_top + p.y + px(2.)),
+                    point(text_x + p.x, row_top + p.y + px(2.)),
                     size(px(2.), line_px - px(4.)),
                 );
                 // 光标用正文前景色（对比度最高），而非主题 accent（可能偏浅看不清）
