@@ -981,6 +981,24 @@ mod tests {
     }
 
     #[test]
+    fn new_ordered_item_before_nested_list_shows_marker() {
+        let mut d = doc("1. a\n2. b\n   - n\n");
+        let at = d.text().find("\n   - n").unwrap();
+        d.apply(crate::intent::newline_edit(&d.text(), at)).unwrap();
+        assert_eq!(d.text(), "1. a\n2. b\n3. \n   - n\n");
+        let p = d.projection();
+        let l = &p.lines[2];
+        assert_eq!(l.display_text(), "");
+        assert_eq!(
+            l.block.bullet,
+            Some(crate::Bullet {
+                ordered: true,
+                number: 3
+            })
+        );
+    }
+
+    #[test]
     fn projection_cache_matches_full_after_edits() {
         let mut d =
             doc("# 标题\n\n```rust\nfn a() {}\n```\n\n> 引用\n\n- 列表一\n- 列表二\n\n结尾\n");

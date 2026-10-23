@@ -642,18 +642,18 @@ fn assign_style(block: &Block, ctx: &StyleCtx, lines: &[Line], styles: &mut [Blo
             BlockKind::ListItem { task } => {
                 let mut inner = ctx.clone();
                 inner.task = *task;
-                if block.children.is_empty() {
-                    // 空列表项（如刚回车续行得到的 `- [ ] `）没有叶子块，
-                    // 必须由容器自身写样式，否则项目符号/复选框图标不会显示。
-                    let style = BlockStyle {
-                        quote_depth: inner.quote_depth,
-                        bullet: inner.bullet.clone(),
-                        task: inner.task,
-                        ..BlockStyle::default()
-                    };
-                    for idx in lines_overlapping(lines, &block.range) {
-                        styles[idx] = style.clone();
-                    }
+                // 列表项的**标记行**始终由容器写样式。仅凭 `children.is_empty()`
+                // 判断不够：新空项后面若跟着缩进内容（嵌套列表/续行），它会有子块，
+                // 但子块不覆盖标记行本身，标记行就退回默认段落样式——项目符号/
+                // 复选框/序号因此要等输入文字后才出现。
+                let style = BlockStyle {
+                    quote_depth: inner.quote_depth,
+                    bullet: inner.bullet.clone(),
+                    task: inner.task,
+                    ..BlockStyle::default()
+                };
+                if let Some(&idx) = lines_overlapping(lines, &block.range).first() {
+                    styles[idx] = style;
                 }
                 for c in &block.children {
                     assign_style(c, &inner, lines, styles);
@@ -836,6 +836,22 @@ mod tests {
         assert_eq!(l.block.task, Some(false));
         assert!(l.block.bullet.is_some());
         assert_eq!(l.display_text(), "");
+    }
+
+    /// 新空项后面紧跟缩进内容时，子块会让该项不再是"空容器"；标记行仍须有
+    /// 列表样式，否则序号/项目符号要等输入后才显示。
+    #[test]
+    fn empty_ordered_item_before_nested_content_keeps_marker() {
+        let p = build("1. a\n2. \n   - x\n");
+        let l = &p.lines[1];
+        assert_eq!(l.display_text(), "");
+        assert_eq!(
+            l.block.bullet,
+            Some(Bullet {
+                ordered: true,
+                number: 2
+            })
+        );
     }
 
     #[test]
