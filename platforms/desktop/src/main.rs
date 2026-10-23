@@ -45,7 +45,7 @@ use gpui_kit::*;
 use mazha_core::{
     BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DefaultIntentMapper, DisplayPos, DocPos,
     Document, Edit, Highlighter, InlineMark, Intent, IntentMapper, OffsetMap, ProjectedLine,
-    Projection, RunStyle, Selection, TableOp, TextRun as DocTextRun, Workspace,
+    Projection, RunStyle, Selection, TableLine, TableOp, TextRun as DocTextRun, Workspace,
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit,
 };
@@ -3877,6 +3877,12 @@ fn build_line_runs(
             r.font = r.font.clone().bold();
         }
     }
+    // 表头整行加粗：与表体的表头底色/分隔线一起，让首行一眼可辨
+    if line.block.table_line == Some(TableLine::Header) {
+        for r in &mut runs {
+            r.font = r.font.clone().bold();
+        }
+    }
     // 已完成任务：整行删除线 + 弱化色，一眼区分"做完的待办"
     if line.block.task == Some(true) {
         for r in &mut runs {
@@ -4344,7 +4350,20 @@ impl Element for DocElement {
                     };
                     // 逐块字号/行高：标题按级别放大，行高同步放大，避免字形压到相邻行
                     let font_size = block_font_size(&line.block, base_size, mono_size);
-                    let line_px = block_line_px(&line.block, font_size);
+                    let mut line_px = block_line_px(&line.block, font_size);
+                    // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
+                    // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
+                    // 光标若落进分隔行则恢复正常高度，否则会出现"看不见的光标"。
+                    if line.block.table_line == Some(TableLine::Delimiter) {
+                        line_px = if caret_pos.line == idx {
+                            line_px
+                        } else {
+                            Pixels::ZERO
+                        };
+                    } else if line.block.table_line == Some(TableLine::Header) {
+                        // 上下各多给约 6px，表头文字在行盒内垂直居中
+                        line_px += px(12.);
+                    }
                     let indent = block_indent(line, indent_base);
                     // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
                     let mut wrap_width = (content_width_total - indent - BASE).max(px(48.));
@@ -4643,11 +4662,27 @@ impl Element for DocElement {
                     WidgetDecorKind::Math if !w.editing => {
                         paint_rect_border(window, rect, palette.border, px(1.));
                     }
-                    // 表格：弱底填充 + 外框 + 每逻辑行之间的水平分隔线
+                    // 表格：弱底 + 表头带 + 外框 + 行分隔线。
+                    // 表头带覆盖表头行与其后的窄分隔行，视觉上就是表头下内边距；
+                    // 分隔线从表体首行开始画，避免表头下出现两条线夹着一个空行。
                     WidgetDecorKind::Table if !w.editing => {
                         window.paint_quad(fill(rect, palette.subtle));
+                        let header_end = (w.line_range.start + 2).min(w.line_range.end);
+                        if header_end > w.line_range.start {
+                            let y0 = layout.origin.y
+                                + layout.row_top(layout.row_starts[w.line_range.start]);
+                            let y1 =
+                                layout.origin.y + layout.row_top(layout.row_starts[header_end]);
+                            window.paint_quad(fill(
+                                bounds(point(left, y0), size(right - left, y1 - y0)),
+                                Hsla {
+                                    a: 0.35,
+                                    ..palette.muted
+                                },
+                            ));
+                        }
                         paint_rect_border(window, rect, palette.border, px(1.));
-                        for line in (w.line_range.start + 1)..w.line_range.end {
+                        for line in (w.line_range.start + 2)..w.line_range.end {
                             let y = layout.origin.y + layout.row_top(layout.row_starts[line]);
                             window.paint_quad(fill(
                                 bounds(point(left, y), size(right - left, px(1.))),

@@ -33,7 +33,7 @@ pub use intent::{DefaultIntentMapper, Intent, IntentMapper};
 pub use offset_map::{DisplayPos, OffsetMap, OffsetMapError};
 pub use projection::{
     BlockStyle, BlockWidget, BlockWidgetKind, Bullet, DocPos, LineDisplayRange, ProjectedLine,
-    Projection, RunStyle, TextRun, Widget, WidgetKind, build as build_projection,
+    Projection, RunStyle, TableLine, TextRun, Widget, WidgetKind, build as build_projection,
     build_from as build_projection_from,
 };
 pub use selection::Selection;

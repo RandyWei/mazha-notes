@@ -23,6 +23,54 @@ pub use pdf::{PdfDocument, PdfError, PdfExportOptions, PdfExporter, to_pdf, to_p
 pub use theme::{Template, Theme};
 pub use typst::{to_typst, to_typst_with_template};
 
+/// 去掉表格单元格首尾的空白片段。
+///
+/// 投影层为了让 WYSIWYG 表格有"单元格内边距"，会保留源码里单元格两端的空格；
+/// 导出 HTML/DOCX 时这些空格只是排版噪声，需要去掉。只裁切首尾的**文本**片段，
+/// 行内标记（`**`、链接括号等）与单元格中间的空格保持不变。
+pub(crate) fn trim_cell_spans(
+    source: &str,
+    spans: &[mazha_md::SyntaxSpan],
+) -> Vec<mazha_md::SyntaxSpan> {
+    use mazha_md::{SpanKind, SyntaxSpan};
+    let mut out: Vec<SyntaxSpan> = spans.to_vec();
+    // 头部：只有最前面的文本片段可能带前导空格
+    while let Some(first) = out.first_mut() {
+        if first.kind != SpanKind::Text {
+            break;
+        }
+        let text = source.get(first.range.clone()).unwrap_or("");
+        let trimmed = text.trim_start();
+        if trimmed.len() == text.len() {
+            break;
+        }
+        first.range.start += text.len() - trimmed.len();
+        if first.range.is_empty() {
+            out.remove(0);
+        } else {
+            break;
+        }
+    }
+    // 尾部同理
+    while let Some(last) = out.last_mut() {
+        if last.kind != SpanKind::Text {
+            break;
+        }
+        let text = source.get(last.range.clone()).unwrap_or("");
+        let trimmed = text.trim_end();
+        if trimmed.len() == text.len() {
+            break;
+        }
+        last.range.end -= text.len() - trimmed.len();
+        if last.range.is_empty() {
+            out.pop();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 /// 支持的导出目标格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {

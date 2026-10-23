@@ -350,9 +350,11 @@ fn table(source: &str, block: &Block, align: &[Align]) -> BodyContent<'static> {
             if let Some(a) = align.get(ci) {
                 prop = prop.justification(align_val(*a));
             }
+            // 源码单元格两端的空格是投影期的内边距，DOCX 里不应写入
+            let cell = crate::trim_cell_spans(source, cell);
             let para = Paragraph {
                 property: prop,
-                content: inline_content(source, cell, &base),
+                content: inline_content(source, &cell, &base),
             };
             tr = tr.push_cell(TableCell::pargraph(para));
         }

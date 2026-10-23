@@ -793,11 +793,12 @@ fn row_spans(source: &str, line: Line) -> Vec<SyntaxSpan> {
     while i < bytes.len() {
         if bytes[i] == b'|' && (i == 0 || bytes[i - 1] != b'\\') {
             if seg_start < i {
-                // 去掉单元格两端空白（渲染时不显示）
-                let (s, e) = trim_ascii_ws(bytes, seg_start, i);
-                if s < e {
-                    out.extend(crate::inline::parse_inline(source, base + s..base + e));
-                }
+                // 保留单元格两端空白：表格的"内边距"就来自源码里的空格，
+                // 若 trim 掉会渲染成 `|a|b|`，格子挤在一起。
+                out.extend(crate::inline::parse_inline(
+                    source,
+                    base + seg_start..base + i,
+                ));
             }
             out.push(SyntaxSpan::text(
                 base + i..base + i + 1,
@@ -810,23 +811,12 @@ fn row_spans(source: &str, line: Line) -> Vec<SyntaxSpan> {
         }
     }
     if seg_start < bytes.len() {
-        let (s, e) = trim_ascii_ws(bytes, seg_start, bytes.len());
-        if s < e {
-            out.extend(crate::inline::parse_inline(source, base + s..base + e));
-        }
+        out.extend(crate::inline::parse_inline(
+            source,
+            base + seg_start..base + bytes.len(),
+        ));
     }
     out
-}
-
-/// 收缩 `[start, end)` 两侧的 ASCII 空白，返回新的 (start, end)。
-fn trim_ascii_ws(bytes: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    (start, end)
 }
 
 /// 构造引用块（仅支持带 `>` 前缀的续行，暂不支持惰性续行）。

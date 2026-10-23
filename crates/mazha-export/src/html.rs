@@ -118,8 +118,9 @@ fn render_table(
                 _ => {}
             }
             out.push('>');
-            // 单元格内已按行内语法解析过，直接渲染其片段
-            render_spans_html(source, cell, out, xhtml);
+            // 单元格内已按行内语法解析过；源码首尾空格是投影期的内边距，导出时去掉
+            let cell = crate::trim_cell_spans(source, cell);
+            render_spans_html(source, &cell, out, xhtml);
             let _ = write!(out, "</{tag}>");
         }
         out.push_str("</tr>");

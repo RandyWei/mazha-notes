@@ -396,6 +396,17 @@ pub struct BlockStyle {
     pub code_lang: Option<String>,
     /// 是否分割线。
     pub thematic_break: bool,
+    /// 表格行的角色（表头/分隔行）；非表格行为 `None`。
+    pub table_line: Option<TableLine>,
+}
+
+/// GFM 表格中需要 UI 特殊处理的行（SPEC §11.5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableLine {
+    /// 表头行：可加粗、铺底色。
+    Header,
+    /// 分隔行（`| --- |`）：投影显示为空，UI 可将其高度并入表头内边距。
+    Delimiter,
 }
 
 /// 列表项符号。
@@ -684,9 +695,25 @@ fn assign_style(block: &Block, ctx: &StyleCtx, lines: &[Line], styles: &mut [Blo
             _ => None,
         },
         thematic_break: matches!(block.kind, BlockKind::ThematicBreak),
+        ..BlockStyle::default()
     };
-    for idx in lines_overlapping(lines, &block.range) {
-        styles[idx] = style.clone();
+    // 表格：首行是表头，次行是分隔行（解析器保证紧随表头）。分隔行在投影里显示为空，
+    // 由 UI 当作表头与表体之间的内边距处理。
+    if matches!(block.kind, BlockKind::Table { .. }) {
+        let covered = lines_overlapping(lines, &block.range);
+        for (offset, &idx) in covered.iter().enumerate() {
+            let mut row = style.clone();
+            row.table_line = match offset {
+                0 => Some(TableLine::Header),
+                1 => Some(TableLine::Delimiter),
+                _ => None,
+            };
+            styles[idx] = row;
+        }
+    } else {
+        for idx in lines_overlapping(lines, &block.range) {
+            styles[idx] = style.clone();
+        }
     }
 }
 
@@ -1209,6 +1236,14 @@ mod tests {
                 fenced: true,
             }
         );
+    }
+
+    #[test]
+    fn table_lines_mark_header_and_delimiter() {
+        let p = build("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        assert_eq!(p.lines[0].block.table_line, Some(TableLine::Header));
+        assert_eq!(p.lines[1].block.table_line, Some(TableLine::Delimiter));
+        assert_eq!(p.lines[2].block.table_line, None);
     }
 
     #[test]
