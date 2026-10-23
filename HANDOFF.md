@@ -6,7 +6,7 @@
 - 最近更新：2026-10-23
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.64**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.65**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -48,12 +48,12 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 数量 |
 |-------|------|
-| `mazha-core` | 185 |
+| `mazha-core` | 187 |
 | `mazha-md` | 149 |
 | `mazha-export` | 121 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
-| 合计 | **483**（其余为占位 crate 的版本号冒烟测试） |
-| `platforms/desktop`（独立 workspace） | 13（不计入上面的 483） |
+| 合计 | **485**（其余为占位 crate 的版本号冒烟测试） |
+| `platforms/desktop`（独立 workspace） | 13（不计入上面的 485） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -97,7 +97,8 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 100 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(core): 引用内列表回车续行（0.1.64）>
+<本次提交：fix(core): 有序列表 1) 标记续行（0.1.65）>
+6fbb83c feat(core): 引用内列表回车续行（0.1.64）
 1d2b2e2 feat(desktop): 列表/任务回车续行，新项图标即时显示（0.1.63）
 bb953df fix(desktop): 代码块光标/选区与文本同起点（0.1.61）
 0506727 feat(desktop): 中文斜体倾斜 + 行内代码底色 + 代码块浅底与就地显源码（0.1.60）

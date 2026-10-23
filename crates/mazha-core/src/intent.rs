@@ -230,11 +230,17 @@ pub fn newline_edit(source: &str, at: usize) -> Edit {
     // 先剥掉引用前缀（`> ` / `> > `），列表可能嵌套在引用里
     let (quote_len, body) = split_quote_prefix(line);
     match list_prefix(body) {
-        Some(prefix) if body[prefix.indent + prefix.len..].trim().is_empty() => Edit::Replace {
-            // 空列表项：只去掉标记（保留引用前缀），退回收引用里的空行
-            range: line_start + quote_len..at,
-            text: String::new(),
-        },
+        Some(prefix)
+            if body
+                .get(prefix.indent + prefix.len..)
+                .is_none_or(|rest| rest.trim().is_empty()) =>
+        {
+            Edit::Replace {
+                // 空列表项：只去掉标记（保留引用前缀），退回收引用里的空行
+                range: line_start + quote_len..at,
+                text: String::new(),
+            }
+        }
         Some(prefix) => Edit::Insert {
             at,
             text: format!("\n{}{}", &line[..quote_len], prefix.next),
@@ -279,17 +285,30 @@ fn split_quote_prefix(line: &str) -> (usize, &str) {
 fn list_prefix(line: &str) -> Option<ListPrefix> {
     let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
     let rest = &line[indent..];
-    let (base, next): (usize, String) =
-        if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
-            (2, "- ".to_string())
-        } else {
-            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 || !rest[digits..].starts_with(". ") {
-                return None;
-            }
-            let n = rest[..digits].parse::<u64>().unwrap_or(1);
-            (digits + 2, format!("{}. ", n + 1))
+    let bytes = rest.as_bytes();
+    let (mut base, next): (usize, String) = if matches!(bytes.first(), Some(b'-' | b'*' | b'+')) {
+        (1, "- ".to_string())
+    } else {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        // 与扫描器保持一致：有序标记接受 `.` / `)`，且其后必须是空白或行尾
+        let delim = match bytes.get(digits) {
+            Some(b'.') => '.',
+            Some(b')') => ')',
+            _ => return None,
         };
+        if !matches!(bytes.get(digits + 1), None | Some(b' ' | b'\t')) {
+            return None;
+        }
+        let n = rest[..digits].parse::<u64>().unwrap_or(1);
+        (digits + 1, format!("{}{delim} ", n + 1))
+    };
+    // 跳过标记后的空白（与扫描器一致；行尾 `-`/`1.` 也算列表标记）
+    while matches!(bytes.get(base), Some(b' ' | b'\t')) {
+        base += 1;
+    }
     // 任务框（`[ ] ` / `[x] `）作为标记一部分，续行时补回未勾选框
     let task = ["[ ] ", "[x] ", "[X] "]
         .iter()
@@ -417,6 +436,22 @@ mod tests {
         let edits = mapper().map(&Intent::Newline { at: 5 }, &doc);
         apply(&mut doc, edits);
         assert_eq!(doc.text(), "hello\n");
+    }
+
+    #[test]
+    fn newline_continues_ordered_paren() {
+        let mut doc = Document::new("1) a");
+        let edits = mapper().map(&Intent::Newline { at: 4 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "1) a\n2) ");
+    }
+
+    #[test]
+    fn newline_continues_ordered_dot() {
+        let mut doc = Document::new("9. a");
+        let edits = mapper().map(&Intent::Newline { at: 4 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "9. a\n10. ");
     }
 
     #[test]
