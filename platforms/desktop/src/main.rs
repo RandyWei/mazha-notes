@@ -30,6 +30,7 @@
 //! `ProjectedLine::display_byte_of_col`（↔ `display_col_of_byte`）与 `WrappedLine` 的
 //! 字节索引互换（引用 "> " 前缀等额外文本以 `prefix_bytes` 计入）。
 
+use rfd::AsyncFileDialog;
 use std::cmp::Reverse;
 use std::ops::Range;
 use std::panic::Location;
@@ -52,7 +53,7 @@ use mazha_export::to_pdf;
 use mazha_md::{SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
-use rfd::AsyncFileDialog;
+mod oblique;
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
 const SAMPLE: &str = "\
@@ -117,8 +118,12 @@ struct Palette {
     border: Hsla,
     /// 背景。
     background: Hsla,
-    /// 弱底色（代码块、行内代码背景）。
+    /// 弱底色（图片占位、表格/图表块背景）。
     subtle: Hsla,
+    /// 行内代码底色（经 `TextRun.background_color` 由 gpui 逐视觉行绘制）。
+    code_bg: Hsla,
+    /// 代码块面板浅底（比 subtle 更淡，编辑态也要铺）。
+    code_block_bg: Hsla,
     /// 引用块整行浅底（比 `subtle` 更淡，避免压过正文）。
     quote_bg: Hsla,
     /// 选区高亮底色（accent 的低透明度）。
@@ -140,6 +145,16 @@ impl Palette {
                 a: 0.25,
                 ..theme.muted
             },
+            // 行内代码底色：前景色低透明度，浅色主题也可见
+            code_bg: Hsla {
+                a: 0.08,
+                ..theme.foreground
+            },
+            // 代码块浅底：前景色极低透明度
+            code_block_bg: Hsla {
+                a: 0.06,
+                ..theme.foreground
+            },
             // 引用块底色：由**前景色**极低透明度混合（只需刚好能和正文区分）
             quote_bg: Hsla {
                 a: 0.04,
@@ -150,6 +165,30 @@ impl Palette {
                 a: 0.25,
                 ..theme.accent
             },
+        }
+    }
+
+    /// 单测用调色板：不依赖全局主题，各字段给中性值即可。
+    #[cfg(test)]
+    fn default_for_test() -> Self {
+        let fg = Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.,
+            a: 1.,
+        };
+        Self {
+            foreground: fg,
+            muted: fg,
+            link: fg,
+            accent: fg,
+            border: fg,
+            background: fg,
+            subtle: fg,
+            code_bg: fg,
+            code_block_bg: fg,
+            quote_bg: fg,
+            selection: fg,
         }
     }
 }
@@ -460,16 +499,40 @@ struct BlockGeom {
     ///
     /// `![alt](url)` 整段被投影隐藏，若不画占位屏幕上就是空白，故补一个可见标签。
     image_chips: Vec<(Point<Pixels>, Box<ShapedLine>)>,
+    /// 需自绘合成倾斜的中文片段（相对行文本字节区间）。
+    ///
+    /// 这些片段在 gpui 侧是透明占位（保留排版/光标/选区），字形轮廓在 paint 阶段
+    /// 按视觉行基线现取现画，避免在布局阶段重复计算几何。
+    oblique_spans: Vec<oblique::ObliqueSpan>,
+    /// 本块字号（自绘斜体取轮廓用）。
+    font_size: Pixels,
+    /// 围栏行在"编辑代码块"时的源码显示文本（含 ``` / ```lang）。
+    ///
+    /// 围栏行投影后显示文本为空（整行都是隐藏标记），光标落上去就"看不见"。
+    /// 编辑该代码块时把源码直接画出来，并令显示列与源字节 1:1 映射。
+    fence_src: Option<SharedString>,
+}
+
+/// 字符列 → UTF-8 字节偏移（越界钳到末尾）。
+fn char_col_to_byte(s: &str, col: usize) -> usize {
+    s.char_indices().nth(col).map_or(s.len(), |(i, _)| i)
 }
 
 impl BlockGeom {
     /// 显示列 → 形状化文本内的字节偏移（含前缀）。
     fn byte_of_col(&self, col: usize) -> usize {
+        if let Some(src) = &self.fence_src {
+            return char_col_to_byte(src, col);
+        }
         self.prefix_bytes + self.proj.display_byte_of_col(col)
     }
 
     /// 形状化文本内的字节偏移 → 显示列（扣除前缀，越界钳到行末）。
     fn col_of_byte(&self, byte: usize) -> usize {
+        if let Some(src) = &self.fence_src {
+            let byte = byte.min(src.len());
+            return src.get(..byte).map_or(0, |s| s.chars().count());
+        }
         self.proj
             .display_col_of_byte(byte.saturating_sub(self.prefix_bytes))
     }
@@ -480,6 +543,10 @@ impl BlockGeom {
     /// 可落点，`display_to_source` 会退回 0（文档开头），导致点击或上下移动误跳文首；
     /// 这里显式落到本行起点。非空行也把结果钳进本行范围，避免跨行串位。
     fn source_of_col(&self, col: usize) -> usize {
+        if self.fence_src.is_some() {
+            return (self.proj.source_range.start + self.byte_of_col(col))
+                .min(self.proj.source_range.end);
+        }
         if self.proj.offset_map.display_len() == 0 {
             return self.proj.source_range.start;
         }
@@ -498,6 +565,10 @@ impl BlockGeom {
     /// 两种状态都经 `OffsetMap::source_to_display`：展开态以行首为基准，投影态用绝对
     /// 偏移；落在隐藏标记内时吸附到标记起点（与光标规则一致）。
     fn col_of_source(&self, src: usize) -> usize {
+        if self.fence_src.is_some() {
+            let rel = src.saturating_sub(self.proj.source_range.start);
+            return self.col_of_byte(rel);
+        }
         let src = src.clamp(self.proj.source_range.start, self.proj.source_range.end);
         // 展开态的 OffsetMap 以行首为基准；投影态是整篇绝对偏移
         let base = if self.revealed {
@@ -3426,15 +3497,27 @@ fn block_line_px(block: &BlockStyle, font_size: Pixels) -> Pixels {
     (font_size * factor).max(LINE_HEIGHT)
 }
 
+fn italic_fallbacks() -> gpui_kit::FontFallbacks {
+    gpui_kit::FontFallbacks::from_fonts(vec![
+        "PingFang SC".into(),
+        "Hiragino Sans GB".into(),
+        "Songti SC".into(),
+        "Heiti SC".into(),
+        "Apple Symbols".into(),
+        "Apple Color Emoji".into(),
+    ])
+}
+
 /// 把一个 core [`TextRun`]（片段 + 样式）转成 gpui 的 [`gpui::TextRun`]（字形级样式）。
 ///
-/// 返回 `(显示文本, gpui_text_run)`；调用方需保证 `run.text` 非空（空片段不参与排版）。
-fn to_gpui_run(
+/// 对中文斜体：仅 CJK 字符需自绘合成，其他字符走 gpui 正常渲染；
+/// 中文片段置为透明占位以避免直立重复绘制。
+fn to_gpui_runs(
     run: &DocTextRun,
     base_font: &Font,
     mono_font: &Font,
     palette: &Palette,
-) -> (String, gpui::TextRun) {
+) -> (String, Vec<gpui::TextRun>, Vec<oblique::ObliqueSpan>) {
     // 默认按正文样式；代码块整体覆盖为等宽字体（字号统一在 shape_line 时按块应用）
     let mut font = base_font.clone();
     let mut color = palette.foreground;
@@ -3444,7 +3527,10 @@ fn to_gpui_run(
 
     match run.style {
         RunStyle::Normal => {}
-        RunStyle::Emphasis => font = font.italic(),
+        RunStyle::Emphasis => {
+            font = font.italic();
+            font.fallbacks = Some(italic_fallbacks());
+        }
         RunStyle::Strong => font = font.bold(),
         RunStyle::Strikethrough => {
             strikethrough = Some(StrikethroughStyle {
@@ -3454,13 +3540,13 @@ fn to_gpui_run(
         }
         RunStyle::InlineCode => {
             font = mono_font.clone();
-            // 正文前景色：主题 accent 在浅/深色底下对比度偏低（看起来"颜色太浅"）
             color = palette.foreground;
-            background = Some(palette.subtle);
+            background = Some(palette.code_bg);
         }
         // 行内公式体（D34 ④）：斜体 + 主题色，与普通文本区分
         RunStyle::Math => {
             font = font.italic();
+            font.fallbacks = Some(italic_fallbacks());
             color = palette.accent;
         }
         // 脚注标签（D35 ⑤）：主题色区分。gpui 字号按行设置（shape_line），
@@ -3478,6 +3564,49 @@ fn to_gpui_run(
         }
     }
 
+    let text = run.text.clone();
+
+    if matches!(run.style, RunStyle::Emphasis | RunStyle::Math) {
+        let base_family = font.family.as_ref();
+        let mut runs_out: Vec<gpui::TextRun> = Vec::new();
+        let mut oblique_list: Vec<oblique::ObliqueSpan> = Vec::new();
+        let mut pos = 0;
+        for (range, is_cjk) in oblique::split_segments(&text) {
+            let seg = &text[range.clone()];
+            if seg.is_empty() {
+                continue;
+            }
+            if is_cjk && !oblique::primary_covers(base_family, seg.chars().next().unwrap_or('中'))
+            {
+                runs_out.push(gpui::TextRun {
+                    len: seg.len(),
+                    font: font.clone(),
+                    color: Hsla { a: 0.0, ..color },
+                    background_color: background,
+                    underline: None,
+                    strikethrough: None,
+                });
+                oblique_list.push(oblique::ObliqueSpan {
+                    range: pos..pos + seg.len(),
+                    color,
+                });
+            } else {
+                runs_out.push(gpui::TextRun {
+                    len: seg.len(),
+                    font: font.clone(),
+                    color,
+                    background_color: background,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            pos += seg.len();
+        }
+        if !runs_out.is_empty() {
+            return (text, runs_out, oblique_list);
+        }
+    }
+
     let gpui_run = gpui::TextRun {
         len: run.text.len(),
         font,
@@ -3486,12 +3615,12 @@ fn to_gpui_run(
         underline,
         strikethrough,
     };
-    (run.text.clone(), gpui_run)
+    (run.text.clone(), vec![gpui_run], Vec::new())
 }
 
 /// 把一整块投影行（引用前缀 + 可见片段）拼成一条不换行的可见文本 + 对应 gpui 样式段。
 ///
-/// 返回 `(完整可见文本, gpui_runs)`。引用前缀 `> ` 用 muted 色，其余用片段自身样式。
+/// 返回 `(完整可见文本, gpui_runs, oblique_spans)`。引用前缀 `> ` 用 muted 色，其余用片段自身样式。
 /// `highlight` 为代码块行的语法高亮片段（相对该行显示文本；`None` = 不高亮）。
 ///
 /// 块级样式（标题整块加粗、已完成任务删除线 + 弱化）在这里逐 run 施加。
@@ -3501,9 +3630,10 @@ fn build_line_runs(
     mono_font: &Font,
     palette: &Palette,
     highlight: Option<&[ColoredRun]>,
-) -> (SharedString, Vec<gpui::TextRun>) {
+) -> (SharedString, Vec<gpui::TextRun>, Vec<oblique::ObliqueSpan>) {
     let mut text = String::new();
     let mut runs: Vec<gpui::TextRun> = Vec::new();
+    let mut oblique_spans: Vec<oblique::ObliqueSpan> = Vec::new();
 
     // 引用块：为每个嵌套深度补一个 muted 的 "> " 前缀段
     for _ in 0..line.block.quote_depth {
@@ -3544,14 +3674,29 @@ fn build_line_runs(
     } else {
         // 其余情况（含未高亮的代码块）：按投影片段拼接
         for run in &line.runs {
-            let mut gp = to_gpui_run(run, base_font, mono_font, palette);
             if line.block.code_block {
                 // 代码块行：强制等宽字体 + 整行弱底色
-                gp.1.font = mono_font.clone();
-                gp.1.background_color = Some(palette.subtle);
+                let gp_run = gpui::TextRun {
+                    len: run.text.len(),
+                    font: mono_font.clone(),
+                    color: palette.foreground,
+                    background_color: Some(palette.subtle),
+                    underline: None,
+                    strikethrough: None,
+                };
+                text.push_str(&run.text);
+                runs.push(gp_run);
+                continue;
             }
-            text.push_str(&gp.0);
-            runs.push(gp.1);
+            let (seg_text, seg_runs, seg_obs) = to_gpui_runs(run, base_font, mono_font, palette);
+            for obs in seg_obs {
+                oblique_spans.push(oblique::ObliqueSpan {
+                    range: (text.len() + obs.range.start)..(text.len() + obs.range.end),
+                    color: obs.color,
+                });
+            }
+            text.push_str(&seg_text);
+            runs.extend(seg_runs);
         }
     }
 
@@ -3574,7 +3719,7 @@ fn build_line_runs(
 
     // 分割线：不在此处画字符，改由 `paint` 依块级 widget 画一条真实细线（SPEC §11.5、D30）。
 
-    (text.into(), runs)
+    (text.into(), runs, oblique_spans)
 }
 
 /// 把 `(r, g, b)`（syntect 前景色）转成 gpui 的 [`Hsla`]。
@@ -3644,7 +3789,7 @@ fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
     }
     // 代码块整体右缩进
     if line.block.code_block {
-        x += base;
+        x += base * 1.5;
     }
     x
 }
@@ -3806,8 +3951,43 @@ impl Element for DocElement {
                     caret >= caret_line_range.start + r.range.start
                         && caret <= caret_line_range.start + r.range.end
                 });
+                let caret_pos = view.doc.projection().source_to_doc_pos(caret);
+                // 光标在代码块内（含围栏行）时，把该块所有围栏行的源码显示出来：
+                // 围栏行投影后整行隐藏，不显示的话光标落上去"看不见"，也无法编辑 ```lang。
+                let fence_ranges: Vec<(usize, Range<usize>)> = {
+                    let projection = view.doc.projection();
+                    let mut out = Vec::new();
+                    if projection
+                        .lines
+                        .get(caret_pos.line)
+                        .is_some_and(|l| l.block.code_block)
+                    {
+                        let lines = &projection.lines;
+                        let mut start = caret_pos.line;
+                        while start > 0 && lines[start - 1].block.code_block {
+                            start -= 1;
+                        }
+                        let mut end = caret_pos.line;
+                        while end + 1 < lines.len() && lines[end + 1].block.code_block {
+                            end += 1;
+                        }
+                        for (i, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+                            out.push((i, line.source_range.clone()));
+                        }
+                    }
+                    out
+                };
+                let fence_texts: Vec<(usize, String)> = fence_ranges
+                    .into_iter()
+                    .filter_map(|(i, range)| {
+                        let src = view.doc.slice(range).into_owned();
+                        let text = src.trim_end_matches(['\n', '\r']);
+                        let head = text.trim_start();
+                        (head.starts_with("```") || head.starts_with("~~~"))
+                            .then(|| (i, text.to_string()))
+                    })
+                    .collect();
                 let projection = view.doc.projection();
-                let caret_pos = projection.source_to_doc_pos(caret);
                 // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
                 let caret_lines: Vec<usize> = caret_sources
                     .iter()
@@ -3934,8 +4114,20 @@ impl Element for DocElement {
                     };
                     let is_revealed = revealed_line.is_some();
                     let line = revealed_line.as_ref().unwrap_or(line);
+                    // 围栏行：光标在代码块内时显示源码（含 ```lang），并做 1:1 字节映射
+                    let fence_src: Option<SharedString> = fence_texts
+                        .iter()
+                        .find(|(i, _)| *i == idx)
+                        .map(|(_, src)| src.clone().into());
                     // 展开态显示文本 = 整行源码（含标记），光标列按行内字节直接换算
-                    let caret_col = if is_revealed {
+                    let caret_col = if let Some(src) = &fence_src {
+                        if caret_pos.line == idx {
+                            let rel = caret.saturating_sub(line.source_range.start).min(src.len());
+                            Some(src.get(..rel).map_or(0, |t| t.chars().count()))
+                        } else {
+                            None
+                        }
+                    } else if is_revealed {
                         // 展开态仍有其它隐藏标记（同行其它链接/强调），按展开后的
                         // OffsetMap 换算，不能假设显示字节 == 源字节
                         Some(
@@ -3948,21 +4140,42 @@ impl Element for DocElement {
                     } else {
                         None
                     };
-                    let (text, runs) = build_line_runs(
-                        line,
-                        &base_font,
-                        &mono_font,
-                        &palette,
-                        code_hl[idx].as_deref(),
-                    );
+                    let (text, runs, oblique_spans) = if let Some(src) = &fence_src {
+                        // 围栏源码：等宽 + 弱化色，不做语法高亮/斜体合成
+                        let run = gpui::TextRun {
+                            len: src.len(),
+                            font: mono_font.clone(),
+                            color: palette.muted,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        (src.clone(), vec![run], Vec::new())
+                    } else {
+                        build_line_runs(
+                            line,
+                            &base_font,
+                            &mono_font,
+                            &palette,
+                            code_hl[idx].as_deref(),
+                        )
+                    };
                     // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
-                    let prefix_bytes = text.len().saturating_sub(line.display_text().len());
+                    // 围栏源码是整行原文，没有额外前缀
+                    let prefix_bytes = if fence_src.is_some() {
+                        0
+                    } else {
+                        text.len().saturating_sub(line.display_text().len())
+                    };
                     // 逐块字号/行高：标题按级别放大，行高同步放大，避免字形压到相邻行
                     let font_size = block_font_size(&line.block, base_size, mono_size);
                     let line_px = block_line_px(&line.block, font_size);
                     let indent = block_indent(line, indent_base);
                     // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
-                    let wrap_width = (content_width_total - indent - BASE).max(px(48.));
+                    let mut wrap_width = (content_width_total - indent - BASE).max(px(48.));
+                    if line.block.code_block {
+                        wrap_width += px(24.);
+                    }
                     // 逐 run 字体（粗/斜/等宽族）由 build_line_runs 决定，**不再统一覆盖**：
                     // 覆盖会把代码块的等宽族、标题的粗体都抹平，看起来就是"md 没渲染"。
                     let shaped = shape_wrapped_line(window, text, font_size, &runs, wrap_width);
@@ -3970,7 +4183,11 @@ impl Element for DocElement {
 
                     // 光标行（内容坐标）：position_for_index 的 y = 视觉行号 × 行高（行顶）
                     if let Some(col) = caret_col {
-                        let cbyte = prefix_bytes + line.display_byte_of_col(col);
+                        let cbyte = if let Some(src) = &fence_src {
+                            char_col_to_byte(src, col)
+                        } else {
+                            prefix_bytes + line.display_byte_of_col(col)
+                        };
                         if let Some(p) = shaped.position_for_index(cbyte, line_px) {
                             caret_row = Some((top_acc + p.y, line_px));
                         }
@@ -4103,6 +4320,9 @@ impl Element for DocElement {
                         marker,
                         check,
                         image_chips,
+                        oblique_spans,
+                        font_size,
+                        fence_src,
                     });
                 }
                 row_starts.push(row_acc);
@@ -4214,8 +4434,8 @@ impl Element for DocElement {
             for w in &layout.widgets {
                 let top = layout.origin.y + layout.row_top(layout.row_starts[w.line_range.start]);
                 let bottom = layout.origin.y + layout.row_top(layout.row_starts[w.line_range.end]);
-                let left = layout.origin.x + w.indent;
-                let right = content_right.max(left + px(24.));
+                let left = layout.origin.x + w.indent - px(8.);
+                let right = content_right.max(left + px(24.)) + px(16.);
                 let rect = bounds(point(left, top), size(right - left, bottom - top));
                 match &w.kind {
                     // 分割线：在行垂直中线画一条细线（取代旧的 "─" 文本占位）
@@ -4226,12 +4446,14 @@ impl Element for DocElement {
                             palette.border,
                         ));
                     }
-                    // 代码块：整体描边（弱底色由每个代码行 run 自身提供，此处不叠加填充）
-                    // + 右上角语言标签
-                    WidgetDecorKind::Code { label } if !w.editing => {
-                        paint_rect_border(window, rect, palette.border, px(1.));
-                        if let Some(label) = label {
-                            paint_corner_label(label, right, top, window, cx);
+                    // 代码块：面板浅底 + 渲染态描边与右上角语言标签
+                    WidgetDecorKind::Code { label } => {
+                        window.paint_quad(fill(rect, palette.code_block_bg));
+                        if !w.editing {
+                            paint_rect_border(window, rect, palette.border, px(1.));
+                            if let Some(label) = label {
+                                paint_corner_label(label, right - px(8.), top, window, cx);
+                            }
                         }
                     }
                     // 图表块：弱底 + 外框 + 右上角语言标签（真渲染留渲染层，R4）
@@ -4371,14 +4593,54 @@ impl Element for DocElement {
             }
 
             // 文本本体（`WrappedLine::paint` 内部按换行边界逐视觉行绘制）
+            let mut text_x = line_x;
+            if block.proj.block.code_block {
+                text_x += px(12.);
+            }
             let _ = block.shaped.paint(
-                point(line_x, row_top),
+                point(text_x, row_top),
                 line_px,
                 TextAlign::Left,
                 None,
                 window,
                 cx,
             );
+            // 合成斜体：在文本绘制后填充倾斜字形。
+            // 这里现取轮廓（而非布局阶段缓存）：需要视觉行基线，而基线由 shaped 的
+            // ascent/descent 决定；放在 train 里算几何会与 paint 的坐标换算重复。
+            if !block.oblique_spans.is_empty() {
+                let line_text = block.shaped.text.as_str();
+                for span in &block.oblique_spans {
+                    let mut byte = span.range.start;
+                    while byte < span.range.end {
+                        let Some(ch) = line_text[byte..].chars().next() else {
+                            break;
+                        };
+                        let ch_len = ch.len_utf8();
+                        if byte + ch_len > span.range.end {
+                            break;
+                        }
+                        // 形状文本内的字节偏移 = 前缀 + 行内偏移
+                        let idx = block.prefix_bytes + byte;
+                        if let Some(p) = block.shaped.position_for_index(idx, line_px) {
+                            // 基线：视觉行顶 + 行内垂直居中偏移 + ascent
+                            let baseline_y = row_top
+                                + p.y
+                                + (line_px - block.shaped.ascent() - block.shaped.descent()) / 2.
+                                + block.shaped.ascent();
+                            if let Some(path) = oblique::glyph_path(
+                                ch,
+                                block.font_size.into(),
+                                text_x + p.x,
+                                baseline_y,
+                            ) {
+                                window.paint_path(path, span.color);
+                            }
+                        }
+                        byte += ch_len;
+                    }
+                }
+            }
 
             // 光标竖线：仅在光标所在块绘制（用 prepaint 预计算的 caret_col 显示列）
             if let Some(col) = block.caret_col
@@ -4450,7 +4712,53 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
-    use super::{DisplayPos, Document, inline_links, inline_reveals, reveal_inline};
+    use super::{
+        DisplayPos, Document, RunStyle, char_col_to_byte, inline_links, inline_reveals, oblique,
+        reveal_inline,
+    };
+
+    /// 中文斜体必须一路传到渲染层：投影要产出 `RunStyle::Emphasis`，
+    /// 且 `to_gpui_runs` 要把 CJK 片段标成合成斜体（透明占位 + ObliqueSpan）。
+    #[test]
+    fn cjk_emphasis_becomes_oblique_span() {
+        let text = "前 *中文斜体* 后";
+        let mut doc = Document::new(text);
+        let projection = doc.projection();
+        let line = &projection.lines[0];
+        let emphasis = line
+            .runs
+            .iter()
+            .find(|r| r.style == RunStyle::Emphasis)
+            .expect("投影应产出 Emphasis 片段");
+        assert_eq!(emphasis.text, "中文斜体");
+
+        let base = gpui_kit::Font {
+            family: ".SystemUIFont".into(),
+            ..Default::default()
+        };
+        let mono = base.clone();
+        let palette = super::Palette::default_for_test();
+        let (out_text, runs, spans) = super::to_gpui_runs(emphasis, &base, &mono, &palette);
+        assert_eq!(out_text, "中文斜体");
+        // 整段都是 CJK：应被拆成透明占位 run + 对应的合成斜体区间
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].range, 0..out_text.len());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, out_text.len());
+        assert_eq!(runs[0].color.a, 0.0, "占位字形必须透明");
+    }
+
+    /// CoreText 侧能真的取到中文轮廓（否则自绘阶段会静默跳过，斜体仍不生效）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cjk_glyph_path_is_available() {
+        assert!(
+            !oblique::primary_covers(".SystemUIFont", '斜'),
+            "系统 UI 字体不应覆盖汉字，否则不会走合成斜体"
+        );
+        let path = oblique::glyph_path('斜', 32.0, gpui_kit::px(0.), gpui_kit::px(100.));
+        assert!(path.is_some(), "应能从 CJK 回退字体取到字形轮廓");
+    }
 
     /// 完整链接应被识别为一组：区间覆盖 `[`..`)`，目标去掉两侧空白。
     #[test]
@@ -4538,5 +4846,15 @@ mod tests {
             reveal_inline(&line, &line_src, &link).is_none(),
             "代码块行不应展开"
         );
+    }
+    /// 围栏行 1:1 映射：显示列按字符计，必须落到 UTF-8 字符边界，
+    /// 越界钳到行末（与 `BlockGeom::byte_of_col` 的约定一致）。
+    #[test]
+    fn fence_char_col_maps_to_char_boundary() {
+        let src = "```中文 lang\n";
+        assert_eq!(char_col_to_byte(src, 0), 0);
+        assert_eq!(char_col_to_byte(src, 3), 3); // ``` 之后
+        assert_eq!(char_col_to_byte(src, 4), 6); // 「中」占 3 字节
+        assert_eq!(char_col_to_byte(src, 99), src.len());
     }
 }

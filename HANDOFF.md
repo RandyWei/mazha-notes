@@ -3,10 +3,10 @@
 > 每次提交代码时**同步更新本文件**（约定，见 `AGENTS.md`）。
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
-- 最近更新：2026-10-21
+- 最近更新：2026-10-23
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.59**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.60**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -39,10 +39,10 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现（要点） | 待办 |
 |------|------|----------------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **行内格式局部展开**（光标在链接/粗体/斜体/删除线/行内代码内时**该组**显示原文，`inline_reveals`/`reveal_inline`，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底（各层引用都铺底 + 左侧竖线，仅最外层加上下 padding）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板+语言标签、表格网格、分割线、**公式描边、图表弱底+标签**）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，侧栏标题列表+点击跳转，Cmd+Shift+O）** | 文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **行内格式局部展开**（光标在链接/粗体/斜体/删除线/行内代码内时**该组**显示原文，`inline_reveals`/`reveal_inline`，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底（各层引用都铺底 + 左侧竖线，仅最外层加上下 padding）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板**浅底+语言标签**、表格网格、分割线、**公式描边、图表弱底+标签**）；**中文斜体渲染器级合成倾斜**（macOS 中文字体无斜体字面、CoreText 也不为 CJK 合成，故 `oblique.rs` 取 CT 字形轮廓做 12° 剪切自绘，CJK 段以透明 run 占位保留排版；D43）；**行内代码可见底色**（`code_bg` = 前景 alpha 0.08，经 `TextRun.background_color` 逐视觉行绘制）；**代码块浅底 + 左右 padding**（`code_block_bg`，缩进 +1.5em、文本 +12px）；**Typora 式就地显源码**（光标进入围栏代码块 → 围栏行就地显出 ``` / ```lang，`BlockGeom::fence_src` 走 1:1 字符↔字节映射，移开复原）；表格增删行列；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，侧栏标题列表+点击跳转，Cmd+Shift+O）** | 文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6 / 8 / 7 |
 
-> 桌面端入口：`cargo run -- [path/to/file.md]`。本环境无法可视化验证渲染效果，逻辑改动靠核心单测 + 编译门禁保证。
+> 桌面端入口：`cargo run -- [path/to/file.md]`。渲染效果**可可视化验证**（需系统已授予终端/编辑器"屏幕录制"权限）：`swift` 查窗口号（CGWindowListCopyWindowInfo）→ `screencapture -x -o -l<窗口号>` 截图 → PIL 逐像素核对底色/字形；无权限时截图全黑。注意无辅助访问权限，**不能合成鼠标点击**，交互态需靠“光标初始落在目标行”的文档构造来验证。
 
 ## 测试现状
 
@@ -53,6 +53,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | `mazha-export` | 121 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
 | 合计 | **477**（其余为占位 crate 的版本号冒烟测试） |
+| `platforms/desktop`（独立 workspace） | 13（不计入上面的 477） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -88,14 +89,16 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 下一步（建议顺序）
 
 1. **Phase 4 余项**：桌面**主题 / 专注模式 / 打字机模式 / 字体字号**（文件管理、多标签页 D37、命令面板 D38、大纲 D39 均已落地）；**全工作区搜索（`Cmd+Shift+F`）列为低优先规划（D40，暂不排期）**；**当前文档查找/替换** `Cmd+F` 已于 0.1.49 实现；文件树可择机深化为目录层级/拖拽移动。
-2. **渲染层深化**（R4）：数学排版（`ratex-*`）与图表 SVG（`mermaid-rs-renderer`）替换块级占位面板；脚注的点击跳转/自动编号/文末归集；软换行**横向滚动**（D33 已知限制）。
-3. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
-4. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
+2. **中文斜体合成仍不完美**（D43 遗留）：当前 `paint_path` 自绘倾斜只保证"倾斜"本身，字符间距/笔画抗锯齿与原生 italic 字面仍有差异（透明占位 run 的 advance 与自绘轮廓起点可能相差不足 1px），且每次 paint 逐字取轮廓；后续可考虑：轮廓路径缓存到 `BlockGeom`（只在 shape 变化时重算）、按 run 基线与 advance 校正、或改用 Metal 自定义着色器做剪切变换。观感需实机对比 Typora 后决定优先级。
+3. **渲染层深化**（R4）：数学排版（`ratex-*`）与图表 SVG（`mermaid-rs-renderer`）替换块级占位面板；脚注的点击跳转/自动编号/文末归集；软换行**横向滚动**（D33 已知限制）。
+4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
+5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 99 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 100 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：docs: 归总 HANDOFF/SPEC（0.1.59）>
+<本次提交：feat(desktop): 中文斜体倾斜 + 行内代码底色 + 代码块浅底与就地显源码（0.1.60）>
+318f7d4 docs: 归总 HANDOFF/SPEC（0.1.59 行内格式局部展开 + 引用块嵌套修正）
 dd40eff feat(desktop): 光标在粗体/斜体/删除线/行内代码内展开标记（同链接展开逻辑）
 7c381a3 fix(desktop): 恢复嵌套引用背景和竖线，仅最外层加上下 padding
 aba26a4 fix(desktop): 嵌套引用不单独画背景和左竖线（最外层统一处理）

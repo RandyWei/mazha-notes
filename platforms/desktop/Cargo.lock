@@ -4377,6 +4377,10 @@ dependencies = [
 name = "mazha-desktop"
 version = "0.1.0"
 dependencies = [
+ "core-foundation 0.10.1",
+ "core-graphics 0.24.0",
+ "core-text",
+ "foreign-types",
  "gpui-kit",
  "mazha-core",
  "mazha-export",

@@ -21,3 +21,10 @@ mazha-export = { path = "../../crates/mazha-export" }
 rfd = "0.14"
 # 只声明 gpui-kit：GPUI 由它锁定版本/快照，避免两份 GPUI 类型不兼容（SPEC §7.1）
 gpui-kit = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 中文斜体合成倾斜：取 CoreText 字形轮廓 → 剪切 → 自绘（见 `src/oblique.rs`）
+core-text = "21"
+core-graphics = "0.24"
+core-foundation = "0.10"
+foreign-types = "0.5"
