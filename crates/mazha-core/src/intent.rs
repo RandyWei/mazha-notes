@@ -227,21 +227,48 @@ pub fn newline_edit(source: &str, at: usize) -> Edit {
         .and_then(|s| s.rfind('\n'))
         .map_or(0, |i| i + 1);
     let line = source.get(line_start..at).unwrap_or_default();
-    match list_prefix(line) {
-        Some(prefix) if line[prefix.indent + prefix.len..].trim().is_empty() => Edit::Replace {
-            // 空列表项：去掉标记（连同缩进），退回普通段落行
-            range: line_start..at,
+    // 先剥掉引用前缀（`> ` / `> > `），列表可能嵌套在引用里
+    let (quote_len, body) = split_quote_prefix(line);
+    match list_prefix(body) {
+        Some(prefix) if body[prefix.indent + prefix.len..].trim().is_empty() => Edit::Replace {
+            // 空列表项：只去掉标记（保留引用前缀），退回收引用里的空行
+            range: line_start + quote_len..at,
             text: String::new(),
         },
         Some(prefix) => Edit::Insert {
             at,
-            text: format!("\n{}", prefix.next),
+            text: format!("\n{}{}", &line[..quote_len], prefix.next),
         },
         None => Edit::Insert {
             at,
             text: "\n".to_string(),
         },
     }
+}
+
+/// 剥离行首的引用前缀（支持嵌套 `> > `，最多 3 个前导空格）。
+///
+/// 返回 `(前缀字节数, 剩余内容)`；前缀原样保留，便于续行时补回相同的引用层级。
+fn split_quote_prefix(line: &str) -> (usize, &str) {
+    let bytes = line.as_bytes();
+    let mut start = 0usize;
+    loop {
+        let mut j = start;
+        let mut spaces = 0;
+        while spaces < 3 && bytes.get(j) == Some(&b' ') {
+            j += 1;
+            spaces += 1;
+        }
+        if bytes.get(j) != Some(&b'>') {
+            break;
+        }
+        j += 1;
+        if matches!(bytes.get(j), Some(b' ' | b'\t')) {
+            j += 1;
+        }
+        start = j;
+    }
+    (start, &line[start..])
 }
 
 /// 识别行首列表标记（`- `/`* `/`+ `/`1. `，可选任务框 `[ ] `）。
@@ -390,6 +417,30 @@ mod tests {
         let edits = mapper().map(&Intent::Newline { at: 5 }, &doc);
         apply(&mut doc, edits);
         assert_eq!(doc.text(), "hello\n");
+    }
+
+    #[test]
+    fn newline_continues_quoted_list() {
+        let mut doc = Document::new("> - a");
+        let edits = mapper().map(&Intent::Newline { at: 5 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "> - a\n> - ");
+    }
+
+    #[test]
+    fn newline_continues_nested_quoted_task() {
+        let mut doc = Document::new("> > 1. a");
+        let edits = mapper().map(&Intent::Newline { at: 8 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "> > 1. a\n> > 2. ");
+    }
+
+    #[test]
+    fn newline_on_empty_quoted_item_keeps_quote_prefix() {
+        let mut doc = Document::new("> - a\n> - ");
+        let edits = mapper().map(&Intent::Newline { at: 10 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "> - a\n> ");
     }
 
     #[test]
