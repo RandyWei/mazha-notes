@@ -43,9 +43,9 @@ use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DisplayPos, DocPos, Document, Edit,
-    Highlighter, InlineMark, OffsetMap, ProjectedLine, Projection, RunStyle, Selection, TableOp,
-    TextRun as DocTextRun, Workspace,
+    BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DefaultIntentMapper, DisplayPos, DocPos,
+    Document, Edit, Highlighter, InlineMark, Intent, IntentMapper, OffsetMap, ProjectedLine,
+    Projection, RunStyle, Selection, TableOp, TextRun as DocTextRun, Workspace,
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit,
 };
@@ -1464,20 +1464,52 @@ impl DocView {
         any_deleted
     }
 
-    /// 所有光标处插入换行。有选区则先删除选区。
+    /// 回车：走核心 [`DefaultIntentMapper`] 的 `Newline` 意图。
+    ///
+    /// - 列表/任务项内：续行并补回标记（有序项序号 +1、任务项补未勾选框），
+    ///   新行立刻显示项目符号/复选框——"提前显示对应项的前缀图标"；
+    /// - 空列表项上再回车：删掉标记退出列表（即"两次回车结束列表"）；
+    /// - 其它情况：普通换行。
+    ///
+    /// 有选区时按普通"覆盖为新行"处理。多光标按位置**从后往前**应用，
+    /// 避免前面的插入改变后面光标对应的偏移。
     fn insert_newline(&mut self, cx: &mut Context<Self>) {
-        for c in &mut self.cursors {
+        let mut order: Vec<usize> = (0..self.cursors.len()).collect();
+        order.sort_by_key(|&i| {
+            let c = &self.cursors[i];
+            Reverse(c.selection().map_or(c.caret, |r| r.end))
+        });
+        for i in order {
+            let c = &mut self.cursors[i];
             let range = c.selection().unwrap_or(c.caret..c.caret);
             let at = range.start;
-            if self
-                .doc
-                .apply(Edit::Replace {
-                    range,
-                    text: "\n".into(),
-                })
-                .is_ok()
-            {
-                c.caret = self.doc.snap_to_boundary(at + 1);
+            let (applied, caret) = if range.is_empty() {
+                let edits = DefaultIntentMapper.map(&Intent::Newline { at }, &self.doc);
+                let mut applied = true;
+                for e in &edits {
+                    if self.doc.apply(e.clone()).is_err() {
+                        applied = false;
+                        break;
+                    }
+                }
+                let caret = match edits.as_slice() {
+                    [Edit::Insert { text, .. }] => at + text.len(),
+                    [Edit::Replace { range, .. }] => range.start,
+                    _ => at,
+                };
+                (applied, caret)
+            } else {
+                let applied = self
+                    .doc
+                    .apply(Edit::Replace {
+                        range,
+                        text: "\n".into(),
+                    })
+                    .is_ok();
+                (applied, at + 1)
+            };
+            if applied {
+                c.caret = self.doc.snap_to_boundary(caret);
                 c.anchor = None;
                 c.marked = None;
             }

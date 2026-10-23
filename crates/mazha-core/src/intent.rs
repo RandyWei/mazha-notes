@@ -208,9 +208,11 @@ fn is_pair(open: char, close: char) -> bool {
 
 /// 行首列表标记信息。
 struct ListPrefix {
-    /// 标记的字节长度（含其后的空格）。
+    /// 标记前的缩进字节数（嵌套列表）。
+    indent: usize,
+    /// 标记的字节长度（含其后的空格；不含缩进）。
     len: usize,
-    /// 续行标记（有序列表为递增后的序号）。
+    /// 续行标记（含缩进；有序列表为递增后的序号）。
     next: String,
 }
 
@@ -226,8 +228,8 @@ pub fn newline_edit(source: &str, at: usize) -> Edit {
         .map_or(0, |i| i + 1);
     let line = source.get(line_start..at).unwrap_or_default();
     match list_prefix(line) {
-        Some(prefix) if line[prefix.len..].trim().is_empty() => Edit::Replace {
-            // 空列表项：去掉标记，退回普通段落行
+        Some(prefix) if line[prefix.indent + prefix.len..].trim().is_empty() => Edit::Replace {
+            // 空列表项：去掉标记（连同缩进），退回普通段落行
             range: line_start..at,
             text: String::new(),
         },
@@ -243,22 +245,28 @@ pub fn newline_edit(source: &str, at: usize) -> Edit {
 }
 
 /// 识别行首列表标记（`- `/`* `/`+ `/`1. `，可选任务框 `[ ] `）。
+///
+/// 允许标记前有空格/制表符（嵌套列表）：续行时**保留相同缩进**，否则在嵌套项上
+/// 回车会突然跳到顶层。`len` 仍只计到标记+任务框（不含缩进），供调用方判断
+/// "标记之后是否还有内容"。
 fn list_prefix(line: &str) -> Option<ListPrefix> {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let rest = &line[indent..];
     let (base, next): (usize, String) =
-        if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") {
+        if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
             (2, "- ".to_string())
         } else {
-            let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 || !line[digits..].starts_with(". ") {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || !rest[digits..].starts_with(". ") {
                 return None;
             }
-            let n = line[..digits].parse::<u64>().unwrap_or(1);
+            let n = rest[..digits].parse::<u64>().unwrap_or(1);
             (digits + 2, format!("{}. ", n + 1))
         };
     // 任务框（`[ ] ` / `[x] `）作为标记一部分，续行时补回未勾选框
     let task = ["[ ] ", "[x] ", "[X] "]
         .iter()
-        .find(|t| line[base..].starts_with(**t))
+        .find(|t| rest[base..].starts_with(**t))
         .map_or(0, |t| t.len());
     let next = if task > 0 {
         format!("{next}[ ] ")
@@ -266,8 +274,9 @@ fn list_prefix(line: &str) -> Option<ListPrefix> {
         next
     };
     Some(ListPrefix {
+        indent,
         len: base + task,
-        next,
+        next: format!("{}{next}", &line[..indent]),
     })
 }
 
@@ -381,6 +390,30 @@ mod tests {
         let edits = mapper().map(&Intent::Newline { at: 5 }, &doc);
         apply(&mut doc, edits);
         assert_eq!(doc.text(), "hello\n");
+    }
+
+    #[test]
+    fn newline_continues_nested_list_with_indent() {
+        let mut doc = Document::new("- a\n  - b");
+        let edits = mapper().map(&Intent::Newline { at: 9 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "- a\n  - b\n  - ");
+    }
+
+    #[test]
+    fn newline_continues_nested_task_with_indent() {
+        let mut doc = Document::new("1. a\n   - [x] b");
+        let edits = mapper().map(&Intent::Newline { at: 15 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "1. a\n   - [x] b\n   - [ ] ");
+    }
+
+    #[test]
+    fn newline_on_empty_nested_item_exits_list() {
+        let mut doc = Document::new("- a\n  - ");
+        let edits = mapper().map(&Intent::Newline { at: 8 }, &doc);
+        apply(&mut doc, edits);
+        assert_eq!(doc.text(), "- a\n");
     }
 
     #[test]

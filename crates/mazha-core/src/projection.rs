@@ -642,6 +642,19 @@ fn assign_style(block: &Block, ctx: &StyleCtx, lines: &[Line], styles: &mut [Blo
             BlockKind::ListItem { task } => {
                 let mut inner = ctx.clone();
                 inner.task = *task;
+                if block.children.is_empty() {
+                    // 空列表项（如刚回车续行得到的 `- [ ] `）没有叶子块，
+                    // 必须由容器自身写样式，否则项目符号/复选框图标不会显示。
+                    let style = BlockStyle {
+                        quote_depth: inner.quote_depth,
+                        bullet: inner.bullet.clone(),
+                        task: inner.task,
+                        ..BlockStyle::default()
+                    };
+                    for idx in lines_overlapping(lines, &block.range) {
+                        styles[idx] = style.clone();
+                    }
+                }
                 for c in &block.children {
                     assign_style(c, &inner, lines, styles);
                 }
@@ -813,6 +826,16 @@ mod tests {
         let p = build(source);
         assert_eq!(p.lines.len(), 1, "期望单行：{source:?}");
         p.lines.into_iter().next().unwrap()
+    }
+
+    /// 新建空任务项（回车续行产出 `- [ ] `）必须立刻带复选框/项目符号，
+    /// 否则光标落在空行上时看不到"下一项"的前缀图标。
+    #[test]
+    fn empty_task_item_keeps_marker() {
+        let l = one("- [ ] ");
+        assert_eq!(l.block.task, Some(false));
+        assert!(l.block.bullet.is_some());
+        assert_eq!(l.display_text(), "");
     }
 
     #[test]
