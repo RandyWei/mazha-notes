@@ -1485,21 +1485,152 @@ impl DocView {
         cx.notify();
     }
 
-    /// 所有光标处插入制表符（Tab）。有选区则先删除选区。
+    /// Tab/Shift+Tab 动作入口：查找条/命令面板/重命名打开时沿用各自语义，
+    /// 否则在正文里缩进/反缩进（见 `insert_tab` / `outdent`）。
+    fn handle_tab_action(&mut self, outdent: bool, cx: &mut Context<Self>) {
+        if self.renaming.is_some() || self.cmd_palette.open {
+            return;
+        }
+        if self.find.open {
+            if !outdent {
+                self.find.focus_replace = !self.find.focus_replace;
+                cx.notify();
+            }
+            return;
+        }
+        if outdent {
+            self.outdent(cx);
+        } else {
+            self.insert_tab(cx);
+        }
+    }
+
+    /// Tab：无选区时在光标处插入 4 个空格；有选区时把选中的每一行整体缩进 4 格。
+    ///
+    /// 代码块与正文都适用——代码块里缩进是刚需，正文里也让 Tab 保持"插入缩进"
+    /// （Root 的默认 Tab 是焦点切换，会吞掉按键，D44）。
     fn insert_tab(&mut self, cx: &mut Context<Self>) {
-        for c in &mut self.cursors {
-            let range = c.selection().unwrap_or(c.caret..c.caret);
-            let at = range.start;
+        if self.cursors.iter().all(|c| c.selection().is_none()) {
+            for c in &mut self.cursors {
+                let at = c.caret;
+                if self
+                    .doc
+                    .apply(Edit::Replace {
+                        range: at..at,
+                        text: "    ".into(),
+                    })
+                    .is_ok()
+                {
+                    c.caret = self.doc.snap_to_boundary(at + 4);
+                    c.anchor = None;
+                    c.marked = None;
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.indent_lines(false, cx);
+    }
+
+    /// Shift+Tab：把光标所在行（或选中的每一行）去掉最多 4 个前导空格，或一个 `\t`。
+    fn outdent(&mut self, cx: &mut Context<Self>) {
+        self.indent_lines(true, cx);
+    }
+
+    /// 按行整体缩进/反缩进所有光标覆盖的行。
+    ///
+    /// 多个光标取各自行区间后合并重叠部分，再**从后往前**应用替换，保证前面的偏移
+    /// 仍然有效；光标/锚点按每行前缀的增删量重新映射（落在被删空格内的夹到行首）。
+    fn indent_lines(&mut self, outdent: bool, cx: &mut Context<Self>) {
+        let text = self.doc.text();
+        let mut blocks: Vec<Range<usize>> = Vec::new();
+        for c in &self.cursors {
+            let sel = c.selection().unwrap_or(c.caret..c.caret);
+            let start = text[..sel.start].rfind('\n').map_or(0, |i| i + 1);
+            let end = text[sel.end..]
+                .find('\n')
+                .map_or(text.len(), |i| sel.end + i);
+            blocks.push(start..end);
+        }
+        blocks.sort_by_key(|r| r.start);
+        let mut merged: Vec<Range<usize>> = Vec::new();
+        for r in blocks {
+            if let Some(last) = merged.last_mut()
+                && r.start <= last.end + 1
+            {
+                last.end = last.end.max(r.end);
+                continue;
+            }
+            merged.push(r);
+        }
+
+        for range in merged.into_iter().rev() {
+            let block = &text[range.clone()];
+            let lines: Vec<&str> = block.split('\n').collect();
+            let mut new = String::with_capacity(block.len() + lines.len() * 4);
+            // 每行被移除的前导字节数（缩进时为 0，统一用前缀增量计算新行首）
+            let mut removed: Vec<usize> = Vec::with_capacity(lines.len());
+            let mut old_starts: Vec<usize> = Vec::with_capacity(lines.len());
+            let mut off = range.start;
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    new.push('\n');
+                }
+                old_starts.push(off);
+                off += line.len() + 1;
+                if outdent {
+                    let n = if let Some(rest) = line.strip_prefix('\t') {
+                        line.len() - rest.len()
+                    } else {
+                        line.bytes().take_while(|b| *b == b' ').take(4).count()
+                    };
+                    removed.push(n);
+                    new.push_str(&line[n..]);
+                } else {
+                    removed.push(0);
+                    new.push_str("    ");
+                    new.push_str(line);
+                }
+            }
+            let delta = new.len() as isize - block.len() as isize;
             if self
                 .doc
                 .apply(Edit::Replace {
-                    range,
-                    text: "    ".into(),
+                    range: range.clone(),
+                    text: new,
                 })
-                .is_ok()
+                .is_err()
             {
-                c.caret = self.doc.snap_to_boundary(at + 4);
-                c.anchor = None;
+                continue;
+            }
+            // 每行的新行首 = 旧行首 + 之前所有行的前缀增量
+            let mut new_starts: Vec<usize> = Vec::with_capacity(lines.len());
+            let mut shift: isize = 0;
+            for (k, &ls) in old_starts.iter().enumerate() {
+                new_starts.push((ls as isize + shift) as usize);
+                shift += if outdent { -(removed[k] as isize) } else { 4 };
+            }
+            let map = |o: usize| -> usize {
+                if o >= range.end {
+                    return (o as isize + delta) as usize;
+                }
+                if o < range.start {
+                    return o;
+                }
+                let k = old_starts.iter().rposition(|&ls| ls <= o).unwrap_or(0);
+                if outdent {
+                    if o <= old_starts[k] + removed[k] {
+                        new_starts[k]
+                    } else {
+                        new_starts[k] + (o - old_starts[k] - removed[k])
+                    }
+                } else {
+                    new_starts[k] + (o - old_starts[k])
+                }
+            };
+            for c in &mut self.cursors {
+                c.caret = self.doc.snap_to_boundary(map(c.caret));
+                c.anchor = c.anchor.map(|a| self.doc.snap_to_boundary(map(a)));
                 c.marked = None;
             }
         }
@@ -2750,6 +2881,14 @@ impl Render for DocView {
                     .min_w(px(0.))
                     .child(tabbar_el)
                     .key_context("mazha-doc")
+                    .on_action(cx.listener(|view, _: &InsertTab, _window, cx| {
+                        view.handle_tab_action(false, cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_action(cx.listener(|view, _: &Outdent, _window, cx| {
+                        view.handle_tab_action(true, cx);
+                        cx.stop_propagation();
+                    }))
                     .track_focus(&focus)
                     .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                         handle_key(view, event, window, cx);
@@ -3871,6 +4010,10 @@ const BASE: Pixels = px(16.);
 /// 统一行高（正文与等宽同高，保证命中测试的行序与块序一致）。
 const LINE_HEIGHT: Pixels = px(24.);
 
+// 编辑器内的 Tab/Shift+Tab（D44）：Root 的全局 `tab` 绑定会先命中并吞掉按键，
+// 必须在 `mazha-doc` 上下文里绑定更具体的动作，否则 `on_key_down` 收不到 Tab。
+gpui_kit::actions!(mazha_doc, [InsertTab, Outdent]);
+
 impl Element for DocElement {
     /// 布局阶段无需保留状态（几何在 prepaint 里生成）。
     type RequestLayoutState = ();
@@ -4699,6 +4842,12 @@ fn main() {
 
     application().run(move |cx| {
         gpui_kit::init(cx);
+        // Tab/Shift+Tab 在编辑器内由本应用处理；Root 的全局 tab 绑定会吞掉按键
+        // （命中绑定后 gpui 不再调用 on_key_down），故必须用更具体的 key context 覆盖。
+        cx.bind_keys([
+            KeyBinding::new("tab", InsertTab, Some("mazha-doc")),
+            KeyBinding::new("shift-tab", Outdent, Some("mazha-doc")),
+        ]);
         let path = path.clone();
         gpui_kit::open_window(options, cx, move |window, cx| {
             let view = cx.new(|cx| DocView::new(path.as_ref(), cx));
