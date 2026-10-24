@@ -82,6 +82,29 @@ pub fn edit_table(source: &str, caret: usize, op: TableOp) -> Option<Edit> {
     })
 }
 
+/// 把一行 GFM 表格按**未转义**的 `|` 拆成单元格，返回每个单元格 trim 后的字节范围。
+///
+/// 行首/行尾竖线不产生单元格；行内空单元格（如 `| a |  | b |`）保留为空范围。
+/// 供 UI 做单元格 Tab 导航（与 [`split_cells`] 共用同一套边界规则）。
+pub fn table_cells(line: &str) -> Vec<Range<usize>> {
+    split_cells(line).into_iter().map(|(r, _)| r).collect()
+}
+
+/// 光标在行内的字节偏移落在第几个单元格。
+///
+/// 单元格末端仍归本格；单元格之间的竖线归右列（首竖线归首格）；越界归最后一列。
+pub fn cell_index_at(cells: &[Range<usize>], offset: usize) -> Option<usize> {
+    if cells.is_empty() {
+        return None;
+    }
+    Some(
+        cells
+            .iter()
+            .position(|r| offset <= r.end)
+            .unwrap_or(cells.len() - 1),
+    )
+}
+
 /// 数据行索引：行索引 `line_idx` 对应的数据行下标（表头/分隔行归为 0）。
 fn data_row_index(line_idx: usize) -> usize {
     line_idx.saturating_sub(2)
@@ -453,5 +476,25 @@ mod tests {
             out,
             "| a |  | b | c |\n| --- | --- | :--: | ---: |\n| 1 |  | 2 | 3 |"
         );
+    }
+    #[test]
+    fn table_cells_skip_outer_pipes_and_trim() {
+        assert_eq!(table_cells("| a | 中 b |"), vec![2..3, 6..11]);
+        assert_eq!(table_cells("a | b"), vec![0..1, 4..5]);
+        assert_eq!(
+            table_cells("|  | b |").first().cloned(),
+            Some(3..3),
+            "空单元格保留为零宽范围"
+        );
+        assert_eq!(table_cells("| a \\| b | c |").len(), 2, "转义竖线不分列");
+    }
+
+    #[test]
+    fn cell_index_falls_on_owning_cell() {
+        let cells = table_cells("| a | b |");
+        assert_eq!(cell_index_at(&cells, 1), Some(0));
+        assert_eq!(cell_index_at(&cells, 2), Some(0), "单元格末端仍属本格");
+        assert_eq!(cell_index_at(&cells, 4), Some(1));
+        assert_eq!(cell_index_at(&cells, 99), Some(1));
     }
 }

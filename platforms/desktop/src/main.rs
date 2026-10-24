@@ -43,11 +43,12 @@ use gpui_kit::component::{ActiveTheme, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use mazha_core::{
-    BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DefaultIntentMapper, DisplayPos, DocPos,
-    Document, Edit, Highlighter, InlineMark, Intent, IntentMapper, OffsetMap, ProjectedLine,
-    Projection, RunStyle, Selection, TableLine, TableOp, TextRun as DocTextRun, Workspace,
+    Align, BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DefaultIntentMapper, DisplayPos,
+    DocPos, Document, Edit, Highlighter, InlineMark, Intent, IntentMapper, OffsetMap,
+    ProjectedLine, Projection, RunStyle, Selection, TableLine, TableOp, TextRun as DocTextRun,
+    Workspace, cell_index_at,
     commands::{set_block, toggle_inline},
-    edit_table, find_all, replace_all_edit,
+    edit_table, find_all, replace_all_edit, table_cells,
 };
 use mazha_export::to_pdf;
 use mazha_md::{SpanKind, SpanRole, parse_inline};
@@ -451,6 +452,9 @@ fn reveal_inline(
     let mut out = line.clone();
     out.runs = runs;
     out.offset_map = offset_map;
+    // 展开态显示文本变化后，原表格单元格字节范围失效；表格行不走展开（见 prepaint），
+    // 这里保守清空，避免按错误范围排版。
+    out.table_cells = None;
     Some(out)
 }
 
@@ -511,6 +515,8 @@ struct BlockGeom {
     /// 围栏行投影后显示文本为空（整行都是隐藏标记），光标落上去就"看不见"。
     /// 编辑该代码块时把源码直接画出来，并令显示列与源字节 1:1 映射。
     fence_src: Option<SharedString>,
+    /// 表格行的网格几何（`None` = 非表格行，或该表放不下/含合成斜体而回退流式排版）。
+    table: Option<TableRowGeom>,
 }
 
 /// 字符列 → UTF-8 字节偏移（越界钳到末尾）。
@@ -578,6 +584,337 @@ impl BlockGeom {
         };
         self.proj.offset_map.source_to_display(src - base).get()
     }
+}
+
+/// 表格单元格左右内边距（源码里的空格不再作为唯一留白，网格模式统一加内边距）。
+const TABLE_CELL_PAD: Pixels = px(10.);
+
+/// 一张网格化表格的公共几何（所有行共享列宽与边界）。
+///
+/// `boundaries[0] = 0`，最后一项 = 表格总宽；列 i 的范围是
+/// `boundaries[i]..boundaries[i+1]`（相对表格左缘）。
+#[derive(Clone)]
+struct TableGridGeom {
+    /// 每列左/右边界（含首 0 与末尾总宽）。
+    boundaries: Vec<Pixels>,
+    /// 表格总宽。
+    width: Pixels,
+}
+
+/// 一个已排好版的单元格。
+#[derive(Clone)]
+struct TableCellGeom {
+    /// 单元格在投影显示文本内的字节范围（不含竖线/两端空格）。
+    display: Range<usize>,
+    /// 单元格首字符在整行显示文本中的字符列（供命中测试换算列号）。
+    start_col: usize,
+    /// 文本绘制 x（相对表格左缘，已含内边距）。
+    x: Pixels,
+    /// 形状化后的单元格文本（单行，不换行）。
+    shaped: Arc<ShapedLine>,
+}
+
+/// 一行表格的网格几何。
+#[derive(Clone)]
+struct TableRowGeom {
+    /// 共享列宽/边界。
+    grid: Arc<TableGridGeom>,
+    /// 本行各列单元格（缺失列用空单元格补齐）。
+    cells: Vec<TableCellGeom>,
+    /// 文本相对行顶的纵向偏移（表头行加高后垂直居中）。
+    offset_y: Pixels,
+}
+
+/// 表格行：显示列 → 最近单元格及其相对字节。
+fn table_cell_of_col<'a>(
+    row: &'a TableRowGeom,
+    line: &ProjectedLine,
+    col: usize,
+) -> Option<(&'a TableCellGeom, usize)> {
+    let byte = line.display_byte_of_col(col);
+    let mut best: Option<(&TableCellGeom, usize)> = None;
+    for cell in &row.cells {
+        let dist = if byte < cell.display.start {
+            cell.display.start - byte
+        } else {
+            byte.saturating_sub(cell.display.end)
+        };
+        let local = byte.clamp(cell.display.start, cell.display.end) - cell.display.start;
+        match best {
+            Some((_, best_dist)) if best_dist <= dist => {}
+            _ => best = Some((cell, local)),
+        }
+    }
+    best
+}
+
+/// 表格行：显示列 → 块内坐标（表头含垂直居中偏移）。
+fn table_point_of_col(
+    row: &TableRowGeom,
+    line: &ProjectedLine,
+    col: usize,
+) -> Option<Point<Pixels>> {
+    let (cell, local) = table_cell_of_col(row, line, col)?;
+    Some(point(cell.x + cell.shaped.x_for_index(local), row.offset_y))
+}
+
+/// 表格行：块内 x → 显示列。
+fn table_col_of_point(row: &TableRowGeom, x: Pixels) -> Option<usize> {
+    let idx = row
+        .grid
+        .boundaries
+        .partition_point(|&b| b <= x)
+        .saturating_sub(1)
+        .min(row.cells.len().saturating_sub(1));
+    let cell = row.cells.get(idx)?;
+    let local_x = x - cell.x;
+    let mut byte = cell.shaped.closest_index_for_x(local_x);
+    while byte > 0 && !cell.shaped.text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    let chars = cell
+        .shaped
+        .text
+        .get(..byte)
+        .map_or(0, |s| s.chars().count());
+    Some(cell.start_col + chars)
+}
+
+impl BlockGeom {
+    /// 表格行：显示列 → 块内坐标（文本基线行顶；含表头垂直居中偏移）。
+    fn table_point_of_col(&self, col: usize) -> Option<Point<Pixels>> {
+        table_point_of_col(self.table.as_ref()?, &self.proj, col)
+    }
+
+    /// 表格行：块内坐标 → 显示列。
+    ///
+    /// x 先按列边界定位列，再在单元格内做最近字节命中；落在单元格右侧内边距时
+    /// 归到该格末尾（与点击表格右半部分的行为一致）。
+    fn table_col_of_point(&self, x: Pixels) -> Option<usize> {
+        table_col_of_point(self.table.as_ref()?, x)
+    }
+
+    /// 显示列 → 块内坐标（表格走单元格排版，普通行走整行 shape）。
+    fn position_of_col(&self, col: usize) -> Option<Point<Pixels>> {
+        if self.table.is_some() {
+            self.table_point_of_col(col)
+        } else {
+            self.shaped
+                .position_for_index(self.byte_of_col(col), self.line_height)
+        }
+    }
+
+    /// 块内坐标 → 显示列（表格走单元格排版，普通行走整行 shape）。
+    fn col_of_point(&self, x: Pixels, y: Pixels) -> Option<usize> {
+        if self.table.is_some() {
+            self.table_col_of_point(x)
+        } else {
+            let byte = self
+                .shaped
+                .closest_index_for_position(point(x, y), self.line_height)
+                .unwrap_or_else(|ix| ix);
+            Some(self.col_of_byte(byte))
+        }
+    }
+}
+
+/// 从整行形状文本/样式段中切出一个单元格，保持逐段样式。
+fn slice_line_runs(
+    text: &str,
+    runs: &[gpui::TextRun],
+    range: Range<usize>,
+) -> (String, Vec<gpui::TextRun>) {
+    let end = range.end.min(text.len());
+    let start = range.start.min(end);
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for run in runs {
+        let rs = pos;
+        let re = pos + run.len;
+        pos = re;
+        let s = rs.max(start);
+        let e = re.min(end);
+        if s < e {
+            let mut r = run.clone();
+            r.len = e - s;
+            out.push(r);
+        }
+    }
+    let mut text = text.to_string();
+    text.truncate(end);
+    let text = text.split_off(start);
+    (text, out)
+}
+
+/// 表格网格测量所需的字体/主题/宽度参数（聚在一起避免函数参数过多）。
+struct TableGridCtx<'a> {
+    content_width_total: Pixels,
+    indent_base: Pixels,
+    base_font: &'a Font,
+    mono_font: &'a Font,
+    palette: &'a Palette,
+    base_size: Pixels,
+    mono_size: Pixels,
+}
+
+/// 为所有表格构建按内容列宽的网格几何；放不下（总宽超过可用宽度）的表格返回 `None`，
+/// 继续走原来的整行流式排版（不强行压缩/裁字）。
+fn build_table_grids(
+    window: &mut Window,
+    projection: &Projection,
+    ctx: &TableGridCtx<'_>,
+) -> Vec<Option<TableRowGeom>> {
+    let TableGridCtx {
+        content_width_total,
+        indent_base,
+        base_font,
+        mono_font,
+        palette,
+        base_size,
+        mono_size,
+    } = *ctx;
+    let mut out: Vec<Option<TableRowGeom>> = vec![None; projection.lines.len()];
+    for widget in projection.block_widgets() {
+        let BlockWidgetKind::Table { align } = &widget.kind else {
+            continue;
+        };
+        let indent = projection
+            .lines
+            .get(widget.line_range.start)
+            .map_or(indent_base, |l| block_indent(l, indent_base));
+        let avail = (content_width_total - indent - BASE).max(px(48.));
+
+        // 先收集各行文本/样式（每行只 build 一次），确定实际列数。
+        struct RawRow {
+            idx: usize,
+            header: bool,
+            text: String,
+            runs: Vec<gpui::TextRun>,
+            prefix: usize,
+            font_size: Pixels,
+            cells: Vec<Range<usize>>,
+        }
+        let mut raw: Vec<RawRow> = Vec::new();
+        let mut cols = align.len();
+        let mut bail = false;
+        for idx in widget.line_range.clone() {
+            // 分隔行显示为空，不参与表格内容排版
+            if idx == widget.line_range.start + 1 {
+                continue;
+            }
+            let line = &projection.lines[idx];
+            let Some(cells) = line.table_cells.clone() else {
+                continue;
+            };
+            let (text, runs, oblique) = build_line_runs(line, base_font, mono_font, palette, None);
+            // 中文合成斜体需要逐字现取轮廓，网格路径暂不支持：整表回退流式排版。
+            if !oblique.is_empty() {
+                bail = true;
+                break;
+            }
+            let prefix = text.len().saturating_sub(line.display_text().len());
+            let font_size = block_font_size(&line.block, base_size, mono_size);
+            cols = cols.max(cells.len());
+            raw.push(RawRow {
+                idx,
+                header: line.block.table_line == Some(TableLine::Header),
+                text: text.to_string(),
+                runs,
+                prefix,
+                font_size,
+                cells,
+            });
+        }
+        if bail || cols == 0 || raw.is_empty() {
+            continue;
+        }
+
+        // 形状化每个单元格并取自然宽度；列宽取该列所有行中的最大值。
+        let pad = TABLE_CELL_PAD;
+        let mut widths: Vec<Pixels> = vec![px(40.); cols];
+        struct CellRaw {
+            display: Range<usize>,
+            start_col: usize,
+            shaped: Arc<ShapedLine>,
+            natural: Pixels,
+        }
+        let mut shaped_rows: Vec<(usize, bool, Vec<CellRaw>, Pixels)> = Vec::new();
+        for row in &raw {
+            let line = &projection.lines[row.idx];
+            let mut cells_out = Vec::with_capacity(cols);
+            for (c, width) in widths.iter_mut().enumerate() {
+                let range = row.cells.get(c).cloned().unwrap_or(0..0);
+                let abs = row.prefix + range.start..row.prefix + range.end;
+                let (ctext, cruns) = slice_line_runs(&row.text, &row.runs, abs);
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(ctext.into(), row.font_size, &cruns, None);
+                let natural = shaped.width();
+                *width = (*width).max(natural + pad * 2.);
+                cells_out.push(CellRaw {
+                    display: range.clone(),
+                    start_col: line.display_col_of_byte(range.start),
+                    shaped: Arc::new(shaped),
+                    natural,
+                });
+            }
+            let line_px = block_line_px(&line.block, row.font_size)
+                + if row.header { px(12.) } else { Pixels::ZERO };
+            shaped_rows.push((row.idx, row.header, cells_out, line_px));
+        }
+        let total: Pixels = widths.iter().copied().sum();
+        if total > avail {
+            continue;
+        }
+        // 列边界与单元格 x（文本在列内左对齐；宽度已保证放得下）。
+        let mut boundaries = Vec::with_capacity(cols + 1);
+        boundaries.push(Pixels::ZERO);
+        for w in &widths {
+            let last = *boundaries.last().unwrap();
+            boundaries.push(last + *w);
+        }
+        let grid = Arc::new(TableGridGeom {
+            boundaries: boundaries.clone(),
+            width: total,
+        });
+        for (idx, header, cells, line_px) in shaped_rows {
+            let offset_y = if header {
+                ((line_px - LINE_HEIGHT) / 2.).max(Pixels::ZERO)
+            } else {
+                Pixels::ZERO
+            };
+            let cells = cells
+                .into_iter()
+                .enumerate()
+                .map(|(c, cell)| {
+                    // 列内对齐：分隔行 `:--`/`:-:`/`--:` 决定文本在可用宽度内的位置
+                    let inner = (widths[c] - pad * 2.).max(Pixels::ZERO);
+                    let align = align.get(c).copied().unwrap_or(Align::Left);
+                    let extra = (inner - cell.natural).max(Pixels::ZERO);
+                    let x = boundaries[c]
+                        + pad
+                        + match align {
+                            Align::Left => Pixels::ZERO,
+                            Align::Center => extra / 2.,
+                            Align::Right => extra,
+                        };
+                    TableCellGeom {
+                        display: cell.display,
+                        start_col: cell.start_col,
+                        x,
+                        shaped: cell.shaped,
+                    }
+                })
+                .collect();
+            out[idx] = Some(TableRowGeom {
+                grid: grid.clone(),
+                cells,
+                offset_y,
+            });
+        }
+    }
+    out
 }
 
 /// 整篇文档的布局几何：块序列 + 光标原点 + 视觉行顶边表 + 视觉行累积。
@@ -679,16 +1016,11 @@ impl DocLayout {
         // row_starts[i] <= row < row_starts[i+1] → 块 i（首元素为 0，故减一后非负）
         let block_idx = self.row_starts.partition_point(|&s| s <= row) - 1;
         let block = &self.blocks[block_idx];
-        let line_px = self.block_line_height(block_idx);
         // 块内相对 y（含所在视觉行的偏移；行内 x 需再减块缩进）
         let block_top = self.row_top(self.row_starts[block_idx]);
         let rel_x = position.x - self.origin.x - block.indent;
         let local_y = rel_y - block_top;
-        let byte = block
-            .shaped
-            .closest_index_for_position(point(rel_x, local_y), line_px)
-            .unwrap_or_else(|ix| ix);
-        Some((block_idx, block.col_of_byte(byte)))
+        Some((block_idx, block.col_of_point(rel_x, local_y)?))
     }
 }
 
@@ -747,8 +1079,7 @@ fn visual_vertical_target(
     let block = layout.blocks.get(pos.line)?;
     let line_px = layout.block_line_height(pos.line);
     // 用块几何取列：展开态（光标在链接内）显示文本更长，源列不能直接用投影列
-    let byte = block.byte_of_col(block.col_of_source(caret));
-    let p = block.shaped.position_for_index(byte, line_px)?;
+    let p = block.position_of_col(block.col_of_source(caret))?;
     // position_for_index 的 y = 视觉行号 × 行高（行顶），除以该块行高即得块内视觉行
     let cur_row = (p.y / line_px) as usize;
     let abs_x = block.indent + p.x;
@@ -768,11 +1099,7 @@ fn visual_vertical_target(
     // 目标行行高可能与当前块不同（如正文→标题），取目标块行高算行中点
     let tline_px = layout.block_line_height(block_idx);
     let local_y = tline_px * local_row as f32 + tline_px / 2.;
-    let tbyte = tblock
-        .shaped
-        .closest_index_for_position(point(local_x, local_y), tline_px)
-        .unwrap_or_else(|ix| ix);
-    let tcol = tblock.col_of_byte(tbyte);
+    let tcol = tblock.col_of_point(local_x, local_y)?;
     Some(tblock.source_of_col(tcol))
 }
 
@@ -1517,6 +1844,113 @@ impl DocView {
         cx.notify();
     }
 
+    /// 光标在表格内时，Tab/Shift+Tab 在单元格之间跳转。
+    ///
+    /// 只在单光标、无选区时接管；到达表格首/末单元格时**吞掉按键**（不退回
+    /// "插入 4 个空格"，否则会在单元格里写入看不见的空白）。返回值表示是否已处理。
+    fn table_tab(&mut self, backward: bool, cx: &mut Context<Self>) -> bool {
+        if self.cursors.len() != 1 || self.cursors[0].selection().is_some() {
+            return false;
+        }
+        let caret = self.cursors[0].caret;
+        let (line_idx, line_start, line_end, role) = {
+            let projection = self.doc.projection();
+            let line_idx = projection.line_of_source(caret);
+            let line = &projection.lines[line_idx];
+            let Some(role) = line.block.table_line else {
+                return false;
+            };
+            (
+                line_idx,
+                line.source_range.start,
+                line.source_range.end,
+                role,
+            )
+        };
+        let source = self.doc.text();
+        let line_src = source.get(line_start..line_end).unwrap_or_default();
+        let cells = table_cells(line_src);
+        let rel = caret.saturating_sub(line_start).min(line_src.len());
+        let Some(cell_idx) = cell_index_at(&cells, rel) else {
+            return false;
+        };
+        // 光标在首格之前（行首竖线/缩进）时，Tab 应进首格；在末格之后则反向进末格。
+        let before_first = cells.first().is_some_and(|r| rel < r.start);
+        let after_last = cells.last().is_some_and(|r| rel > r.end);
+        if before_first && !backward {
+            let target = line_start + cells[0].start;
+            let c = &mut self.cursors[0];
+            c.caret = self.doc.snap_to_boundary(target);
+            c.anchor = None;
+            c.marked = None;
+            cx.notify();
+            return true;
+        }
+        if after_last && backward {
+            let target = line_start + cells.last().unwrap().start;
+            let c = &mut self.cursors[0];
+            c.caret = self.doc.snap_to_boundary(target);
+            c.anchor = None;
+            c.marked = None;
+            cx.notify();
+            return true;
+        }
+
+        // 1) 同一行内还能移动
+        let same_line = if backward {
+            cell_idx.checked_sub(1).and_then(|i| cells.get(i))
+        } else {
+            cells.get(cell_idx + 1)
+        };
+        let mut target: Option<usize> = same_line.map(|r| line_start + r.start);
+
+        // 2) 跨行：跳过表格分隔行（其显示为空、无法落光标），到相邻行的首/末单元格
+        if target.is_none() && role != TableLine::Delimiter {
+            let mut i = line_idx;
+            loop {
+                if backward {
+                    if i == 0 {
+                        break;
+                    }
+                    i -= 1;
+                } else {
+                    i += 1;
+                }
+                let Some(line) = self.doc.projection().lines.get(i) else {
+                    break;
+                };
+                match line.block.table_line {
+                    None => break,
+                    Some(TableLine::Delimiter) => continue,
+                    Some(_) => {
+                        let start = line.source_range.start;
+                        let end = line.source_range.end;
+                        let src = source.get(start..end).unwrap_or_default();
+                        let cells = table_cells(src);
+                        let cell = if backward {
+                            cells.last()
+                        } else {
+                            cells.first()
+                        };
+                        target = cell.map(|r| start + r.start);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 到了表格边界：吞掉按键，避免把 Tab 当缩进写进单元格。
+        let Some(target) = target else {
+            return true;
+        };
+        let c = &mut self.cursors[0];
+        c.caret = self.doc.snap_to_boundary(target);
+        c.anchor = None;
+        c.marked = None;
+        cx.notify();
+        true
+    }
+
     /// Tab/Shift+Tab 动作入口：查找条/命令面板/重命名打开时沿用各自语义，
     /// 否则在正文里缩进/反缩进（见 `insert_tab` / `outdent`）。
     fn handle_tab_action(&mut self, outdent: bool, cx: &mut Context<Self>) {
@@ -1528,6 +1962,9 @@ impl DocView {
                 self.find.focus_replace = !self.find.focus_replace;
                 cx.notify();
             }
+            return;
+        }
+        if self.table_tab(outdent, cx) {
             return;
         }
         if outdent {
@@ -3180,17 +3617,14 @@ impl EntityInputHandler for DocView {
         let line0 = layout.block_line_height(p0.line);
         // 列一律经块几何换算（展开态显示文本更长，投影列会画偏）
         let pos0 = b0
-            .shaped
-            .position_for_index(b0.byte_of_col(b0.col_of_source(start)), line0)
+            .position_of_col(b0.col_of_source(start))
             .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
         let x0 = layout.origin.x + b0.indent + pos0.x;
         let y0 = layout.origin.y + layout.row_top(layout.row_starts[p0.line]) + pos0.y;
         let (x1, y1) = match layout.blocks.get(p1.line) {
             Some(b1) => {
-                let line1 = layout.block_line_height(p1.line);
                 let pos1 = b1
-                    .shaped
-                    .position_for_index(b1.byte_of_col(b1.col_of_source(end)), line1)
+                    .position_of_col(b1.col_of_source(end))
                     .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
                 (
                     layout.origin.x + b1.indent + pos1.x,
@@ -4128,10 +4562,20 @@ impl Element for DocElement {
                 };
                 let caret_line_src = view.doc.slice(caret_line_range.clone()).into_owned();
                 // 光标落在可展开组内（链接、粗体、斜体、删除线、行内代码）才展开
-                let caret_reveal = inline_reveals(&caret_line_src).into_iter().find(|r| {
-                    caret >= caret_line_range.start + r.range.start
-                        && caret <= caret_line_range.start + r.range.end
-                });
+                // 表格行不做行内展开：网格排版依赖投影的单元格字节范围，展开标记会让
+                // 范围失效（编辑表格时保持稳定的网格视图，D47）。
+                let caret_reveal = if view.doc.projection().lines[caret_line]
+                    .block
+                    .table_line
+                    .is_some()
+                {
+                    None
+                } else {
+                    inline_reveals(&caret_line_src).into_iter().find(|r| {
+                        caret >= caret_line_range.start + r.range.start
+                            && caret <= caret_line_range.start + r.range.end
+                    })
+                };
                 let caret_pos = view.doc.projection().source_to_doc_pos(caret);
                 // 光标在代码块内（含围栏行）时，把该块所有围栏行的源码显示出来：
                 // 围栏行投影后整行隐藏，不显示的话光标落上去"看不见"，也无法编辑 ```lang。
@@ -4271,6 +4715,20 @@ impl Element for DocElement {
                         }
                     }
                 }
+                // 表格网格：先整表测量列宽并形状化单元格（放不下则返回 None，走流式排版）
+                let table_rows = build_table_grids(
+                    window,
+                    projection,
+                    &TableGridCtx {
+                        content_width_total,
+                        indent_base,
+                        base_font: &base_font,
+                        mono_font: &mono_font,
+                        palette: &palette,
+                        base_size,
+                        mono_size,
+                    },
+                );
                 let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
                 let mut row_starts: Vec<usize> = Vec::with_capacity(projection.lines.len() + 1);
                 // 每个全局视觉行的顶边（内容坐标）：标题/代码行高放大后不能再用"行号 × 统一行高"
@@ -4321,6 +4779,8 @@ impl Element for DocElement {
                     } else {
                         None
                     };
+                    // 本行若属于网格化表格，复用预排好的单元格几何
+                    let table_row = table_rows.get(idx).cloned().flatten();
                     let (text, runs, oblique_spans) = if let Some(src) = &fence_src {
                         // 围栏源码：等宽 + 弱化色，不做语法高亮/斜体合成
                         let run = gpui::TextRun {
@@ -4373,17 +4833,28 @@ impl Element for DocElement {
                     // 逐 run 字体（粗/斜/等宽族）由 build_line_runs 决定，**不再统一覆盖**：
                     // 覆盖会把代码块的等宽族、标题的粗体都抹平，看起来就是"md 没渲染"。
                     let shaped = shape_wrapped_line(window, text, font_size, &runs, wrap_width);
-                    let rows = shaped.wrap_boundaries().len() + 1;
+                    // 网格表格每行固定单视觉行（单元格不换行；放不下的表已回退流式）
+                    let rows = if table_row.is_some() {
+                        1
+                    } else {
+                        shaped.wrap_boundaries().len() + 1
+                    };
 
-                    // 光标行（内容坐标）：position_for_index 的 y = 视觉行号 × 行高（行顶）
+                    // 光标行（内容坐标）：表格按单元格几何取 x/y，普通行按换行后的视觉行取
                     if let Some(col) = caret_col {
-                        let cbyte = if let Some(src) = &fence_src {
-                            char_col_to_byte(src, col)
+                        if let Some(row) = &table_row {
+                            if let Some(p) = table_point_of_col(row, line, col) {
+                                caret_row = Some((top_acc + p.y, line_px));
+                            }
                         } else {
-                            prefix_bytes + line.display_byte_of_col(col)
-                        };
-                        if let Some(p) = shaped.position_for_index(cbyte, line_px) {
-                            caret_row = Some((top_acc + p.y, line_px));
+                            let cbyte = if let Some(src) = &fence_src {
+                                char_col_to_byte(src, col)
+                            } else {
+                                prefix_bytes + line.display_byte_of_col(col)
+                            };
+                            if let Some(p) = shaped.position_for_index(cbyte, line_px) {
+                                caret_row = Some((top_acc + p.y, line_px));
+                            }
                         }
                     }
                     // 列表符号：任务项改画复选框（见 paint），其余 shape 成文本右对齐进标记区
@@ -4517,6 +4988,7 @@ impl Element for DocElement {
                         oblique_spans,
                         font_size,
                         fence_src,
+                        table: table_row,
                     });
                 }
                 row_starts.push(row_acc);
@@ -4662,32 +5134,80 @@ impl Element for DocElement {
                     WidgetDecorKind::Math if !w.editing => {
                         paint_rect_border(window, rect, palette.border, px(1.));
                     }
-                    // 表格：弱底 + 表头带 + 外框 + 行分隔线。
-                    // 表头带覆盖表头行与其后的窄分隔行，视觉上就是表头下内边距；
-                    // 分隔线从表体首行开始画，避免表头下出现两条线夹着一个空行。
-                    WidgetDecorKind::Table if !w.editing => {
-                        window.paint_quad(fill(rect, palette.subtle));
-                        let header_end = (w.line_range.start + 2).min(w.line_range.end);
-                        if header_end > w.line_range.start {
-                            let y0 = layout.origin.y
-                                + layout.row_top(layout.row_starts[w.line_range.start]);
-                            let y1 =
-                                layout.origin.y + layout.row_top(layout.row_starts[header_end]);
-                            window.paint_quad(fill(
-                                bounds(point(left, y0), size(right - left, y1 - y0)),
-                                Hsla {
-                                    a: 0.35,
-                                    ..palette.muted
-                                },
-                            ));
-                        }
-                        paint_rect_border(window, rect, palette.border, px(1.));
-                        for line in (w.line_range.start + 2)..w.line_range.end {
-                            let y = layout.origin.y + layout.row_top(layout.row_starts[line]);
-                            window.paint_quad(fill(
-                                bounds(point(left, y), size(right - left, px(1.))),
-                                palette.border,
-                            ));
+                    // 表格：弱底 + 表头带 + 外框 + 行列网格线。
+                    // 网格模式下即使光标在表内也保留框线（编辑时仍要看清列边界）；
+                    // 放不下而回退流式排版时，沿用旧的"编辑态隐藏装饰"行为。
+                    WidgetDecorKind::Table => {
+                        let grid = layout
+                            .blocks
+                            .get(w.line_range.start)
+                            .and_then(|b| b.table.as_ref())
+                            .map(|r| r.grid.clone());
+                        if let Some(grid) = grid {
+                            let left = layout.origin.x + w.indent;
+                            let right = left + grid.width;
+                            let rect = bounds(point(left, top), size(right - left, bottom - top));
+                            window.paint_quad(fill(rect, palette.subtle));
+                            let header_end = (w.line_range.start + 2).min(w.line_range.end);
+                            if header_end > w.line_range.start {
+                                let y0 = layout.origin.y
+                                    + layout.row_top(layout.row_starts[w.line_range.start]);
+                                let y1 =
+                                    layout.origin.y + layout.row_top(layout.row_starts[header_end]);
+                                window.paint_quad(fill(
+                                    bounds(point(left, y0), size(right - left, y1 - y0)),
+                                    Hsla {
+                                        a: 0.35,
+                                        ..palette.muted
+                                    },
+                                ));
+                            }
+                            paint_rect_border(window, rect, palette.border, px(1.));
+                            // 行分隔线（表体每行顶边）
+                            for line in (w.line_range.start + 2)..w.line_range.end {
+                                let y = layout.origin.y + layout.row_top(layout.row_starts[line]);
+                                window.paint_quad(fill(
+                                    bounds(point(left, y), size(right - left, px(1.))),
+                                    palette.border,
+                                ));
+                            }
+                            // 竖向网格线：内部列边界（外框已画首尾）
+                            for b in grid
+                                .boundaries
+                                .iter()
+                                .skip(1)
+                                .take(grid.boundaries.len() - 2)
+                            {
+                                let x = left + *b;
+                                window.paint_quad(fill(
+                                    bounds(point(x, top), size(px(1.), bottom - top)),
+                                    palette.border,
+                                ));
+                            }
+                        } else if !w.editing {
+                            window.paint_quad(fill(rect, palette.subtle));
+                            let header_end = (w.line_range.start + 2).min(w.line_range.end);
+                            if header_end > w.line_range.start {
+                                let y0 = layout.origin.y
+                                    + layout.row_top(layout.row_starts[w.line_range.start]);
+                                let y1 =
+                                    layout.origin.y + layout.row_top(layout.row_starts[header_end]);
+                                window.paint_quad(fill(
+                                    bounds(point(left, y0), size(right - left, y1 - y0)),
+                                    Hsla {
+                                        a: 0.35,
+                                        ..palette.muted
+                                    },
+                                ));
+                            }
+                            paint_rect_border(window, rect, palette.border, px(1.));
+                            for line in (w.line_range.start + 2)..w.line_range.end {
+                                let y = layout.origin.y + layout.row_top(layout.row_starts[line]);
+                                window.paint_quad(fill(
+                                    bounds(point(left, y), size(right - left, px(1.))),
+                                    palette.border,
+                                ));
+                            }
                         }
                     }
                     _ => {}
@@ -4739,33 +5259,65 @@ impl Element for DocElement {
                 let b0 = block.byte_of_col(cols.start);
                 let b1 = block.byte_of_col(cols.end);
                 if b1 > b0 {
-                    let rb = row_byte_bounds(&block.shaped);
-                    for r in 0..block.rows {
-                        let (rs, re) = (rb[r], rb[r + 1]);
-                        let (s, e) = (b0.max(rs), b1.min(re));
-                        if e <= s {
-                            continue;
+                    if let Some(row) = &block.table {
+                        // 表格单元格范围相对"显示文本"（不含引用前缀），故重算起止字节
+                        let b0 = block.proj.display_byte_of_col(cols.start);
+                        let b1 = block.proj.display_byte_of_col(cols.end);
+                        // 表格：逐单元格画高亮（竖线/内边距不参与选区）
+                        for cell in &row.cells {
+                            let s = b0.max(cell.display.start);
+                            let e = b1.min(cell.display.end);
+                            if e <= s {
+                                continue;
+                            }
+                            let x0 = if s == cell.display.start {
+                                Pixels::ZERO
+                            } else {
+                                cell.shaped.x_for_index(s - cell.display.start)
+                            };
+                            let x1 = if e == cell.display.end {
+                                cell.shaped.width()
+                            } else {
+                                cell.shaped.x_for_index(e - cell.display.start)
+                            };
+                            let width = (x1 - x0).max(Pixels::ZERO);
+                            window.paint_quad(fill(
+                                bounds(
+                                    point(text_x + cell.x + x0, row_top + row.offset_y),
+                                    size(width, LINE_HEIGHT),
+                                ),
+                                palette.selection,
+                            ));
                         }
-                        // 视觉行内 x 相对行首；行首本身 x=0（`position_for_index` 在边界字节
-                        // 会落到上一行，故行首直接取 0）
-                        let x0 = if s == rs {
-                            Pixels::ZERO
-                        } else {
-                            block
+                    } else {
+                        let rb = row_byte_bounds(&block.shaped);
+                        for r in 0..block.rows {
+                            let (rs, re) = (rb[r], rb[r + 1]);
+                            let (s, e) = (b0.max(rs), b1.min(re));
+                            if e <= s {
+                                continue;
+                            }
+                            // 视觉行内 x 相对行首；行首本身 x=0（`position_for_index` 在边界字节
+                            // 会落到上一行，故行首直接取 0）
+                            let x0 = if s == rs {
+                                Pixels::ZERO
+                            } else {
+                                block
+                                    .shaped
+                                    .position_for_index(s, line_px)
+                                    .map_or(Pixels::ZERO, |p| p.x)
+                            };
+                            let x1 = block
                                 .shaped
-                                .position_for_index(s, line_px)
-                                .map_or(Pixels::ZERO, |p| p.x)
-                        };
-                        let x1 = block
-                            .shaped
-                            .position_for_index(e, line_px)
-                            .map_or(Pixels::ZERO, |p| p.x);
-                        let width = if x1 > x0 { x1 - x0 } else { Pixels::ZERO };
-                        let y = row_top + line_px * r as f32;
-                        window.paint_quad(fill(
-                            bounds(point(text_x + x0, y), size(width, line_px)),
-                            palette.selection,
-                        ));
+                                .position_for_index(e, line_px)
+                                .map_or(Pixels::ZERO, |p| p.x);
+                            let width = if x1 > x0 { x1 - x0 } else { Pixels::ZERO };
+                            let y = row_top + line_px * r as f32;
+                            window.paint_quad(fill(
+                                bounds(point(text_x + x0, y), size(width, line_px)),
+                                palette.selection,
+                            ));
+                        }
                     }
                 }
             }
@@ -4808,15 +5360,28 @@ impl Element for DocElement {
                 let _ = chip.paint(*chip_pos, line_px, TextAlign::Left, None, window, cx);
             }
 
-            // 文本本体（`WrappedLine::paint` 内部按换行边界逐视觉行绘制）
-            let _ = block.shaped.paint(
-                point(text_x, row_top),
-                line_px,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
+            // 文本本体：网格表格逐单元格绘制，普通行由 `WrappedLine::paint` 按换行绘制
+            if let Some(row) = &block.table {
+                for cell in &row.cells {
+                    let _ = cell.shaped.paint(
+                        point(text_x + cell.x, row_top + row.offset_y),
+                        LINE_HEIGHT,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            } else {
+                let _ = block.shaped.paint(
+                    point(text_x, row_top),
+                    line_px,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
             // 合成斜体：在文本绘制后填充倾斜字形。
             // 这里现取轮廓（而非布局阶段缓存）：需要视觉行基线，而基线由 shaped 的
             // ascent/descent 决定；放在 train 里算几何会与 paint 的坐标换算重复。
@@ -4856,14 +5421,18 @@ impl Element for DocElement {
 
             // 光标竖线：仅在光标所在块绘制（用 prepaint 预计算的 caret_col 显示列）
             if let Some(col) = block.caret_col
-                && let Some(p) = block
-                    .shaped
-                    .position_for_index(block.byte_of_col(col), line_px)
+                && let Some(p) = block.position_of_col(col)
             {
                 // p.y = 光标所在视觉行在块内的顶边偏移（软换行下不再画错行）
+                // 表格单元格是单行 shape，光标高度按基准行高，避免表头行加高后光标过长
+                let caret_h = if block.table.is_some() {
+                    LINE_HEIGHT
+                } else {
+                    line_px
+                };
                 let caret_rect = bounds(
                     point(text_x + p.x, row_top + p.y + px(2.)),
-                    size(px(2.), line_px - px(4.)),
+                    size(px(2.), caret_h - px(4.)),
                 );
                 // 光标用正文前景色（对比度最高），而非主题 accent（可能偏浅看不清）
                 window.paint_quad(fill(caret_rect, palette.foreground));

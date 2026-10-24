@@ -282,6 +282,11 @@ pub struct ProjectedLine {
     pub block: BlockStyle,
     /// 带样式的可见文本片段（已隐藏语法标记）。
     pub runs: Vec<TextRun>,
+    /// 表格行的单元格显示文本范围（不含竖线，已裁掉两端空白）；非表格行为 `None`。
+    ///
+    /// 范围是**显示文本内的字节区间**，供 UI 按内容重排列宽、画竖向网格线，
+    /// 以及在单元格之间跳转；竖线本身仍保留在显示文本里（编辑时可被光标命中）。
+    pub table_cells: Option<Vec<Range<usize>>>,
     /// 内联占位（图片等）。
     pub widgets: Vec<Widget>,
     /// 显示位置 ↔ 源偏移 双向映射。
@@ -396,7 +401,7 @@ pub struct BlockStyle {
     pub code_lang: Option<String>,
     /// 是否分割线。
     pub thematic_break: bool,
-    /// 表格行的角色（表头/分隔行）；非表格行为 `None`。
+    /// 表格行的角色（表头/分隔行/表体）；非表格行为 `None`。
     pub table_line: Option<TableLine>,
 }
 
@@ -407,6 +412,8 @@ pub enum TableLine {
     Header,
     /// 分隔行（`| --- |`）：投影显示为空，UI 可将其高度并入表头内边距。
     Delimiter,
+    /// 表体数据行：UI 可据此把整张表按列网格渲染。
+    Body,
 }
 
 /// 列表项符号。
@@ -706,7 +713,7 @@ fn assign_style(block: &Block, ctx: &StyleCtx, lines: &[Line], styles: &mut [Blo
             row.table_line = match offset {
                 0 => Some(TableLine::Header),
                 1 => Some(TableLine::Delimiter),
-                _ => None,
+                _ => Some(TableLine::Body),
             };
             styles[idx] = row;
         }
@@ -771,6 +778,58 @@ fn collect_block_widgets_into(block: &Block, lines: &[Line], out: &mut Vec<Block
     }
 }
 
+/// 按竖线位置切分显示文本，返回各单元格的显示字节范围（已裁掉两端空白）。
+///
+/// `pipes` 是竖线在显示文本中的字节偏移。行首/行尾竖线带来的空段被丢弃；
+/// 行内连续竖线之间的空单元格保留（与 GFM 语义一致）。
+fn table_cell_ranges(display: &str, pipes: &[usize]) -> Vec<Range<usize>> {
+    let bytes = display.as_bytes();
+    // 单元格候选：相邻两条竖线之间的内容；首/尾竖线外侧的段单独收集。
+    let mut segs: Vec<Range<usize>> = Vec::new();
+    if let Some(&first) = pipes.first() {
+        segs.push(0..first);
+    }
+    for pair in pipes.windows(2) {
+        segs.push(pair[0] + 1..pair[1]);
+    }
+    if let Some(&last) = pipes.last()
+        && last < bytes.len()
+    {
+        segs.push(last + 1..bytes.len());
+    }
+    if pipes.is_empty() {
+        return Vec::new();
+    }
+    // 首段只有空白（有行首竖线）则丢弃；末段同理。
+    if let Some(first) = segs.first()
+        && first.start == 0
+        && display[first.clone()].trim().is_empty()
+    {
+        segs.remove(0);
+    }
+    if let Some(last) = segs.last()
+        && last.end == bytes.len()
+        && display[last.clone()].trim().is_empty()
+    {
+        segs.pop();
+    }
+    segs.into_iter()
+        .map(|r| {
+            let s = bytes[r.clone()]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .map_or(r.end, |i| r.start + i);
+            let e = bytes[r.clone()]
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(r.start, |i| r.start + i + 1);
+            // 全空白单元格与 `split_cells` 一致，折成紧贴右竖线的空范围
+            let e = e.max(s);
+            s..e
+        })
+        .collect()
+}
+
 /// 构造单行投影。
 fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) -> ProjectedLine {
     let line_range = line.start..line.end;
@@ -784,6 +843,9 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
     let mut runs: Vec<TextRun> = Vec::new();
     let mut widgets: Vec<Widget> = Vec::new();
     let mut visible: Vec<Range<usize>> = Vec::new();
+    // 表格竖线在显示文本中的字节位置（仅 TablePipe 片段；转义竖线是普通文本）
+    let mut pipes: Vec<usize> = Vec::new();
+    let mut disp_bytes = 0usize;
     let mut disp_col = 0usize;
 
     for span in spans {
@@ -795,7 +857,11 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
                 .unwrap_or_default()
                 .to_string();
             visible.push(span.range.clone());
+            if span.role == SpanRole::TablePipe {
+                pipes.push(disp_bytes);
+            }
             let chars = text.chars().count();
+            disp_bytes += text.len();
             match runs.last_mut() {
                 Some(last) if last.style == style && last.source_range.end == span.range.start => {
                     last.text.push_str(&text);
@@ -823,10 +889,17 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
     let offset_map =
         OffsetMap::from_visible_runs(source, &visible).unwrap_or_else(|_| OffsetMap::empty());
 
+    // 表格单元格：按 TablePipe 片段切分显示文本，得到各单元格的显示字节范围。
+    // 用片段角色而不是字符 `|` 判断，避免把转义竖线 `\|` 误当分隔符。
+    let table_cells = block.table_line.map(|_| {
+        let display = runs.iter().map(|r| r.text.as_str()).collect::<String>();
+        table_cell_ranges(&display, &pipes)
+    });
     ProjectedLine {
         source_range: line_range,
         block,
         runs,
+        table_cells,
         widgets,
         offset_map,
     }
@@ -1243,7 +1316,36 @@ mod tests {
         let p = build("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
         assert_eq!(p.lines[0].block.table_line, Some(TableLine::Header));
         assert_eq!(p.lines[1].block.table_line, Some(TableLine::Delimiter));
-        assert_eq!(p.lines[2].block.table_line, None);
+        assert_eq!(p.lines[2].block.table_line, Some(TableLine::Body));
+    }
+
+    /// 表格行给出单元格的显示字节范围（不含竖线与两端空格），供 UI 按列排版。
+    #[test]
+    fn table_cells_exclude_pipes_and_padding() {
+        let p = build("| a | 中 b |\n| --- | --- |\n| 1 | 2 |\n");
+        let l = &p.lines[0];
+        assert_eq!(l.display_text(), "| a | 中 b |");
+        let cells = l.table_cells.as_ref().expect("表格行应有单元格");
+        assert_eq!(cells.len(), 2);
+        let text = l.display_text();
+        assert_eq!(&text[cells[0].clone()], "a");
+        assert_eq!(&text[cells[1].clone()], "中 b");
+        // 分隔行显示为空，没有可见单元格
+        assert_eq!(p.lines[1].table_cells.as_deref(), Some(&[][..]));
+        // 表体行也带单元格
+        assert_eq!(p.lines[2].table_cells.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// 单元格内的转义竖线不应被当作分隔符。
+    #[test]
+    fn table_cells_keep_escaped_pipe() {
+        let p = build("| a \\| b | c |\n| --- | --- |\n| 1 | 2 |");
+        let l = &p.lines[0];
+        let text = l.display_text();
+        let cells = l.table_cells.clone().expect("表格行应有单元格");
+        assert_eq!(cells.len(), 2, "显示文本: {text:?}");
+        assert_eq!(&text[cells[0].clone()], "a | b");
+        assert_eq!(&text[cells[1].clone()], "c");
     }
 
     #[test]
