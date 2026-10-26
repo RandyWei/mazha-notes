@@ -775,13 +775,8 @@ fn table_arrow_step(doc: &mut Document, caret: usize, forward: bool) -> Option<u
     let display = line.display_text();
     let disp_col = line.offset_map.source_to_display(caret).get();
     let disp_byte = line.display_byte_of_col(disp_col);
-    // 显示字节 → 源字节（隐藏标记会吸附到可见文本边界，正好跳过它们）
-    let source_of = |line: &ProjectedLine, byte: usize| {
-        line.offset_map
-            .display_to_source(DisplayPos(line.display_col_of_byte(byte)))
-    };
     if let Some(target) = cell_step(&display, cells, disp_byte, forward) {
-        return Some(source_of(line, target));
+        return Some(source_of_display_byte(line, target));
     }
 
     // 本行单元格已到边界：跳到相邻表格行的首/末单元格（分隔行显示为空，跳过）
@@ -810,10 +805,50 @@ fn table_arrow_step(doc: &mut Document, caret: usize, forward: bool) -> Option<u
                 } else {
                     cells.last()?.end
                 };
-                return Some(source_of(line, target));
+                return Some(source_of_display_byte(line, target));
             }
         }
     }
+}
+
+/// 显示字节 → 源字节（隐藏标记会吸附到可见文本边界，正好跳过它们）。
+fn source_of_display_byte(line: &ProjectedLine, byte: usize) -> usize {
+    line.offset_map
+        .display_to_source(DisplayPos(line.display_col_of_byte(byte)))
+}
+
+/// 横向移动落到表格行边界时，把目标吸附到**单元格内**。
+///
+/// 普通字符移动从表格外进入时，会先落在行首（首个 `|` 之前）或行尾
+/// （末个 `|` 之后）。这两个位置在网格里都被绘制成首个/末个单元格的边界，
+/// 看起来像已经进格，但输入会落到竖线外，Markdown 会把新增文字解析成新单元格。
+/// 这里把行首吸附到首格文本起点、行尾吸附到末格文本末尾，保证第一下按键就
+/// 真正进入单元格。
+fn table_entry_snap(doc: &mut Document, target: usize) -> Option<usize> {
+    let projection = doc.projection();
+    let line = projection.lines.get(projection.line_of_source(target))?;
+    line.block.table_line?;
+    let cells = line.table_cells.as_deref()?;
+    if target <= line.source_range.start {
+        Some(source_of_display_byte(line, cells.first()?.start))
+    } else if target >= line.source_range.end {
+        Some(source_of_display_byte(line, cells.last()?.end))
+    } else {
+        None
+    }
+}
+
+/// 横向移动：表格内/进出表格都走表格规则，其余交给普通字符移动。
+fn horizontal_step(doc: &mut Document, caret: usize, forward: bool) -> usize {
+    if let Some(target) = table_arrow_step(doc, caret, forward) {
+        return target;
+    }
+    let raw = if forward {
+        doc.next_char_boundary(caret)
+    } else {
+        doc.prev_char_boundary(caret)
+    };
+    table_entry_snap(doc, raw).unwrap_or(raw)
 }
 
 /// 表格网格测量所需的字体/主题/宽度参数（聚在一起避免函数参数过多）。
@@ -1534,8 +1569,7 @@ impl DocView {
     fn move_left(&mut self, shift: bool) {
         let doc = &mut self.doc;
         for c in &mut self.cursors {
-            let target = table_arrow_step(doc, c.caret, false)
-                .unwrap_or_else(|| doc.prev_char_boundary(c.caret));
+            let target = horizontal_step(doc, c.caret, false);
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
@@ -1551,8 +1585,7 @@ impl DocView {
     fn move_right(&mut self, shift: bool) {
         let doc = &mut self.doc;
         for c in &mut self.cursors {
-            let target = table_arrow_step(doc, c.caret, true)
-                .unwrap_or_else(|| doc.next_char_boundary(c.caret));
+            let target = horizontal_step(doc, c.caret, true);
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
@@ -5572,8 +5605,8 @@ fn main() {
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
-        DisplayPos, Document, RunStyle, char_col_to_byte, inline_links, inline_reveals,
-        nearest_cell, oblique, reveal_inline, table_arrow_step,
+        DisplayPos, Document, RunStyle, char_col_to_byte, horizontal_step, inline_links,
+        inline_reveals, nearest_cell, oblique, reveal_inline, table_arrow_step, table_entry_snap,
     };
 
     /// 表格内左右方向键要跳过竖线/填充空格/分隔行，不能出现"按了没反应"。
@@ -5600,6 +5633,25 @@ mod tests {
         doc.projection();
         let blank = text.find("\n\n").expect("空行") + 1;
         assert_eq!(table_arrow_step(&mut doc, 7, true), Some(blank));
+    }
+
+    /// 从表格外横移进入表格：第一下就应落在单元格内，不能停在首/末竖线外。
+    #[test]
+    fn arrow_enters_table_inside_cells_on_first_press() {
+        let text = "para\n\n| a | b |\n| --- | --- |\n| c | d |\ntail";
+        let mut doc = Document::new(text);
+        doc.projection();
+        let header = text.find("| a").expect("表头");
+        let body = text.find("| c").expect("表体");
+        let blank = text.find("\n\n").expect("空行") + 1;
+        let tail = text.find("tail").expect("尾行");
+
+        // 空行右移：普通移动先到表头行首，吸附到首格文本起点
+        assert_eq!(table_entry_snap(&mut doc, header), Some(header + 2));
+        assert_eq!(horizontal_step(&mut doc, blank, true), header + 2);
+        // 尾行行首左移：普通移动先到表体行尾换行符，吸附到末格文本末尾
+        assert_eq!(table_entry_snap(&mut doc, tail - 1), Some(body + 7));
+        assert_eq!(horizontal_step(&mut doc, tail, false), body + 7);
     }
 
     /// 多字单元格末尾必须仍命中本格（不能因 `local` 大而误判为下一格）。
