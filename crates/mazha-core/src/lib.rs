@@ -37,7 +37,7 @@ pub use projection::{
     build_from as build_projection_from,
 };
 pub use selection::Selection;
-pub use table::{TableOp, cell_index_at, edit_table, table_cells};
+pub use table::{TableOp, cell_index_at, cell_step, edit_table, table_cells};
 pub use workspace::{Workspace, WorkspaceError, WorkspaceResult};
 
 // 复用解析层的公共类型（供 UI 消费投影，无需直接依赖 mazha-md）

@@ -90,6 +90,67 @@ pub fn table_cells(line: &str) -> Vec<Range<usize>> {
     split_cells(line).into_iter().map(|(r, _)| r).collect()
 }
 
+/// 表格行内左右移动一步：在单元格内按字符走，跨单元格时跳过竖线与两端填充空白。
+///
+/// `display` 是投影后的**显示文本**（已隐藏行内标记），`cells` 是其中的单元格显示
+/// 字节范围；`offset` 是显示文本内的字节偏移。返回新的显示字节偏移；`None` 表示已到
+/// 达本行单元格内容的左/右边界（调用方负责跨行或移出表格）。空单元格按零宽处理。
+pub fn cell_step(
+    display: &str,
+    cells: &[Range<usize>],
+    offset: usize,
+    forward: bool,
+) -> Option<usize> {
+    if cells.is_empty() {
+        return None;
+    }
+    let offset = offset.min(display.len());
+    if forward {
+        if offset < cells[0].start {
+            return Some(cells[0].start);
+        }
+        for (i, cell) in cells.iter().enumerate() {
+            if offset < cell.start {
+                return Some(cell.start);
+            }
+            if offset < cell.end {
+                // 单元格内按字符前进，但不越过单元格末尾
+                let next = display[offset..]
+                    .chars()
+                    .next()
+                    .map_or(offset, |c| offset + c.len_utf8());
+                return Some(next.min(cell.end));
+            }
+            if offset == cell.end {
+                // 单元格末尾：一步跳到下一格首字符（跳过竖线/空格）
+                return cells.get(i + 1).map(|r| r.start);
+            }
+        }
+        None
+    } else {
+        let last_end = cells.last().map_or(0, |r| r.end);
+        if offset > last_end {
+            return Some(last_end);
+        }
+        for (i, cell) in cells.iter().enumerate().rev() {
+            if offset > cell.end {
+                return Some(cell.end);
+            }
+            if offset > cell.start {
+                let prev = display[..offset]
+                    .char_indices()
+                    .next_back()
+                    .map_or(0, |(k, _)| k);
+                return Some(prev.max(cell.start));
+            }
+            if offset == cell.start {
+                return i.checked_sub(1).map(|j| cells[j].end);
+            }
+        }
+        None
+    }
+}
+
 /// 光标在行内的字节偏移落在第几个单元格。
 ///
 /// 单元格末端仍归本格；单元格之间的竖线归右列（首竖线归首格）；越界归最后一列。
@@ -487,6 +548,49 @@ mod tests {
             "空单元格保留为零宽范围"
         );
         assert_eq!(table_cells("| a \\| b | c |").len(), 2, "转义竖线不分列");
+    }
+
+    #[test]
+    fn cell_step_skips_pipes_and_padding() {
+        let line = "| a | b |";
+        let cells = table_cells(line);
+        // 前导竖线/空格 → 首格
+        assert_eq!(cell_step(line, &cells, 0, true), Some(2));
+        assert_eq!(cell_step(line, &cells, 1, true), Some(2));
+        // 格内逐字符；到末尾后一步跳到下一格首字符
+        assert_eq!(cell_step(line, &cells, 2, true), Some(3));
+        assert_eq!(cell_step(line, &cells, 3, true), Some(6));
+        assert_eq!(cell_step(line, &cells, 4, true), Some(6));
+        assert_eq!(cell_step(line, &cells, 6, true), Some(7));
+        assert_eq!(cell_step(line, &cells, 7, true), None);
+        assert_eq!(cell_step(line, &cells, 8, true), None);
+        // 反向：末尾填充 → 末格末尾；跨格跳过竖线/空格
+        assert_eq!(cell_step(line, &cells, 8, false), Some(7));
+        assert_eq!(cell_step(line, &cells, 7, false), Some(6));
+        assert_eq!(cell_step(line, &cells, 6, false), Some(3));
+        assert_eq!(cell_step(line, &cells, 4, false), Some(3));
+        assert_eq!(cell_step(line, &cells, 3, false), Some(2));
+        assert_eq!(cell_step(line, &cells, 2, false), None);
+        assert_eq!(cell_step(line, &cells, 0, false), None);
+    }
+
+    #[test]
+    fn cell_step_crosses_empty_cell() {
+        let line = "| a |  | b |";
+        let cells = table_cells(line);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1], 7..7, "空单元格是零宽范围");
+        // 从首格末尾一步跨过空单元格到 b 的首字符
+        assert_eq!(cell_step(line, &cells, 3, true), Some(cells[1].start));
+        assert_eq!(
+            cell_step(line, &cells, cells[1].start, true),
+            Some(cells[2].start)
+        );
+        assert_eq!(
+            cell_step(line, &cells, cells[2].start, false),
+            Some(cells[1].end)
+        );
+        assert_eq!(cell_step(line, &cells, cells[1].end, false), Some(3));
     }
 
     #[test]

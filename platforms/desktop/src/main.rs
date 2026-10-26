@@ -46,7 +46,7 @@ use mazha_core::{
     Align, BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DefaultIntentMapper, DisplayPos,
     DocPos, Document, Edit, Highlighter, InlineMark, Intent, IntentMapper, OffsetMap,
     ProjectedLine, Projection, RunStyle, Selection, TableLine, TableOp, TextRun as DocTextRun,
-    Workspace, cell_index_at,
+    Workspace, cell_index_at, cell_step,
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit, table_cells,
 };
@@ -744,6 +744,61 @@ fn slice_line_runs(
     text.truncate(end);
     let text = text.split_off(start);
     (text, out)
+}
+
+/// 表格行内左右方向键的目标：跳过竖线/单元格填充与行内隐藏标记，只落在可见文本上。
+///
+/// 用**显示文本**（而非源码）逐字符移动，因此 `**粗体**` 这类隐藏标记不会造成
+/// "按一次没反应"；到本行单元格边界时跨到相邻表格行（跳过分隔行），到表格边界时
+/// 移到相邻逻辑行的行首/行尾。非表格行返回 `None`，由调用方按普通字符移动。
+fn table_arrow_step(doc: &mut Document, caret: usize, forward: bool) -> Option<usize> {
+    let projection = doc.projection();
+    let idx = projection.line_of_source(caret);
+    let line = projection.lines.get(idx)?;
+    line.block.table_line?;
+    let cells = line.table_cells.as_deref()?;
+    let display = line.display_text();
+    let disp_col = line.offset_map.source_to_display(caret).get();
+    let disp_byte = line.display_byte_of_col(disp_col);
+    // 显示字节 → 源字节（隐藏标记会吸附到可见文本边界，正好跳过它们）
+    let source_of = |line: &ProjectedLine, byte: usize| {
+        line.offset_map
+            .display_to_source(DisplayPos(line.display_col_of_byte(byte)))
+    };
+    if let Some(target) = cell_step(&display, cells, disp_byte, forward) {
+        return Some(source_of(line, target));
+    }
+
+    // 本行单元格已到边界：跳到相邻表格行的首/末单元格（分隔行显示为空，跳过）
+    let mut i = idx;
+    loop {
+        if forward {
+            i += 1;
+        } else {
+            i = i.checked_sub(1)?;
+        }
+        let line = projection.lines.get(i)?;
+        match line.block.table_line {
+            // 表格边界：移到表格外相邻逻辑行的行首/行尾（没有相邻行则交给普通移动）
+            None => {
+                return Some(if forward {
+                    line.source_range.start
+                } else {
+                    line.source_range.end
+                });
+            }
+            Some(TableLine::Delimiter) => continue,
+            Some(_) => {
+                let cells = line.table_cells.as_deref()?;
+                let target = if forward {
+                    cells.first()?.start
+                } else {
+                    cells.last()?.end
+                };
+                return Some(source_of(line, target));
+            }
+        }
+    }
 }
 
 /// 表格网格测量所需的字体/主题/宽度参数（聚在一起避免函数参数过多）。
@@ -1462,9 +1517,10 @@ impl DocView {
 
     /// 所有光标左移一个字符边界。
     fn move_left(&mut self, shift: bool) {
-        let doc = &self.doc;
+        let doc = &mut self.doc;
         for c in &mut self.cursors {
-            let new_caret = doc.prev_char_boundary(c.caret);
+            let target = table_arrow_step(doc, c.caret, false)
+                .unwrap_or_else(|| doc.prev_char_boundary(c.caret));
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
@@ -1472,15 +1528,16 @@ impl DocView {
             } else {
                 c.anchor = None;
             }
-            c.caret = doc.snap_to_boundary(new_caret);
+            c.caret = doc.snap_to_boundary(target);
         }
     }
 
     /// 所有光标右移一个字符边界。
     fn move_right(&mut self, shift: bool) {
-        let doc = &self.doc;
+        let doc = &mut self.doc;
         for c in &mut self.cursors {
-            let new_caret = doc.next_char_boundary(c.caret);
+            let target = table_arrow_step(doc, c.caret, true)
+                .unwrap_or_else(|| doc.next_char_boundary(c.caret));
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
@@ -1488,7 +1545,7 @@ impl DocView {
             } else {
                 c.anchor = None;
             }
-            c.caret = doc.snap_to_boundary(new_caret);
+            c.caret = doc.snap_to_boundary(target);
         }
     }
 
@@ -5501,8 +5558,34 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
         DisplayPos, Document, RunStyle, char_col_to_byte, inline_links, inline_reveals, oblique,
-        reveal_inline,
+        reveal_inline, table_arrow_step,
     };
+
+    /// 表格内左右方向键要跳过竖线/填充空格/分隔行，不能出现"按了没反应"。
+    #[test]
+    fn table_arrows_skip_hidden_gaps_and_wrap_rows() {
+        let text = "| a | b |\n| --- | --- |\n| c | d |\n\n尾";
+        let mut doc = Document::new(text);
+        doc.projection();
+        let body = text.find("| c").expect("表体行");
+        // 表头：格内逐字符，格尾一步跳到下一格首字符
+        assert_eq!(table_arrow_step(&mut doc, 3, true), Some(6));
+        assert_eq!(table_arrow_step(&mut doc, 6, false), Some(3));
+        // 表头末格 → 跳过隐藏分隔行 → 表体首格
+        assert_eq!(table_arrow_step(&mut doc, 7, true), Some(body + 2));
+        assert_eq!(table_arrow_step(&mut doc, body + 2, false), Some(7));
+        // 表体末格 → 表格外下一逻辑行行首
+        assert_eq!(table_arrow_step(&mut doc, body + 7, true), Some(body + 10));
+        // 表格外/普通行不接管
+        assert_eq!(table_arrow_step(&mut doc, body + 10, true), None);
+
+        // 只有表头+分隔行的表：末格右移应越过分隔行，落到表格后的空行
+        let text = "| a | b |\n| --- | --- |\n\n尾";
+        let mut doc = Document::new(text);
+        doc.projection();
+        let blank = text.find("\n\n").expect("空行") + 1;
+        assert_eq!(table_arrow_step(&mut doc, 7, true), Some(blank));
+    }
 
     /// 中文斜体必须一路传到渲染层：投影要产出 `RunStyle::Emphasis`，
     /// 且 `to_gpui_runs` 要把 CJK 片段标成合成斜体（透明占位 + ObliqueSpan）。
