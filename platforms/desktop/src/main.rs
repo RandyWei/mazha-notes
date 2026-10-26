@@ -4503,6 +4503,14 @@ fn code_block_wrap_width(content_width_total: Pixels, indent: Pixels) -> Pixels 
     (content_width_total - indent - BASE - CODE_TEXT_INSET - CODE_RIGHT_INSET).max(px(48.))
 }
 
+/// 引用块单行可排版宽度：在正文宽度基础上再给右侧留出 `QUOTE_TEXT_RIGHT_INSET`。
+///
+/// 引用文字左缘 = 正文左缘 + 每层引用缩进，底色左缘只比正文左缘缩 4px，
+/// 因此长行必须在右侧收窄，否则会顶到/越过底色右缘。
+fn quote_block_wrap_width(content_width_total: Pixels, indent: Pixels) -> Pixels {
+    (content_width_total - indent - BASE - QUOTE_TEXT_RIGHT_INSET).max(px(48.))
+}
+
 /// 块在屏幕上的横向缩进（引用深度 + 列表缩进），单位为像素。
 fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
     let mut x = base;
@@ -4599,6 +4607,12 @@ const CODE_TEXT_INSET: Pixels = px(12.);
 
 /// 代码块文本距面板右缘的内边距。
 const CODE_RIGHT_INSET: Pixels = px(20.);
+
+/// 引用块底色相对正文文本列的左右内缩（避免贴住正文边界）。
+const QUOTE_BAND_INSET: Pixels = px(4.);
+
+/// 引用文字距正文右缘的留白：底色右缘再收 4px，文字再收 16px，形成 12px 内边距。
+const QUOTE_TEXT_RIGHT_INSET: Pixels = px(16.);
 /// 统一行高（正文与等宽同高，保证命中测试的行序与块序一致）。
 const LINE_HEIGHT: Pixels = px(24.);
 
@@ -4948,6 +4962,8 @@ impl Element for DocElement {
                     // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
                     let wrap_width = if line.block.code_block {
                         code_block_wrap_width(content_width_total, indent)
+                    } else if line.block.quote_depth > 0 {
+                        quote_block_wrap_width(content_width_total, indent)
                     } else {
                         (content_width_total - indent - BASE).max(px(48.))
                     };
@@ -5355,11 +5371,14 @@ impl Element for DocElement {
             // 引用块：所有层级都画左竖线和背景；仅最外层加上下内边距，
             // 避免嵌套引用之间产生多余的间隔分隔。
             if block.proj.block.quote_depth > 0 {
-                let pad_x = px(4.);
                 let is_outer = block.proj.block.quote_depth == 1;
                 let pad_y = if is_outer { px(2.) } else { px(0.) };
-                let left = layout.origin.x + pad_x;
-                let right = element_bounds.origin.x + element_bounds.size.width - pad_x;
+                // 底色只在正文文本列内留 4px 内缩：左缘 = 正文左缘 + 4px，
+                // 右缘 = 正文右缘 - 4px。旧实现相对整个元素边界，左侧会伸到
+                // 正文左缘之外、右侧顶出正文右边距。
+                let left = layout.origin.x + BASE + QUOTE_BAND_INSET;
+                let right =
+                    element_bounds.origin.x + element_bounds.size.width - BASE - QUOTE_BAND_INSET;
                 if right > left {
                     let height = line_px * block.rows as f32;
                     let band = bounds(
@@ -5624,10 +5643,28 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::px;
     use super::{
-        BASE, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document, RunStyle, char_col_to_byte,
-        code_block_wrap_width, horizontal_step, inline_links, inline_reveals, nearest_cell,
-        oblique, reveal_inline, table_arrow_step, table_entry_snap,
+        BASE, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document, QUOTE_BAND_INSET,
+        QUOTE_TEXT_RIGHT_INSET, RunStyle, char_col_to_byte, code_block_wrap_width, horizontal_step,
+        inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
+        table_arrow_step, table_entry_snap,
     };
+
+    /// 引用底色与文字都必须落在正文文本列内，左右不越界。
+    #[test]
+    fn quote_block_stays_inside_text_column() {
+        let content_width = px(800.);
+        let indent = px(32.);
+        let wrap = quote_block_wrap_width(content_width, indent);
+        let content_left = BASE;
+        let content_right = content_width - BASE;
+        let band_left = content_left + QUOTE_BAND_INSET;
+        let band_right = content_right - QUOTE_BAND_INSET;
+        let text_left = indent;
+        let text_right = text_left + wrap;
+        assert!(band_left > content_left && band_right < content_right);
+        assert!(text_left >= band_left && text_right <= band_right);
+        assert_eq!(text_right, content_right - QUOTE_TEXT_RIGHT_INSET);
+    }
 
     /// 代码块长行右缘不能越过面板右缘（面板右缘 = 正文右边距）。
     #[test]
