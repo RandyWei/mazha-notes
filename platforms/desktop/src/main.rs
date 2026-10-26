@@ -4494,6 +4494,15 @@ fn row_byte_bounds(w: &WrappedLine) -> Vec<usize> {
     v
 }
 
+/// 代码块单行可排版宽度：扣掉块缩进、页面右内边距、文本右移量和面板右内边距。
+///
+/// 代码块面板左缘在 `indent - 8px`，文本左缘在 `indent + CODE_TEXT_INSET`；
+/// 右缘固定到 `content_width - BASE`（与正文右边距一致），因此文本宽度必须
+/// 同时扣除左移和 `CODE_RIGHT_INSET`，否则长行会越过面板右缘。
+fn code_block_wrap_width(content_width_total: Pixels, indent: Pixels) -> Pixels {
+    (content_width_total - indent - BASE - CODE_TEXT_INSET - CODE_RIGHT_INSET).max(px(48.))
+}
+
 /// 块在屏幕上的横向缩进（引用深度 + 列表缩进），单位为像素。
 fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
     let mut x = base;
@@ -4584,6 +4593,12 @@ struct DocElement {
 
 /// 排版基数（正文行高 / 内边距）。
 const BASE: Pixels = px(16.);
+
+/// 代码块文本相对块缩进的右移量（同时作为面板左内边距的一部分）。
+const CODE_TEXT_INSET: Pixels = px(12.);
+
+/// 代码块文本距面板右缘的内边距。
+const CODE_RIGHT_INSET: Pixels = px(20.);
 /// 统一行高（正文与等宽同高，保证命中测试的行序与块序一致）。
 const LINE_HEIGHT: Pixels = px(24.);
 
@@ -4931,10 +4946,11 @@ impl Element for DocElement {
                     }
                     let indent = block_indent(line, indent_base);
                     // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
-                    let mut wrap_width = (content_width_total - indent - BASE).max(px(48.));
-                    if line.block.code_block {
-                        wrap_width += px(24.);
-                    }
+                    let wrap_width = if line.block.code_block {
+                        code_block_wrap_width(content_width_total, indent)
+                    } else {
+                        (content_width_total - indent - BASE).max(px(48.))
+                    };
                     // 逐 run 字体（粗/斜/等宽族）由 build_line_runs 决定，**不再统一覆盖**：
                     // 覆盖会把代码块的等宽族、标题的粗体都抹平，看起来就是"md 没渲染"。
                     let shaped = shape_wrapped_line(window, text, font_size, &runs, wrap_width);
@@ -5206,7 +5222,9 @@ impl Element for DocElement {
                 let top = layout.origin.y + layout.row_top(layout.row_starts[w.line_range.start]);
                 let bottom = layout.origin.y + layout.row_top(layout.row_starts[w.line_range.end]);
                 let left = layout.origin.x + w.indent - px(8.);
-                let right = content_right.max(left + px(24.)) + px(16.);
+                // 面板右缘与正文右边距对齐；左侧只向外扩 8px 形成描边留白，
+                // 不能再用 `+16px`，否则右侧会顶出编辑区边界。
+                let right = content_right.max(left + px(24.));
                 let rect = bounds(point(left, top), size(right - left, bottom - top));
                 match &w.kind {
                     // 分割线：在行垂直中线画一条细线（取代旧的 "─" 文本占位）
@@ -5331,7 +5349,7 @@ impl Element for DocElement {
             // 否则光标会压在左侧字符上、行末光标也停在最后一个字之前（只差 12px）。
             let mut text_x = line_x;
             if block.proj.block.code_block {
-                text_x += px(12.);
+                text_x += CODE_TEXT_INSET;
             }
 
             // 引用块：所有层级都画左竖线和背景；仅最外层加上下内边距，
@@ -5604,10 +5622,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
+    use super::px;
     use super::{
-        DisplayPos, Document, RunStyle, char_col_to_byte, horizontal_step, inline_links,
-        inline_reveals, nearest_cell, oblique, reveal_inline, table_arrow_step, table_entry_snap,
+        BASE, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document, RunStyle, char_col_to_byte,
+        code_block_wrap_width, horizontal_step, inline_links, inline_reveals, nearest_cell,
+        oblique, reveal_inline, table_arrow_step, table_entry_snap,
     };
+
+    /// 代码块长行右缘不能越过面板右缘（面板右缘 = 正文右边距）。
+    #[test]
+    fn code_block_text_stays_inside_panel() {
+        let content_width = px(800.);
+        let indent = px(24.);
+        let wrap = code_block_wrap_width(content_width, indent);
+        let panel_right = content_width - BASE;
+        let text_right = indent + CODE_TEXT_INSET + wrap;
+        assert_eq!(text_right, panel_right - CODE_RIGHT_INSET);
+        assert!(text_right <= panel_right);
+    }
 
     /// 表格内左右方向键要跳过竖线/填充空格/分隔行，不能出现"按了没反应"。
     #[test]
