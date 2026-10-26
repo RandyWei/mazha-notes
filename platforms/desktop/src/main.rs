@@ -625,6 +625,33 @@ struct TableRowGeom {
     offset_y: Pixels,
 }
 
+/// 最近的单元格：显示字节 → (单元格序号, 单元格内相对字节)。
+///
+/// 距离用「字节到区间」度量：区间内为 0，区间外为到最近边界的字节数。注意
+/// 比较的是**距离**，不能拿相对字节 `local` 当距离——多字单元格末尾的 `local`
+/// 会大于下一格的距离，导致光标在视觉上提前跳进下一格。距离相同保留靠前的
+/// 单元格（光标停在格尾时仍属于本格）。纯函数便于单测，不依赖排版几何。
+fn nearest_cell<'a>(
+    cells: impl IntoIterator<Item = &'a Range<usize>>,
+    byte: usize,
+) -> Option<(usize, usize)> {
+    // (单元格序号, 格内相对字节, 距离)；只有距离更小才替换。
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (i, cell) in cells.into_iter().enumerate() {
+        let dist = if byte < cell.start {
+            cell.start - byte
+        } else {
+            byte.saturating_sub(cell.end)
+        };
+        let local = byte.clamp(cell.start, cell.end) - cell.start;
+        match best {
+            Some((_, _, best_dist)) if best_dist <= dist => {}
+            _ => best = Some((i, local, dist)),
+        }
+    }
+    best.map(|(i, local, _)| (i, local))
+}
+
 /// 表格行：显示列 → 最近单元格及其相对字节。
 fn table_cell_of_col<'a>(
     row: &'a TableRowGeom,
@@ -632,20 +659,8 @@ fn table_cell_of_col<'a>(
     col: usize,
 ) -> Option<(&'a TableCellGeom, usize)> {
     let byte = line.display_byte_of_col(col);
-    let mut best: Option<(&TableCellGeom, usize)> = None;
-    for cell in &row.cells {
-        let dist = if byte < cell.display.start {
-            cell.display.start - byte
-        } else {
-            byte.saturating_sub(cell.display.end)
-        };
-        let local = byte.clamp(cell.display.start, cell.display.end) - cell.display.start;
-        match best {
-            Some((_, best_dist)) if best_dist <= dist => {}
-            _ => best = Some((cell, local)),
-        }
-    }
-    best
+    let (i, local) = nearest_cell(row.cells.iter().map(|c| &c.display), byte)?;
+    row.cells.get(i).map(|cell| (cell, local))
 }
 
 /// 表格行：显示列 → 块内坐标（表头含垂直居中偏移）。
@@ -5557,8 +5572,8 @@ fn main() {
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
-        DisplayPos, Document, RunStyle, char_col_to_byte, inline_links, inline_reveals, oblique,
-        reveal_inline, table_arrow_step,
+        DisplayPos, Document, RunStyle, char_col_to_byte, inline_links, inline_reveals,
+        nearest_cell, oblique, reveal_inline, table_arrow_step,
     };
 
     /// 表格内左右方向键要跳过竖线/填充空格/分隔行，不能出现"按了没反应"。
@@ -5585,6 +5600,19 @@ mod tests {
         doc.projection();
         let blank = text.find("\n\n").expect("空行") + 1;
         assert_eq!(table_arrow_step(&mut doc, 7, true), Some(blank));
+    }
+
+    /// 多字单元格末尾必须仍命中本格（不能因 `local` 大而误判为下一格）。
+    #[test]
+    fn table_hit_at_cell_end_stays_in_cell() {
+        let cells = [2..8, 11..17, 20..26];
+        assert_eq!(nearest_cell(cells.iter(), 8), Some((0, 6)));
+        assert_eq!(nearest_cell(cells.iter(), 9), Some((0, 6)));
+        assert_eq!(nearest_cell(cells.iter(), 10), Some((1, 0)));
+        assert_eq!(nearest_cell(cells.iter(), 11), Some((1, 0)));
+        // 单字单元格末尾同样属于本格
+        let narrow = [1..2, 3..4];
+        assert_eq!(nearest_cell(narrow.iter(), 2), Some((0, 1)));
     }
 
     /// 中文斜体必须一路传到渲染层：投影要产出 `RunStyle::Emphasis`，
