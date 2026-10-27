@@ -30,6 +30,7 @@
 //! `ProjectedLine::display_byte_of_col`（↔ `display_col_of_byte`）与 `WrappedLine` 的
 //! 字节索引互换（引用 "> " 前缀等额外文本以 `prefix_bytes` 计入）。
 
+use base64::Engine as _;
 use rfd::AsyncFileDialog;
 use std::cmp::Reverse;
 use std::ops::Range;
@@ -4539,15 +4540,79 @@ fn standalone_image_dest(line: &ProjectedLine) -> Option<&String> {
 
 /// 把图片地址解析为 GPUI 资源：远程 URL 直接用 `Resource::Uri`，其余走本地路径。
 ///
-/// 只接受 `http(s)://` 远程地址；`data:`/`mailto:`/协议相对 URL 返回 `None`，
-/// 继续显示占位标签。本地路径仍由 [`resolve_image_path`] 处理（相对文档目录）。
+/// `http(s)://` 原样使用；协议相对 `//host/path` 在本地编辑器没有页面协议可继承，
+/// 统一按 `https://` 处理。`data:`/`mailto:` 返回 `None`（data URI 由
+/// [`decode_data_image`] 单独解码），本地路径由 [`resolve_image_path`] 处理。
 fn image_resource(dest: &str, doc_path: Option<&Path>) -> Option<Resource> {
     let dest = dest.trim();
     let lower = dest.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Some(Resource::Uri(dest.to_string().into()));
     }
+    if dest.starts_with("//") {
+        return Some(Resource::Uri(format!("https:{dest}").into()));
+    }
     resolve_image_path(dest, doc_path).map(|path| Resource::Path(path.into()))
+}
+
+/// 解码 `data:` 图片 URI，返回 GPUI 图片格式与原始字节。
+///
+/// 支持 `data:image/png;base64,...` 与百分号编码的二进制形式；MIME 决定格式。
+/// 未知 MIME、缺失逗号、base64/百分号解码失败或空载荷都返回 `None`，回退占位。
+fn decode_data_image(uri: &str) -> Option<(ImageFormat, Vec<u8>)> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut parts = meta.split(';');
+    let format = image_format_from_mime(parts.next()?.trim())?;
+    let is_base64 = parts.any(|part| part.trim().eq_ignore_ascii_case("base64"));
+    let bytes = if is_base64 {
+        // data URI 允许换行/空白；base64 解码器本身不容忍，先剔除。
+        let compact: String = payload
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .ok()?
+    } else {
+        percent_decode_bytes(payload)
+    };
+    (!bytes.is_empty()).then_some((format, bytes))
+}
+
+/// data URI MIME → GPUI 图片格式；未知类型返回 `None`。
+fn image_format_from_mime(mime: &str) -> Option<ImageFormat> {
+    Some(match mime.to_ascii_lowercase().as_str() {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
+        "image/webp" => ImageFormat::Webp,
+        "image/gif" => ImageFormat::Gif,
+        "image/svg+xml" => ImageFormat::Svg,
+        "image/bmp" | "image/x-ms-bmp" => ImageFormat::Bmp,
+        "image/tiff" => ImageFormat::Tiff,
+        "image/x-icon" | "image/vnd.microsoft.icon" => ImageFormat::Ico,
+        "image/x-portable-anymap"
+        | "image/x-portable-bitmap"
+        | "image/x-portable-pixmap"
+        | "image/x-portable-graymap" => ImageFormat::Pnm,
+        _ => return None,
+    })
+}
+
+/// 加载图片：data URI 走 [`Image`] 的内联解码，其它地址走 GPUI 资源加载。
+fn load_image(
+    dest: &str,
+    doc_path: Option<&Path>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    if let Some((format, bytes)) = decode_data_image(dest.trim()) {
+        return Arc::new(Image::from_bytes(format, bytes)).use_render_image(window, cx);
+    }
+    let resource = image_resource(dest, doc_path)?;
+    window
+        .use_asset::<ImageAssetLoader>(&resource, cx)
+        .and_then(Result::ok)
 }
 
 /// 把图片地址解析为本地路径：相对路径以当前文档目录为基准；URL/空地址返回 `None`。
@@ -4579,6 +4644,11 @@ fn resolve_image_path(dest: &str, doc_path: Option<&Path>) -> Option<PathBuf> {
 
 /// 还原路径中的 `%XX` 转义（非法序列原样保留）。
 fn percent_decode(text: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(text)).into_owned()
+}
+
+/// 还原 `%XX` 转义并保留任意二进制字节（data URI 非 base64 分支使用）。
+fn percent_decode_bytes(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -4594,7 +4664,7 @@ fn percent_decode(text: &str) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// 单个十六进制字符值。
@@ -5074,8 +5144,7 @@ impl Element for DocElement {
                     let image_preview = if raw_src.is_none()
                         && caret_pos.line != idx
                         && let Some(dest) = standalone_image_dest(line)
-                        && let Some(resource) = image_resource(dest, doc_path.as_deref())
-                        && let Some(Ok(data)) = window.use_asset::<ImageAssetLoader>(&resource, cx)
+                        && let Some(data) = load_image(dest, doc_path.as_deref(), window, cx)
                     {
                         let natural = data.size(0);
                         let natural = size(
@@ -5828,8 +5897,8 @@ mod tests {
         inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
         table_arrow_step, table_entry_snap,
     };
-    use super::{image_resource, px, size};
-    use gpui_kit::Resource;
+    use super::{decode_data_image, image_resource, px, size};
+    use gpui_kit::{ImageFormat, Resource};
     use std::path::{Path, PathBuf};
 
     /// 引用底色与文字都必须落在正文文本列内，左右不越界。
@@ -6105,17 +6174,36 @@ mod tests {
         assert!(super::resolve_image_path("", Some(doc)).is_none());
     }
 
-    /// 远程图片走 HTTP 资源；data/协议相对地址仍交给占位标签。
+    /// 远程图片走 HTTP 资源；协议相对地址默认补 `https:`，data URI 单独解码。
     #[test]
     fn remote_image_uses_uri_resource() {
         let doc = Path::new("/tmp/notes/post.md");
-        let resource = image_resource("https://example.com/a.png", Some(doc));
         assert_eq!(
-            resource,
+            image_resource("https://example.com/a.png", Some(doc)),
+            Some(Resource::Uri("https://example.com/a.png".into()))
+        );
+        assert_eq!(
+            image_resource("//example.com/a.png", Some(doc)),
             Some(Resource::Uri("https://example.com/a.png".into()))
         );
         assert!(image_resource("data:image/png;base64,xx", Some(doc)).is_none());
-        assert!(image_resource("//example.com/a.png", Some(doc)).is_none());
+    }
+
+    /// data URI 支持 base64 与百分号编码，未知 MIME/坏 base64 回退占位。
+    #[test]
+    fn data_image_decodes_base64_and_percent() {
+        let (format, bytes) = decode_data_image("data:image/png;base64,UE5H").unwrap();
+        assert_eq!(format, ImageFormat::Png);
+        assert_eq!(bytes, b"PNG");
+
+        let (format, bytes) =
+            decode_data_image("data:image/jpeg;charset=utf-8,%89PNG%0D%0A").unwrap();
+        assert_eq!(format, ImageFormat::Jpeg);
+        assert_eq!(bytes, [0x89, b'P', b'N', b'G', b'\r', b'\n']);
+
+        assert!(decode_data_image("data:text/plain;base64,UE5H").is_none());
+        assert!(decode_data_image("data:image/png;base64,***").is_none());
+        assert!(decode_data_image("data:image/png,").is_none());
     }
 
     /// 图片适配只缩小、不放大，并保持宽高比。
