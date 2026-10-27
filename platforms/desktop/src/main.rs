@@ -34,7 +34,7 @@ use rfd::AsyncFileDialog;
 use std::cmp::Reverse;
 use std::ops::Range;
 use std::panic::Location;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::base::h_flex;
@@ -46,7 +46,7 @@ use mazha_core::{
     Align, BlockStyle, BlockTarget, BlockWidgetKind, ColoredRun, DefaultIntentMapper, DisplayPos,
     DocPos, Document, Edit, Highlighter, InlineMark, Intent, IntentMapper, OffsetMap,
     ProjectedLine, Projection, RunStyle, Selection, TableLine, TableOp, TextRun as DocTextRun,
-    Workspace, cell_index_at, cell_step,
+    WidgetKind, Workspace, cell_index_at, cell_step,
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit, table_cells,
 };
@@ -458,6 +458,15 @@ fn reveal_inline(
     Some(out)
 }
 
+/// 独占行图片的渲染态数据：已解码图像 + 适配后的逻辑尺寸。
+#[derive(Clone)]
+struct ImagePreview {
+    /// GPUI 图像缓存持有的解码结果（按路径去重，跨帧复用）。
+    data: Arc<RenderImage>,
+    /// 适配正文宽度后的显示尺寸（不放大）。
+    size: Size<Pixels>,
+}
+
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
 #[derive(Clone)]
 struct BlockGeom {
@@ -501,7 +510,8 @@ struct BlockGeom {
     check: Option<Box<ShapedLine>>,
     /// 行内图片占位小标签：`(窗口坐标 (x, y), 已 shape 文本)`。
     ///
-    /// `![alt](url)` 整段被投影隐藏，若不画占位屏幕上就是空白，故补一个可见标签。
+    /// 非独占行的 `![alt](url)` 整段被投影隐藏，若不画占位屏幕上就是空白，
+    /// 故补一个可见标签；独占行在加载失败/未加载时也用它兜底。
     image_chips: Vec<(Point<Pixels>, Box<ShapedLine>)>,
     /// 需自绘合成倾斜的中文片段（相对行文本字节区间）。
     ///
@@ -510,11 +520,13 @@ struct BlockGeom {
     oblique_spans: Vec<oblique::ObliqueSpan>,
     /// 本块字号（自绘斜体取轮廓用）。
     font_size: Pixels,
-    /// 围栏行在"编辑代码块"时的源码显示文本（含 ``` / ```lang）。
+    /// 光标进入隐藏整行时直接显示的源码（围栏行 / 独占行图片）。
     ///
-    /// 围栏行投影后显示文本为空（整行都是隐藏标记），光标落上去就"看不见"。
-    /// 编辑该代码块时把源码直接画出来，并令显示列与源字节 1:1 映射。
-    fence_src: Option<SharedString>,
+    /// 这些行投影后显示文本为空（整行都是隐藏标记），光标落上去就"看不见"。
+    /// 编辑时把源码直接画出来，并令显示列与源字节 1:1 映射。
+    raw_src: Option<SharedString>,
+    /// 图片独占行在渲染态下的真实图片（已加载并适配宽度）。
+    image: Option<ImagePreview>,
     /// 表格行的网格几何（`None` = 非表格行，或该表放不下/含合成斜体而回退流式排版）。
     table: Option<TableRowGeom>,
 }
@@ -527,7 +539,7 @@ fn char_col_to_byte(s: &str, col: usize) -> usize {
 impl BlockGeom {
     /// 显示列 → 形状化文本内的字节偏移（含前缀）。
     fn byte_of_col(&self, col: usize) -> usize {
-        if let Some(src) = &self.fence_src {
+        if let Some(src) = &self.raw_src {
             return char_col_to_byte(src, col);
         }
         self.prefix_bytes + self.proj.display_byte_of_col(col)
@@ -535,7 +547,7 @@ impl BlockGeom {
 
     /// 形状化文本内的字节偏移 → 显示列（扣除前缀，越界钳到行末）。
     fn col_of_byte(&self, byte: usize) -> usize {
-        if let Some(src) = &self.fence_src {
+        if let Some(src) = &self.raw_src {
             let byte = byte.min(src.len());
             return src.get(..byte).map_or(0, |s| s.chars().count());
         }
@@ -549,7 +561,7 @@ impl BlockGeom {
     /// 可落点，`display_to_source` 会退回 0（文档开头），导致点击或上下移动误跳文首；
     /// 这里显式落到本行起点。非空行也把结果钳进本行范围，避免跨行串位。
     fn source_of_col(&self, col: usize) -> usize {
-        if self.fence_src.is_some() {
+        if self.raw_src.is_some() {
             return (self.proj.source_range.start + self.byte_of_col(col))
                 .min(self.proj.source_range.end);
         }
@@ -571,7 +583,7 @@ impl BlockGeom {
     /// 两种状态都经 `OffsetMap::source_to_display`：展开态以行首为基准，投影态用绝对
     /// 偏移；落在隐藏标记内时吸附到标记起点（与光标规则一致）。
     fn col_of_source(&self, src: usize) -> usize {
-        if self.fence_src.is_some() {
+        if self.raw_src.is_some() {
             let rel = src.saturating_sub(self.proj.source_range.start);
             return self.col_of_byte(rel);
         }
@@ -4511,6 +4523,85 @@ fn quote_block_wrap_width(content_width_total: Pixels, indent: Pixels) -> Pixels
     (content_width_total - indent - BASE - QUOTE_TEXT_RIGHT_INSET).max(px(48.))
 }
 
+/// 独占行图片：命中唯一一个图片 Widget，且本行没有其它可见文本/表格/代码。
+fn standalone_image_dest(line: &ProjectedLine) -> Option<&String> {
+    if !line.runs.is_empty()
+        || line.widgets.len() != 1
+        || line.table_cells.is_some()
+        || line.block.code_block
+    {
+        return None;
+    }
+    match &line.widgets[0].kind {
+        WidgetKind::Image { dest, .. } => Some(dest),
+    }
+}
+
+/// 把图片地址解析为本地路径：相对路径以当前文档目录为基准；URL/空地址返回 `None`。
+///
+/// 只支持本地文件（D53）；远程图片仍显示占位标签。`file://` 前缀与 `%20` 等
+/// 百分号转义会被还原，方便直接使用浏览器/其它编辑器生成的 Markdown。
+fn resolve_image_path(dest: &str, doc_path: Option<&Path>) -> Option<PathBuf> {
+    let dest = dest.trim();
+    if dest.is_empty() {
+        return None;
+    }
+    let lower = dest.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || lower.starts_with("mailto:")
+        || dest.starts_with("//")
+    {
+        return None;
+    }
+    let raw = dest.strip_prefix("file://").unwrap_or(dest);
+    let path = PathBuf::from(percent_decode(raw));
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        doc_path.and_then(Path::parent).map(|dir| dir.join(path))
+    }
+}
+
+/// 还原路径中的 `%XX` 转义（非法序列原样保留）。
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 单个十六进制字符值。
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 图片适配：宽度不超过正文可用宽度，且**不放大**小图。
+fn fit_image_size(natural: Size<Pixels>, max_width: Pixels) -> Size<Pixels> {
+    let width = natural.width.max(px(1.));
+    let height = natural.height.max(px(1.));
+    let scale = (max_width.max(px(1.)) / width).min(1.);
+    size(width * scale, height * scale)
+}
+
 /// 块在屏幕上的横向缩进（引用深度 + 列表缩进），单位为像素。
 fn block_indent(line: &ProjectedLine, base: Pixels) -> Pixels {
     let mut x = base;
@@ -4616,6 +4707,12 @@ const QUOTE_TEXT_RIGHT_INSET: Pixels = px(16.);
 /// 统一行高（正文与等宽同高，保证命中测试的行序与块序一致）。
 const LINE_HEIGHT: Pixels = px(24.);
 
+/// 图片与上下相邻内容的呼吸间距。
+const IMAGE_VERTICAL_PAD: Pixels = px(8.);
+
+/// 图片圆角（避免直角贴住引用底色/面板）。
+const IMAGE_CORNER_RADIUS: Pixels = px(6.);
+
 // 编辑器内的 Tab/Shift+Tab（D44）：Root 的全局 `tab` 绑定会先命中并吞掉按键，
 // 必须在 `mazha-doc` 上下文里绑定更具体的动作，否则 `on_key_down` 收不到 Tab。
 gpui_kit::actions!(mazha_doc, [InsertTab, Outdent]);
@@ -4682,10 +4779,17 @@ impl Element for DocElement {
         // update 提供 &mut DocView（投影缓存需惰性建立），闭包返回几何数据避免借用越界
         let content_width_total = bounds.size.width;
         let (blocks, widgets, row_starts, row_tops, caret_row, task_cand) =
-            self.view.update(cx, |view, _| {
+            self.view.update(cx, |view, cx| {
                 // 需先取所有光标的源偏移，随后 projection() 会可变借用 view.doc（借用不相交）
                 let caret_sources: Vec<usize> = view.cursors.iter().map(|c| c.caret).collect();
                 let caret = view.cursors[view.primary].caret;
+                // 光标所在整行源码：图片/代码围栏行进入编辑态时直接展示原文。
+                // 必须在 projection() 借用 doc 之前取好，避免同时可变/不可变借用。
+                let caret_line_text = view
+                    .doc
+                    .slice(view.doc.line_range_of(caret))
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string();
                 // 光标所在行源码：用于"光标在链接内时展开该链接的原文"（SPEC §11.2 的
                 // 链接局部版本）。先借投影取行号/行区间（借用立即结束），再切出行文本，
                 // 避免为一行复制整篇文档。
@@ -4746,6 +4850,7 @@ impl Element for DocElement {
                             .then(|| (i, text.to_string()))
                     })
                     .collect();
+                let doc_path = view.path.clone();
                 let projection = view.doc.projection();
                 // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
                 let caret_lines: Vec<usize> = caret_sources
@@ -4756,7 +4861,8 @@ impl Element for DocElement {
                 let widgets: Vec<WidgetDecor> = projection
                     .block_widgets()
                     .iter()
-                    .map(|w| {
+                    // 图片不走通用装饰面板：渲染态由逐行图片预览负责，编辑态显示整行源码。
+                    .filter_map(|w| {
                         let editing = caret_lines.iter().any(|&l| w.line_range.contains(&l));
                         let indent = projection
                             .lines
@@ -4790,13 +4896,14 @@ impl Element for DocElement {
                             BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
                             BlockWidgetKind::Rule => WidgetDecorKind::Rule,
                             BlockWidgetKind::Math => WidgetDecorKind::Math,
+                            BlockWidgetKind::Image { .. } => return None,
                         };
-                        WidgetDecor {
+                        Some(WidgetDecor {
                             kind,
                             line_range: w.line_range.clone(),
                             indent,
                             editing,
-                        }
+                        })
                     })
                     .collect();
                 // 选区高亮：用核心的文档级映射把每个选区的源区间分解成"每行显示列区间"，
@@ -4887,13 +4994,17 @@ impl Element for DocElement {
                     };
                     let is_revealed = revealed_line.is_some();
                     let line = revealed_line.as_ref().unwrap_or(line);
-                    // 围栏行：光标在代码块内时显示源码（含 ```lang），并做 1:1 字节映射
-                    let fence_src: Option<SharedString> = fence_texts
+                    // 围栏行/独占图片行：光标进入时显示整行源码，并做 1:1 字节映射。
+                    let raw_src: Option<SharedString> = fence_texts
                         .iter()
                         .find(|(i, _)| *i == idx)
-                        .map(|(_, src)| src.clone().into());
+                        .map(|(_, src)| src.clone().into())
+                        .or_else(|| {
+                            (caret_pos.line == idx && standalone_image_dest(line).is_some())
+                                .then(|| caret_line_text.clone().into())
+                        });
                     // 展开态显示文本 = 整行源码（含标记），光标列按行内字节直接换算
-                    let caret_col = if let Some(src) = &fence_src {
+                    let caret_col = if let Some(src) = &raw_src {
                         if caret_pos.line == idx {
                             let rel = caret.saturating_sub(line.source_range.start).min(src.len());
                             Some(src.get(..rel).map_or(0, |t| t.chars().count()))
@@ -4915,7 +5026,7 @@ impl Element for DocElement {
                     };
                     // 本行若属于网格化表格，复用预排好的单元格几何
                     let table_row = table_rows.get(idx).cloned().flatten();
-                    let (text, runs, oblique_spans) = if let Some(src) = &fence_src {
+                    let (text, runs, oblique_spans) = if let Some(src) = &raw_src {
                         // 围栏源码：等宽 + 弱化色，不做语法高亮/斜体合成
                         let run = gpui::TextRun {
                             len: src.len(),
@@ -4937,14 +5048,40 @@ impl Element for DocElement {
                     };
                     // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
                     // 围栏源码是整行原文，没有额外前缀
-                    let prefix_bytes = if fence_src.is_some() {
+                    let prefix_bytes = if raw_src.is_some() {
                         0
                     } else {
                         text.len().saturating_sub(line.display_text().len())
                     };
                     // 逐块字号/行高：标题按级别放大，行高同步放大，避免字形压到相邻行
                     let font_size = block_font_size(&line.block, base_size, mono_size);
+                    let indent = block_indent(line, indent_base);
+                    // 图片只按正文可用宽度适配；不放大、不改宽高比（渲染态才加载）。
+                    let image_max_width = (content_width_total - indent - BASE).max(px(48.));
+                    let image_preview = if raw_src.is_none()
+                        && caret_pos.line != idx
+                        && let Some(dest) = standalone_image_dest(line)
+                        && let Some(path) = resolve_image_path(dest, doc_path.as_deref())
+                        && let Some(Ok(data)) =
+                            window.use_asset::<ImageAssetLoader>(&Resource::Path(path.into()), cx)
+                    {
+                        let natural = data.size(0);
+                        let natural = size(
+                            px(natural.width.0.max(1) as f32),
+                            px(natural.height.0.max(1) as f32),
+                        );
+                        Some(ImagePreview {
+                            data,
+                            size: fit_image_size(natural, image_max_width),
+                        })
+                    } else {
+                        None
+                    };
                     let mut line_px = block_line_px(&line.block, font_size);
+                    // 独占图片行：行高跟随图片（含上下呼吸间距），命中测试/滚动同步生效。
+                    if let Some(image) = &image_preview {
+                        line_px = image.size.height + IMAGE_VERTICAL_PAD * 2.;
+                    }
                     // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
                     // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
                     // 光标若落进分隔行则恢复正常高度，否则会出现"看不见的光标"。
@@ -4958,7 +5095,6 @@ impl Element for DocElement {
                         // 上下各多给约 6px，表头文字在行盒内垂直居中
                         line_px += px(12.);
                     }
-                    let indent = block_indent(line, indent_base);
                     // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
                     let wrap_width = if line.block.code_block {
                         code_block_wrap_width(content_width_total, indent)
@@ -4984,7 +5120,7 @@ impl Element for DocElement {
                                 caret_row = Some((top_acc + p.y, line_px));
                             }
                         } else {
-                            let cbyte = if let Some(src) = &fence_src {
+                            let cbyte = if let Some(src) = &raw_src {
                                 char_col_to_byte(src, col)
                             } else {
                                 prefix_bytes + line.display_byte_of_col(col)
@@ -5039,45 +5175,50 @@ impl Element for DocElement {
                     if line.block.task.is_some() {
                         task_cand.push((line.source_range.clone(), indent, top_acc, line_px));
                     }
-                    // 行内图片占位：`![alt](url)` 整段被投影隐藏，画个小标签补上可见性
+                    // 行内图片占位：`![alt](url)` 整段被投影隐藏，画个小标签补上可见性。
+                    // 独占行已真实渲染（或正在编辑原文）时不再叠占位标签。
                     let mut image_chips = Vec::new();
-                    for w in &line.widgets {
-                        // 展开态显示文本与源逐字节对齐；投影态用投影给的显示列
-                        let byte = prefix_bytes
-                            + if is_revealed {
-                                let rel =
-                                    w.source_range.start.saturating_sub(line.source_range.start);
-                                line.display_byte_of_col(
-                                    line.offset_map.source_to_display(rel).get(),
-                                )
-                            } else {
-                                line.display_byte_of_col(w.display_col)
+                    if raw_src.is_none() && image_preview.is_none() {
+                        for w in &line.widgets {
+                            // 展开态显示文本与源逐字节对齐；投影态用投影给的显示列
+                            let byte = prefix_bytes
+                                + if is_revealed {
+                                    let rel = w
+                                        .source_range
+                                        .start
+                                        .saturating_sub(line.source_range.start);
+                                    line.display_byte_of_col(
+                                        line.offset_map.source_to_display(rel).get(),
+                                    )
+                                } else {
+                                    line.display_byte_of_col(w.display_col)
+                                };
+                            let Some(p) = shaped.position_for_index(byte, line_px) else {
+                                continue;
                             };
-                        let Some(p) = shaped.position_for_index(byte, line_px) else {
-                            continue;
-                        };
-                        let chip_text = w.kind.placeholder();
-                        let run = gpui::TextRun {
-                            len: chip_text.len(),
-                            font: base_font.clone(),
-                            color: palette.muted,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let chip = window.text_system().shape_line(
-                            chip_text.into(),
-                            font_size,
-                            &[run],
-                            None,
-                        );
-                        image_chips.push((
-                            point(
-                                bounds.origin.x + indent + p.x,
-                                bounds.origin.y + top_acc + p.y,
-                            ),
-                            Box::new(chip),
-                        ));
+                            let chip_text = w.kind.placeholder();
+                            let run = gpui::TextRun {
+                                len: chip_text.len(),
+                                font: base_font.clone(),
+                                color: palette.muted,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let chip = window.text_system().shape_line(
+                                chip_text.into(),
+                                font_size,
+                                &[run],
+                                None,
+                            );
+                            image_chips.push((
+                                point(
+                                    bounds.origin.x + indent + p.x,
+                                    bounds.origin.y + top_acc + p.y,
+                                ),
+                                Box::new(chip),
+                            ));
+                        }
                     }
 
                     row_starts.push(row_acc);
@@ -5124,7 +5265,8 @@ impl Element for DocElement {
                         image_chips,
                         oblique_spans,
                         font_size,
-                        fence_src,
+                        raw_src,
+                        image: image_preview,
                         table: table_row,
                     });
                 }
@@ -5396,6 +5538,27 @@ impl Element for DocElement {
                 }
             }
 
+            // 独占行图片：先铺弱底（透明 PNG 也能看清边界），再绘制真实图像。
+            // 光标进入该行时 `image` 为 `None`，改为绘制整行源码（见 raw_src）。
+            if let Some(image) = &block.image {
+                let rect = bounds(point(text_x, row_top + IMAGE_VERTICAL_PAD), image.size);
+                window.paint_quad(fill(rect, palette.subtle));
+                let _ = window.paint_image(
+                    rect,
+                    rect,
+                    Corners {
+                        top_left: IMAGE_CORNER_RADIUS,
+                        top_right: IMAGE_CORNER_RADIUS,
+                        bottom_right: IMAGE_CORNER_RADIUS,
+                        bottom_left: IMAGE_CORNER_RADIUS,
+                    },
+                    image.data.clone(),
+                    0,
+                    false,
+                );
+                paint_rect_border(window, rect, palette.border, px(1.));
+            }
+
             // 选区高亮：`selection` 是本块的显示列区间；按视觉行拆成多段矩形
             if let Some(cols) = &block.selection {
                 let b0 = block.byte_of_col(cols.start);
@@ -5641,13 +5804,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
-    use super::px;
     use super::{
         BASE, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document, QUOTE_BAND_INSET,
         QUOTE_TEXT_RIGHT_INSET, RunStyle, char_col_to_byte, code_block_wrap_width, horizontal_step,
         inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
         table_arrow_step, table_entry_snap,
     };
+    use super::{px, size};
+    use std::path::{Path, PathBuf};
 
     /// 引用底色与文字都必须落在正文文本列内，左右不越界。
     #[test]
@@ -5875,5 +6039,69 @@ mod tests {
         assert_eq!(char_col_to_byte(src, 3), 3); // ``` 之后
         assert_eq!(char_col_to_byte(src, 4), 6); // 「中」占 3 字节
         assert_eq!(char_col_to_byte(src, 99), src.len());
+    }
+
+    /// 独占行图片才进入真实渲染；混排图片仍是行内占位。
+    #[test]
+    fn standalone_image_line_detection() {
+        let p = mazha_core::build_projection("![图](assets/a.png)");
+        assert_eq!(
+            super::standalone_image_dest(&p.lines[0]).map(String::as_str),
+            Some("assets/a.png")
+        );
+
+        let p = mazha_core::build_projection("前 ![图](assets/a.png) 后");
+        assert!(super::standalone_image_dest(&p.lines[0]).is_none());
+
+        let p = mazha_core::build_projection("![一](a.png) ![二](b.png)");
+        assert!(super::standalone_image_dest(&p.lines[0]).is_none());
+    }
+
+    /// 相对图片路径以文档目录为基准；远程/空地址不进入本地加载。
+    #[test]
+    fn image_path_resolution() {
+        let doc = Path::new("/tmp/notes/post.md");
+        assert_eq!(
+            super::resolve_image_path("assets/a.png", Some(doc)),
+            Some(PathBuf::from("/tmp/notes/assets/a.png"))
+        );
+        assert_eq!(
+            super::resolve_image_path("assets/my photo.png", Some(doc)),
+            Some(PathBuf::from("/tmp/notes/assets/my photo.png"))
+        );
+        assert_eq!(
+            super::resolve_image_path("assets/my%20photo.png", Some(doc)),
+            Some(PathBuf::from("/tmp/notes/assets/my photo.png"))
+        );
+        assert_eq!(
+            super::resolve_image_path("file:///tmp/pic.png", Some(doc)),
+            Some(PathBuf::from("/tmp/pic.png"))
+        );
+        assert_eq!(
+            super::resolve_image_path("/tmp/pic.png", None),
+            Some(PathBuf::from("/tmp/pic.png"))
+        );
+        assert!(super::resolve_image_path("https://example.com/a.png", Some(doc)).is_none());
+        assert!(super::resolve_image_path("data:image/png;base64,xx", Some(doc)).is_none());
+        assert!(super::resolve_image_path("", Some(doc)).is_none());
+    }
+
+    /// 图片适配只缩小、不放大，并保持宽高比。
+    #[test]
+    fn image_fit_size_never_upscales() {
+        let natural = size(gpui_kit::px(400.), gpui_kit::px(200.));
+        let fitted = super::fit_image_size(natural, gpui_kit::px(800.));
+        assert_eq!(fitted, natural);
+
+        let fitted = super::fit_image_size(natural, gpui_kit::px(200.));
+        assert_eq!(fitted, size(gpui_kit::px(200.), gpui_kit::px(100.)));
+    }
+
+    /// 百分号转义只还原合法 `%XX`，非法序列保持原样。
+    #[test]
+    fn percent_decode_handles_invalid_sequences() {
+        assert_eq!(super::percent_decode("a%20b"), "a b");
+        assert_eq!(super::percent_decode("100%"), "100%");
+        assert_eq!(super::percent_decode("%ZZ"), "%ZZ");
     }
 }

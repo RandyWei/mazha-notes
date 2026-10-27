@@ -103,7 +103,7 @@ impl Projection {
         out.extend(self.lines[last + 1..].iter().map(|l| l.shifted(delta)));
         self.lines = out;
         // 块级 widget 分组依赖块森林，直接由新块森林全量重算（O(块数)，代价低）。
-        self.widgets = collect_block_widgets(blocks, &all);
+        self.widgets = collect_block_widgets(source, blocks, &all);
     }
 
     /// 全部块级 widget（按源序）。
@@ -492,6 +492,8 @@ pub enum WidgetKind {
     Image {
         /// 替代文本。
         alt: String,
+        /// 图片地址（源文本中的原样目标；可为相对路径/绝对路径/URL）。
+        dest: String,
     },
 }
 
@@ -499,7 +501,13 @@ impl WidgetKind {
     /// 占位的最小显示文本（用于纯文本场景占宽）。
     pub fn placeholder(&self) -> String {
         match self {
-            WidgetKind::Image { alt } => format!("[图片: {alt}]"),
+            WidgetKind::Image { alt, .. } => {
+                if alt.is_empty() {
+                    "[图片]".to_string()
+                } else {
+                    format!("[图片: {alt}]")
+                }
+            }
         }
     }
 }
@@ -542,6 +550,13 @@ pub enum BlockWidgetKind {
         /// 图表语言标识（如 `mermaid`）。
         lang: String,
     },
+    /// 独占一行的图片（`![alt](dest)`，D53）：渲染层按块级图片绘制。
+    Image {
+        /// 替代文本。
+        alt: String,
+        /// 图片地址（原样目标）。
+        dest: String,
+    },
 }
 
 /// 由源文本构造整篇投影。
@@ -575,7 +590,7 @@ pub fn build_from(source: &str, blocks: &[Block]) -> Projection {
         .enumerate()
         .map(|(i, line)| build_line(source, line, styles[i].clone(), &spans))
         .collect();
-    let widgets = collect_block_widgets(blocks, &lines);
+    let widgets = collect_block_widgets(source, blocks, &lines);
 
     Projection {
         lines: projected,
@@ -737,17 +752,26 @@ fn collect_spans(block: &Block, out: &mut Vec<SyntaxSpan>) {
 /// 只处理叶子块；容器块（引用/列表/提示块）透传，故嵌套在列表项/引用内的代码块/表格
 /// 也会各自产出一个 widget（其 `line_range` 覆盖各自的逻辑行）。块的 `line_range`
 /// 由覆盖的逻辑行推导（首行..末行+1）。
-fn collect_block_widgets(blocks: &[Block], lines: &[Line]) -> Vec<BlockWidget> {
+fn collect_block_widgets(source: &str, blocks: &[Block], lines: &[Line]) -> Vec<BlockWidget> {
     let mut out = Vec::new();
     for b in blocks {
-        collect_block_widgets_into(b, lines, &mut out);
+        collect_block_widgets_into(source, b, lines, &mut out);
     }
     out.sort_by_key(|w| w.source_range.start);
     out
 }
 
-fn collect_block_widgets_into(block: &Block, lines: &[Line], out: &mut Vec<BlockWidget>) {
+fn collect_block_widgets_into(
+    source: &str,
+    block: &Block,
+    lines: &[Line],
+    out: &mut Vec<BlockWidget>,
+) {
     let kind = match &block.kind {
+        // 图片只有独占整行时才升级为块级 widget；混排图片仍是行内占位。
+        BlockKind::Paragraph => {
+            standalone_image(source, block).map(|(alt, dest)| BlockWidgetKind::Image { alt, dest })
+        }
         // mermaid 围栏块归类为图表 widget（D34 ③：解析器不特判，归类放在投影层）
         BlockKind::CodeBlock {
             lang: Some(lang), ..
@@ -774,8 +798,40 @@ fn collect_block_widgets_into(block: &Block, lines: &[Line], out: &mut Vec<Block
         }
     }
     for c in &block.children {
-        collect_block_widgets_into(c, lines, out);
+        collect_block_widgets_into(source, c, lines, out);
     }
+}
+
+/// 若段落整块恰好是一条图片语法（且只有一行），返回 `(alt, dest)`。
+///
+/// 支持 `![alt](dest)` 与 `![alt](<带 空格 的路径> "title")`；前后空白忽略。
+/// 段落含换行/其它文本/多个图片时返回 `None`，仍按行内占位处理。
+fn standalone_image(source: &str, block: &Block) -> Option<(String, String)> {
+    let text = source.get(block.range.clone())?.trim();
+    if text.contains('\n') || text.contains('\r') {
+        return None;
+    }
+    parse_image_source(text)
+}
+
+/// 解析单条图片语法的 `(alt, dest)`。
+///
+/// 只做投影层所需的最小解析：`alt` 取 `![` 与 `](` 之间，`dest` 取括号内的
+/// 第一个空白分隔项；`<...>` 包裹时允许路径含空格。title 被忽略。
+fn parse_image_source(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("![")?;
+    let close = rest.find("](")?;
+    let alt = &rest[..close];
+    let target = rest[close + 2..].strip_suffix(')')?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let dest = if let Some(inner) = target.strip_prefix('<') {
+        inner.split_once('>')?.0
+    } else {
+        target.split_whitespace().next()?
+    };
+    Some((alt.to_string(), dest.to_string()))
 }
 
 /// 按竖线位置切分显示文本，返回各单元格的显示字节范围（已裁掉两端空白）。
@@ -908,13 +964,14 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
 /// 从被隐藏的 Widget 源范围里提取占位信息。
 fn extract_widget(source: &str, range: &Range<usize>) -> WidgetKind {
     let s = source.get(range.clone()).unwrap_or_default();
-    if let Some(rest) = s.strip_prefix("![") {
-        let alt = rest.find(']').map_or("", |i| &rest[..i]);
-        WidgetKind::Image {
-            alt: alt.to_string(),
-        }
+    if let Some((alt, dest)) = parse_image_source(s) {
+        WidgetKind::Image { alt, dest }
     } else {
-        WidgetKind::Image { alt: String::new() }
+        // 防御：解析器把未知隐藏片段也标成 Widget 时的兜底。
+        WidgetKind::Image {
+            alt: String::new(),
+            dest: String::new(),
+        }
     }
 }
 
@@ -1041,7 +1098,8 @@ mod tests {
         assert_eq!(
             l.widgets[0].kind,
             WidgetKind::Image {
-                alt: "alt".to_string()
+                alt: "alt".to_string(),
+                dest: "x.png".to_string()
             }
         );
         assert_eq!(l.offset_map.display_len(), 0);
@@ -1402,11 +1460,36 @@ mod tests {
     }
 
     #[test]
-    fn inline_image_does_not_make_block_widget() {
-        // 图片是**内联**占位（ProjectedLine.widgets），不产生块级 widget
+    fn standalone_image_makes_block_widget() {
+        // 独占整行时图片是块级 widget，渲染层可整体绘制；行内仍保留内联占位
         let p = build("![alt](x.png)");
+        assert_eq!(
+            p.block_widgets()[0].kind,
+            BlockWidgetKind::Image {
+                alt: "alt".to_string(),
+                dest: "x.png".to_string()
+            }
+        );
+        assert_eq!(p.lines[0].widgets.len(), 1);
+    }
+
+    #[test]
+    fn image_with_surrounding_text_stays_inline() {
+        let p = build("前 ![alt](x.png) 后");
         assert!(p.block_widgets().is_empty());
         assert_eq!(p.lines[0].widgets.len(), 1);
+    }
+
+    #[test]
+    fn image_with_space_path_keeps_full_dest() {
+        let p = build("![图](<assets/my photo.png> \"标题\")");
+        assert_eq!(
+            p.block_widgets()[0].kind,
+            BlockWidgetKind::Image {
+                alt: "图".to_string(),
+                dest: "assets/my photo.png".to_string()
+            }
+        );
     }
 
     #[test]

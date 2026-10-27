@@ -3,10 +3,10 @@
 > 每次提交代码时**同步更新本文件**（约定，见 `AGENTS.md`）。
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
-- 最近更新：2026-10-24
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 主体已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
+- 最近更新：2026-10-27
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地真实渲染）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.73**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.74**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -26,7 +26,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 状态 | 能力面（要点） | 待办 |
 |-------|------|----------------|------|
-| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/块缓存+投影缓存**双增量**维护/`apply_and_sync`）、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget`/`RunStyle` + **块级 widget** `BlockWidget{source_range,line_range,kind}`、`BlockWidgetKind::{Code{lang,fenced},Table{align},Rule,Math,Chart{lang}}` + `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标**（`DocPos`/`LineDisplayRange`/`source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`selection_display_ranges`）、显示列↔字节换算（软换行用）、`commands`、`IntentMapper`、`table::edit_table`、`highlight::Highlighter`（syntect）、`find::{find_all,replace_all,replace_all_edit}`、导航（行范围/CJK 词范围）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接 | `DocId` |
+| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/块缓存+投影缓存**双增量**维护/`apply_and_sync`）、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`Widget`/`RunStyle` + **块级 widget** `BlockWidget{source_range,line_range,kind}`、`BlockWidgetKind::{Code{lang,fenced},Table{align},Rule,Math,Chart{lang},Image{alt,dest}}` + `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标**（`DocPos`/`LineDisplayRange`/`source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`selection_display_ranges`）、显示列↔字节换算（软换行用）、`commands`、`IntentMapper`、`table::edit_table`、`highlight::Highlighter`（syntect）、`find::{find_all,replace_all,replace_all_edit}`、导航（行范围/CJK 词范围）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接 | `DocId` |
 | `mazha-md` | ✅ Phase 1 完成（方言全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏/缩进代码、引用、列表/任务、GFM 表格、Callout、Front-matter、**`$$…$$` 显示公式**、**`[^label]: body` 脚注定义**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/wiki-link/tags/`$…$` 行内公式/**`[^label]` 脚注引用**/转义）、`serialize_source`/`to_md`（前缀穿线，逐字节往返 + 幂等）、`reparse`（脏块增量 + 裁切点安全校验） | HTML 块、惰性续行、多段落脚注（见 SPEC §9.1/§15） |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text`，字符↔字节）、insert/delete/replace/push、状态向量 + 增量更新（Yjs v1）、`apply_update`、`fork`、`snapshot`、并发收敛、落盘（`save_crdt`/`load_crdt`） | 多文档名册 |
@@ -39,7 +39,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现（要点） | 待办 |
 |------|------|----------------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **行内格式局部展开**（光标在链接/粗体/斜体/删除线/行内代码内时**该组**显示原文，`inline_reveals`/`reveal_inline`，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底（各层引用都铺底 + 左侧竖线，仅最外层加上下 padding；底色限制在正文列内，D52）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板**浅底+语言标签**、表格网格、分割线、**公式描边、图表弱底+标签**）；**中文斜体渲染器级合成倾斜**（macOS 中文字体无斜体字面、CoreText 也不为 CJK 合成，故 `oblique.rs` 取 CT 字形轮廓做 12° 剪切自绘，CJK 段以透明 run 占位保留排版；D43）；**行内代码可见底色**（`code_bg` = 前景 alpha 0.08，经 `TextRun.background_color` 逐视觉行绘制）；**代码块浅底 + 左右 padding**（`code_block_bg`，缩进 +1.5em、文本 +12px、面板右缘与正文右边距对齐，D51）；**Tab/Shift+Tab 缩进/反缩进**（D44：覆盖 Root 的焦点切换绑定，行选区整体缩进，多光标重映射）；**列表/任务回车续行**（D45：走核心 `IntentMapper`，新项图标即时显示，空项再回车退出列表，嵌套保留缩进，引用内列表也续行；修复空 `ListItem` 无样式导致图标不显示）；**Typora 式就地显源码**（光标进入围栏代码块 → 围栏行就地显出 ``` / ```lang，`BlockGeom::fence_src` 走 1:1 字符↔字节映射，移开复原）；表格增删行列 + **表格观感**（表头加粗/底色、分隔行收起、单元格留白，D46）+ **按内容列宽/竖向网格线/列对齐 + 单元格 Tab 导航**（D47）+ **表格内左右方向键跳过隐藏标记/竖线/填充**（D48）+ **表格光标视觉命中按最近格距离选择**（D49）+ **从表格外横移第一下即进入单元格**（D50）；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，侧栏标题列表+点击跳转，Cmd+Shift+O）** | 文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **行内格式局部展开**（光标在链接/粗体/斜体/删除线/行内代码内时**该组**显示原文，`inline_reveals`/`reveal_inline`，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底（各层引用都铺底 + 左侧竖线，仅最外层加上下 padding；底色限制在正文列内，D52）；自写 `Element`（连续布局 + 视觉行表 `row_starts`）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板**浅底+语言标签**、表格网格、分割线、**公式描边、图表弱底+标签**）；**中文斜体渲染器级合成倾斜**（macOS 中文字体无斜体字面、CoreText 也不为 CJK 合成，故 `oblique.rs` 取 CT 字形轮廓做 12° 剪切自绘，CJK 段以透明 run 占位保留排版；D43）；**行内代码可见底色**（`code_bg` = 前景 alpha 0.08，经 `TextRun.background_color` 逐视觉行绘制）；**代码块浅底 + 左右 padding**（`code_block_bg`，缩进 +1.5em、文本 +12px、面板右缘与正文右边距对齐，D51）；**Tab/Shift+Tab 缩进/反缩进**（D44：覆盖 Root 的焦点切换绑定，行选区整体缩进，多光标重映射）；**列表/任务回车续行**（D45：走核心 `IntentMapper`，新项图标即时显示，空项再回车退出列表，嵌套保留缩进，引用内列表也续行；修复空 `ListItem` 无样式导致图标不显示）；**Typora 式就地显源码**（光标进入围栏代码块/独占图片行 → 整行就地显出原文，`BlockGeom::raw_src` 走 1:1 字符↔字节映射，移开复原）；**图片本地真实渲染**（D53：核心保留 `dest`，独占行产出 `BlockWidgetKind::Image`；桌面按文档目录解析本地路径，GPUI `ImageAssetLoader` 异步加载缓存，按正文宽等比缩放且不放大小图，行高随图片；光标进入显示 `![alt](dest)`，远程/缺失/行内图片仍占位）；表格增删行列 + **表格观感**（表头加粗/底色、分隔行收起、单元格留白，D46）+ **按内容列宽/竖向网格线/列对齐 + 单元格 Tab 导航**（D47）+ **表格内左右方向键跳过隐藏标记/竖线/填充**（D48）+ **表格光标视觉命中按最近格距离选择**（D49）+ **从表格外横移第一下即进入单元格**（D50）；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、文件树侧栏（新建/重命名 ✎/删除 ✕/移动）、脏状态 `*`；多标签页（D37，Cmd+T/W/Shift+W/1..9/0）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，侧栏标题列表+点击跳转，Cmd+Shift+O）** | 文档内搜索、主题与专注模式（Phase 4 余项）；文件树目录层级/移动拖拽
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6 / 8 / 7 |
 
 > 桌面端入口：`cargo run -- [path/to/file.md]`。渲染效果可可视化验证：`swift` 查窗口号（CGWindowListCopyWindowInfo）→ `screencapture -x -o -l<窗口号>` 截图 → PIL 逐像素核对底色/字形（本机屏幕录制权限已可用）。交互可用 `CGEvent.postToPid` 合成按键（无需 `osascript` 置前；置前脚本偶发 -1719，重试即可），已验证 Tab/Shift+Tab/回车等链路。
@@ -48,12 +48,12 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 数量 |
 |-------|------|
-| `mazha-core` | 196 |
+| `mazha-core` | 198 |
 | `mazha-md` | 149 |
 | `mazha-export` | 121 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
-| 合计 | **495**（其余为占位 crate 的版本号冒烟测试） |
-| `platforms/desktop`（独立 workspace） | 18（不计入上面的 495） |
+| 合计 | **497**（其余为占位 crate 的版本号冒烟测试） |
+| `platforms/desktop`（独立 workspace） | 22（不计入上面的 497） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -69,6 +69,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - **D33**：软换行放 **UI 层**（gpui `shape_text` + 视觉行），核心保持无 GUI；显示列↔字节换算下沉核心可单测。
 - **D34**：公式/图表「解析在 `mazha-md`、归类在 `mazha-core`、真排版留渲染层」——`$$…$$`→`MathBlock`/`BlockWidgetKind::Math`，`$…$`→`SpanRole::Math`+`RunStyle::Math`，` ```mermaid `→`Chart{lang}`；导出按字面量（Typst **不**进 `$…$`，R8）。
 - **D35**：脚注「解析在 `mazha-md`、样式/导出按可见文本、真渲染留渲染层」——行内 `[^label]`（`FootnoteMarker` 隐藏 + `FootnoteRef` 可见）、块级 `[^label]: body`→`BlockKind::FootnoteDef`；续行缩进 ≥4 且恰好剥 4 空格；`RunStyle::Footnote`（不加 `BlockWidgetKind`）；HTML `sup.fnref`/`div.footnote`、Typst `#super[…]`（**不**用 `#footnote`）、DOCX 纯文本；跳转/编号/文末归集留后续。
+- **D53**：图片**本地真实渲染**——核心保留 `dest`、独占行产出 `BlockWidgetKind::Image`；桌面用 GPUI `ImageAssetLoader` 按文档目录加载本地文件，等比缩宽不放大、光标进入显示原文；远程/缺失/行内图片仍占位。
 - **R8**（PDF 真实文档回归）/ **R10**（`platforms/*` 独立 workspace，须单独门禁 + 同步独立 `Cargo.lock`）：见 SPEC §13。
 
 ## 依赖方向（不可违反）
@@ -97,7 +98,8 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 100 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：fix(desktop): 引用块左右越界（0.1.73）>
+<本次提交：feat(desktop): 本地图片真实渲染（0.1.74，D53）>
+8417ea6 fix(desktop): 引用块左右越界（0.1.73）
 c25637e fix(desktop): 代码块右侧越界（0.1.72）
 c09a6ac fix(desktop): 表格外横移第一下落入单元格（0.1.71）
 64105e2 fix(desktop): 表格光标格尾视觉提前跳格（0.1.70）
