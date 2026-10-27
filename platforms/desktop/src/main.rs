@@ -4537,10 +4537,23 @@ fn standalone_image_dest(line: &ProjectedLine) -> Option<&String> {
     }
 }
 
+/// 把图片地址解析为 GPUI 资源：远程 URL 直接用 `Resource::Uri`，其余走本地路径。
+///
+/// 只接受 `http(s)://` 远程地址；`data:`/`mailto:`/协议相对 URL 返回 `None`，
+/// 继续显示占位标签。本地路径仍由 [`resolve_image_path`] 处理（相对文档目录）。
+fn image_resource(dest: &str, doc_path: Option<&Path>) -> Option<Resource> {
+    let dest = dest.trim();
+    let lower = dest.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(Resource::Uri(dest.to_string().into()));
+    }
+    resolve_image_path(dest, doc_path).map(|path| Resource::Path(path.into()))
+}
+
 /// 把图片地址解析为本地路径：相对路径以当前文档目录为基准；URL/空地址返回 `None`。
 ///
-/// 只支持本地文件（D53）；远程图片仍显示占位标签。`file://` 前缀与 `%20` 等
-/// 百分号转义会被还原，方便直接使用浏览器/其它编辑器生成的 Markdown。
+/// 本地文件支持绝对路径、`file://` 前缀与 `%20` 等百分号转义，方便直接使用
+/// 浏览器/其它编辑器生成的 Markdown。远程图片由 [`image_resource`] 单独处理。
 fn resolve_image_path(dest: &str, doc_path: Option<&Path>) -> Option<PathBuf> {
     let dest = dest.trim();
     if dest.is_empty() {
@@ -5061,9 +5074,8 @@ impl Element for DocElement {
                     let image_preview = if raw_src.is_none()
                         && caret_pos.line != idx
                         && let Some(dest) = standalone_image_dest(line)
-                        && let Some(path) = resolve_image_path(dest, doc_path.as_deref())
-                        && let Some(Ok(data)) =
-                            window.use_asset::<ImageAssetLoader>(&Resource::Path(path.into()), cx)
+                        && let Some(resource) = image_resource(dest, doc_path.as_deref())
+                        && let Some(Ok(data)) = window.use_asset::<ImageAssetLoader>(&resource, cx)
                     {
                         let natural = data.size(0);
                         let natural = size(
@@ -5781,24 +5793,30 @@ fn main() {
         ..Default::default()
     };
 
-    application().run(move |cx| {
-        gpui_kit::init(cx);
-        // Tab/Shift+Tab 在编辑器内由本应用处理；Root 的全局 tab 绑定会吞掉按键
-        // （命中绑定后 gpui 不再调用 on_key_down），故必须用更具体的 key context 覆盖。
-        cx.bind_keys([
-            KeyBinding::new("tab", InsertTab, Some("mazha-doc")),
-            KeyBinding::new("shift-tab", Outdent, Some("mazha-doc")),
-        ]);
-        let path = path.clone();
-        gpui_kit::open_window(options, cx, move |window, cx| {
-            let view = cx.new(|cx| DocView::new(path.as_ref(), cx));
-            // 打开即聚焦，键盘事件直接可用
-            let focus = view.read(cx).focus.clone();
-            window.focus(&focus, cx);
-            view
-        })
-        .expect("打开窗口失败");
-    });
+    // GPUI `application()` 默认装的是 NullHttpClient；远程图片必须显式换成 reqwest。
+    let http_client =
+        reqwest_client::ReqwestClient::user_agent(concat!("Mazha/", env!("CARGO_PKG_VERSION")))
+            .expect("初始化 HTTP 客户端失败");
+    application()
+        .with_http_client(Arc::new(http_client))
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            // Tab/Shift+Tab 在编辑器内由本应用处理；Root 的全局 tab 绑定会吞掉按键
+            // （命中绑定后 gpui 不再调用 on_key_down），故必须用更具体的 key context 覆盖。
+            cx.bind_keys([
+                KeyBinding::new("tab", InsertTab, Some("mazha-doc")),
+                KeyBinding::new("shift-tab", Outdent, Some("mazha-doc")),
+            ]);
+            let path = path.clone();
+            gpui_kit::open_window(options, cx, move |window, cx| {
+                let view = cx.new(|cx| DocView::new(path.as_ref(), cx));
+                // 打开即聚焦，键盘事件直接可用
+                let focus = view.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                view
+            })
+            .expect("打开窗口失败");
+        });
 }
 
 #[cfg(test)]
@@ -5810,7 +5828,8 @@ mod tests {
         inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
         table_arrow_step, table_entry_snap,
     };
-    use super::{px, size};
+    use super::{image_resource, px, size};
+    use gpui_kit::Resource;
     use std::path::{Path, PathBuf};
 
     /// 引用底色与文字都必须落在正文文本列内，左右不越界。
@@ -6084,6 +6103,19 @@ mod tests {
         assert!(super::resolve_image_path("https://example.com/a.png", Some(doc)).is_none());
         assert!(super::resolve_image_path("data:image/png;base64,xx", Some(doc)).is_none());
         assert!(super::resolve_image_path("", Some(doc)).is_none());
+    }
+
+    /// 远程图片走 HTTP 资源；data/协议相对地址仍交给占位标签。
+    #[test]
+    fn remote_image_uses_uri_resource() {
+        let doc = Path::new("/tmp/notes/post.md");
+        let resource = image_resource("https://example.com/a.png", Some(doc));
+        assert_eq!(
+            resource,
+            Some(Resource::Uri("https://example.com/a.png".into()))
+        );
+        assert!(image_resource("data:image/png;base64,xx", Some(doc)).is_none());
+        assert!(image_resource("//example.com/a.png", Some(doc)).is_none());
     }
 
     /// 图片适配只缩小、不放大，并保持宽高比。
