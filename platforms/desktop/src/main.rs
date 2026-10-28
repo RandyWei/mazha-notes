@@ -37,6 +37,7 @@ use std::ops::Range;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::scroll::Scrollbar;
@@ -162,10 +163,12 @@ impl Palette {
                 a: 0.04,
                 ..theme.foreground
             },
-            // 选区底色：accent 的低透明度，跟随强调色随主题变化
+            // 选区底色：常规编辑器风格（蓝底高亮）
             selection: Hsla {
-                a: 0.25,
-                ..theme.accent
+                h: 215.0,
+                s: 0.9,
+                l: 0.55,
+                a: 0.28,
             },
         }
     }
@@ -1117,14 +1120,8 @@ impl DocLayout {
         if self.blocks.is_empty() {
             return None;
         }
-        // 先限定在编辑区视口内：标签栏/信息条与已滚出视口的内容都不放光标
-        if position.x < self.viewport.left()
-            || position.x > self.viewport.right()
-            || position.y < self.viewport.top()
-            || position.y > self.viewport.bottom()
-        {
-            return None;
-        }
+        // 命中时允许稍微超出视口（拖拽选区、Shift+点选时常超出编辑区）
+        // 只做最基本的范围钳制，避免命中到标题栏等完全无关区域
         let rel_y = position.y - self.origin.y;
         // 落在内容末尾以下也不放光标（行映射会钳到末行，但那会误改光标位置）
         if rel_y < Pixels::ZERO || rel_y >= self.total_height() {
@@ -1391,6 +1388,12 @@ struct DocView {
     primary: usize,
     /// 是否正在拖拽选区（鼠标左键按下未松开）。
     selecting: bool,
+    /// 上次左键按下时间（双击/三击用）。
+    last_click_at: Option<std::time::Instant>,
+    /// 上次左键按下位置（同一区域内连续点击才计数）。
+    last_click_pos: Option<Point<Pixels>>,
+    /// 连续点击次数（1/2/3）。
+    click_count: u32,
     /// 最近一次渲染的布局几何（供鼠标命中测试读取）。
     layout: Option<DocLayout>,
     /// 编辑区滚动句柄：由 `#editor` 滚动容器 `track_scroll` 绑定，
@@ -1405,6 +1408,12 @@ struct DocView {
     caret_scroll_key: Option<(Pixels, Pixels)>,
     /// 焦点句柄：键盘事件只在获得焦点后送达。
     focus: FocusHandle,
+    /// 光标当前是否处于闪烁的“可见”相位（每 500ms 翻转）。
+    cursor_visible: bool,
+    /// 光标闪烁定时任务；重新计时时替换旧任务即可取消旧循环。
+    _blink_task: Task<()>,
+    /// 焦点/失焦订阅：获得焦点开始闪烁，失焦立即隐藏。
+    _blink_subscriptions: Vec<Subscription>,
     /// 系统字体族（正文 run 的字体）。
     ui_font: SharedString,
     /// 等宽字体族（来自主题，代码块/行内代码使用）。
@@ -1445,13 +1454,17 @@ impl DocView {
     }
 
     /// 读入文件（或内置示例）并构建文档，光标置于文首。
-    fn new(path: Option<&PathBuf>, cx: &mut App) -> Self {
+    fn new(path: Option<&PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let text = match path {
             Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| format!("> 读取失败：{e}\n")),
             None => SAMPLE.to_string(),
         };
         let theme = cx.theme();
         let palette = Palette::from_theme(theme);
+        // 先复制字体信息，结束 `theme` 对 `cx` 的不可变借用，后面注册焦点订阅需可变借用。
+        let ui_font = theme.font_family.clone();
+        let mono_font = theme.mono_font_family.clone();
+        let mono_font_size = theme.mono_font_size;
         let saved_text = path.is_some().then(|| text.clone());
         // 设置工作区根为文件所在目录或命令行目录
         let ws_root = path
@@ -1480,6 +1493,9 @@ impl DocView {
             find: FindState::default(),
             saved_text: path.is_some().then(|| text.clone()),
         };
+        let focus = cx.focus_handle();
+        let focus_sub = cx.on_focus(&focus, window, |view, _, cx| view.start_blink(cx));
+        let blur_sub = cx.on_blur(&focus, window, |view, _, cx| view.stop_blink(cx));
         Self {
             tabs: vec![t],
             active: 0,
@@ -1488,14 +1504,20 @@ impl DocView {
             cursors: vec![Cursor::new(0)],
             primary: 0,
             selecting: false,
+            last_click_at: None,
+            last_click_pos: None,
+            click_count: 1,
             layout: None,
-            scroll: gpui::ScrollHandle::default(),
-            content_height: Pixels::ZERO,
+            scroll: ScrollHandle::new(),
+            content_height: px(0.),
             caret_scroll_key: None,
-            focus: cx.focus_handle(),
-            ui_font: theme.font_family.clone(),
-            mono_font: theme.mono_font_family.clone(),
-            mono_font_size: theme.mono_font_size,
+            focus,
+            cursor_visible: false,
+            _blink_task: Task::ready(()),
+            _blink_subscriptions: vec![focus_sub, blur_sub],
+            ui_font,
+            mono_font,
+            mono_font_size,
             palette,
             highlighter: None,
             find: FindState::default(),
@@ -1507,6 +1529,44 @@ impl DocView {
             cmd_palette: PaletteState::default(),
             renaming: None,
         }
+    }
+
+    /// 开始/重启光标闪烁：立即显示，并每 500ms 翻转一次可见性。
+    fn start_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_visible = true;
+        self._blink_task = Self::spawn_blink_task(cx);
+    }
+
+    /// 失焦：隐藏光标并取消闪烁任务。
+    fn stop_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_visible = false;
+        self._blink_task = Task::ready(());
+        cx.notify();
+    }
+
+    /// 光标移动/编辑/点选后重置相位，避免刚操作完光标恰好处于隐藏半周期。
+    fn reset_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_visible = true;
+        self._blink_task = Self::spawn_blink_task(cx);
+        cx.notify();
+    }
+
+    /// 闪烁循环：实体或窗口失效时 `update` 返回 `Err`，循环自然结束。
+    fn spawn_blink_task(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let alive = this.update(cx, |view, cx| {
+                    view.cursor_visible = !view.cursor_visible;
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
     }
 
     fn is_dirty(&self) -> bool {
@@ -2610,11 +2670,59 @@ impl DocView {
     /// 从窗口坐标命中一个**源字节偏移**（整篇命中：先算显示索引，再经 OffsetMap 映射）。
     fn hit_source(&self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout.as_ref()?;
-        let (row, col) = layout.hit(position)?;
-        let block = &layout.blocks[row];
-        // 显示字符列 → 源字节偏移（空行等无显示文本的行落到行首）
-        let src = self.doc.snap_to_boundary(block.source_of_col(col));
-        Some(src)
+        if let Some((row, col)) = layout.hit(position) {
+            let block = &layout.blocks[row];
+            // 显示字符列 → 源字节偏移（空行等无显示文本的行落到行首）
+            let src = self.doc.snap_to_boundary(block.source_of_col(col));
+            return Some(src);
+        }
+        // 拖拽到视口外时：钳到最近的可见行首/行尾，保证能继续扩选
+        if layout.blocks.is_empty() {
+            return None;
+        }
+        let rel_y = position.y - layout.origin.y;
+        if rel_y <= Pixels::ZERO {
+            // 拖到最上方：落到文首
+            let first = &layout.blocks[0];
+            let src = self.doc.snap_to_boundary(first.source_of_col(0));
+            return Some(src);
+        }
+        if rel_y >= layout.total_height() {
+            // 拖到最下方：落到文末
+            let last_idx = layout.blocks.len() - 1;
+            let last_row = *layout.row_starts.last().unwrap_or(&0);
+            let rel_x = (position.x - layout.origin.x - layout.blocks[last_idx].indent).max(Pixels::ZERO);
+            let local_y = layout.row_height(last_row) - layout.line_height / 2.;
+            if let Some(col) = layout.blocks[last_idx].col_of_point(rel_x, local_y) {
+                let src = self.doc.snap_to_boundary(layout.blocks[last_idx].source_of_col(col));
+                return Some(src);
+            }
+            return Some(self.doc.snap_to_boundary(self.doc.len()));
+        }
+        None
+    }
+
+    /// 双击：选中光标处的**词**（用核心 `Document::word_range_at`，支持 ASCII/CJK/符号）。
+    fn select_word_at(&mut self, src: usize) {
+        let range = self.doc.word_range_at(src);
+        if range.start == range.end {
+            // 不在词内（空白）：退回到单击行为，不做特殊选区
+            return;
+        }
+        let mut c = Cursor::new(range.end);
+        c.anchor = Some(range.start);
+        self.cursors = vec![c];
+        self.primary = 0;
+    }
+
+    /// 三击：选中整行（不含行尾换行符）。
+    fn select_line_at(&mut self, src: usize) {
+        let range = self.doc.line_range_of(src);
+        // 选中整行文本（换行符留在外面，粘贴时更符合常用编辑器）
+        let mut c = Cursor::new(range.end);
+        c.anchor = Some(range.start);
+        self.cursors = vec![c];
+        self.primary = 0;
     }
 
     /// 命中窗口坐标处的**链接目标**（Cmd+点击用）；不在链接上返回 `None`。
@@ -3480,7 +3588,7 @@ impl Render for DocView {
                     .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                         handle_key(view, event, window, cx);
                     }))
-                    // 左键按下：先试任务复选框切换，再放置光标
+                    // 左键按下：先试任务复选框切换，再放置光标；支持双击选词、三击选行
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, event: &MouseDownEvent, window, cx| {
@@ -3491,35 +3599,110 @@ impl Render for DocView {
                                 cx.open_url(&url);
                                 return;
                             }
-                            // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（命中失败则继续放光标）
-                            view.toggle_task_at(event.position, cx);
+                            // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（Shift/Alt 点击不切换，
+                            // 让它们保持“扩选/多光标”语义；命中失败则继续放光标）
+                            if !event.modifiers.shift && !event.modifiers.alt {
+                                view.toggle_task_at(event.position, cx);
+                            }
+                            // 双击/三击判定（同一区域 400ms 内连续点击）
+                            let now = std::time::Instant::now();
+                            let mut clicks = 1u32;
+                            if let Some(last_t) = view.last_click_at
+                                && let Some(last_p) = view.last_click_pos
+                            {
+                                if now.saturating_duration_since(last_t).as_millis() < 400
+                                    && (event.position.x - last_p.x).abs() < px(4.)
+                                    && (event.position.y - last_p.y).abs() < px(4.)
+                                {
+                                    clicks = view.click_count.saturating_add(1).min(3);
+                                }
+                            }
+                            view.last_click_at = Some(now);
+                            view.last_click_pos = Some(event.position);
+                            view.click_count = clicks;
                             if let Some(src) = view.hit_source(event.position) {
                                 if event.modifiers.alt {
                                     // Alt+Click: 添加/移除光标
                                     view.add_or_remove_cursor(src);
+                                    view.selecting = false;
+                                } else if event.modifiers.shift {
+                                    // Shift+Click: 从当前锚点扩选到点击处；无选区时以原光标为锚点。
+                                    // 保留 `selecting=true`，按住 Shift 继续拖拽也能继续扩选。
+                                    let c = &mut view.cursors[view.primary];
+                                    if c.anchor.is_none() {
+                                        c.anchor = Some(c.caret);
+                                    }
+                                    c.caret = src;
+                                    view.selecting = true;
+                                } else if clicks == 3 {
+                                    view.select_line_at(src);
+                                    view.selecting = false;
+                                } else if clicks == 2 {
+                                    view.select_word_at(src);
+                                    // 双击选词后允许拖拽扩展选区（像主流编辑器）
+                                    if let Some(c) = view.cursors.get_mut(view.primary) {
+                                        if c.anchor.is_none() {
+                                            c.anchor = Some(c.caret);
+                                        }
+                                    }
+                                    view.selecting = true;
                                 } else {
-                                    // 普通点击: 重置为单光标
-                                    view.cursors = vec![Cursor::new(src)];
+                                    // 普通点击: 重置为单光标，锚点=点击处，供按住左键拖选使用。
+                                    let mut cursor = Cursor::new(src);
+                                    cursor.anchor = Some(src);
+                                    view.cursors = vec![cursor];
                                     view.primary = 0;
                                     view.selecting = true;
                                 }
+                                // 点击/拖选都让光标先显示，避免刚好落在隐藏相位。
+                                view.reset_blink(cx);
                             }
                             let focus = view.focus.clone();
                             window.focus(&focus, cx);
                             cx.notify();
                         }),
                     )
-                    // 拖动中：持续更新主光标
-                    .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                    // 拖动中：持续更新主光标；到视口外时自动滚动以扩选
+                    .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                         if !view.selecting {
                             return;
                         }
+                        // 若拖到视口外，按方向自动滚动（每帧按距离加速）
+                        let sc = view.scroll.clone();
+                        let vp = sc.bounds();
+                        if vp.size.height > Pixels::ZERO {
+                            let y = event.position.y;
+                            if y < vp.top() {
+                                let dist_f: f32 = (vp.top() - y).into();
+                                let delta_f = (dist_f / 12.0).max(2.0);
+                                let cur = sc.offset();
+                                let max_off = sc.max_offset().y;
+                                let want = (cur.y - px(delta_f)).clamp(-max_off, Pixels::ZERO);
+                                if want != cur.y {
+                                    sc.set_offset(point(cur.x, want));
+                                    cx.notify();
+                                }
+                            } else if y > vp.bottom() {
+                                let dist_f: f32 = (y - vp.bottom()).into();
+                                let delta_f = (dist_f / 12.0).max(2.0);
+                                let cur = sc.offset();
+                                let max_off = sc.max_offset().y;
+                                let want = (cur.y + px(delta_f)).clamp(-max_off, Pixels::ZERO);
+                                if want != cur.y {
+                                    sc.set_offset(point(cur.x, want));
+                                    cx.notify();
+                                }
+                            }
+                        }
                         if let Some(src) = view.hit_source(event.position) {
+                            // 只移动活动端；锚点在按下时已固定，不能在这里用新 caret 覆盖，
+                            // 否则 anchor == caret，拖选永远为空。
                             if let Some(c) = view.cursors.get_mut(view.primary) {
                                 c.caret = view.doc.snap_to_boundary(src);
-                                c.anchor = Some(c.anchor.unwrap_or(c.caret)); // 保持锚点
                             }
+                            view.reset_blink(cx);
                             cx.notify();
+                            let _ = window;
                         }
                     }))
                     // 左键松开：结束拖选
@@ -3823,6 +4006,8 @@ fn handle_key(
     window: &mut Window,
     cx: &mut Context<DocView>,
 ) {
+    // 任意按键都把光标相位重置到“可见”，打字时不会出现光标刚好隐藏的情况。
+    view.reset_blink(cx);
     let m = &event.keystroke.modifiers;
     let shift = m.shift;
 
@@ -3878,6 +4063,7 @@ fn handle_key(
                 view.cursors = vec![Cursor::new(len)];
                 view.cursors[0].anchor = Some(0);
                 view.primary = 0;
+                view.selecting = false;
                 cx.notify();
             }
             // 剪贴板（Cmd+C/X/V）：复制/剪切选区、粘贴
@@ -5672,7 +5858,12 @@ impl Element for DocElement {
                                     point(text_x + cell.x + x0, row_top + row.offset_y),
                                     size(width, LINE_HEIGHT),
                                 ),
-                                palette.selection,
+                                Hsla {
+                                    h: 0.61,
+                                    s: 0.9,
+                                    l: 0.55,
+                                    a: 0.32,
+                                },
                             ));
                         }
                     } else {
@@ -5701,7 +5892,12 @@ impl Element for DocElement {
                             let y = row_top + line_px * r as f32;
                             window.paint_quad(fill(
                                 bounds(point(text_x + x0, y), size(width, line_px)),
-                                palette.selection,
+                                Hsla {
+                                    h: 0.61,
+                                    s: 0.9,
+                                    l: 0.55,
+                                    a: 0.32,
+                                },
                             ));
                         }
                     }
@@ -5805,8 +6001,14 @@ impl Element for DocElement {
                 }
             }
 
-            // 光标竖线：仅在光标所在块绘制（用 prepaint 预计算的 caret_col 显示列）
-            if let Some(col) = block.caret_col
+            // 光标竖线：仅在焦点在编辑区且处于闪烁可见相位时绘制。
+            let (cursor_visible, focused) = {
+                let view = self.view.read(cx);
+                (view.cursor_visible, view.focus.is_focused(window))
+            };
+            if cursor_visible
+                && focused
+                && let Some(col) = block.caret_col
                 && let Some(p) = block.position_of_col(col)
             {
                 // p.y = 光标所在视觉行在块内的顶边偏移（软换行下不再画错行）
@@ -5878,7 +6080,7 @@ fn main() {
             ]);
             let path = path.clone();
             gpui_kit::open_window(options, cx, move |window, cx| {
-                let view = cx.new(|cx| DocView::new(path.as_ref(), cx));
+                let view = cx.new(|cx| DocView::new(path.as_ref(), window, cx));
                 // 打开即聚焦，键盘事件直接可用
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
