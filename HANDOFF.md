@@ -100,7 +100,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 100 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(desktop): 内联 data URI 与协议相对图片（0.1.76，D55）>
+<本次提交：feat(desktop): 内联 HTML 标签与 <font> 样式解析 + 表格分隔行布局修复>
 66db09a feat(desktop): 远程图片加载（0.1.75，D54）
 957875e feat(desktop): 本地图片真实渲染（0.1.74，D53）
 8417ea6 fix(desktop): 引用块左右越界（0.1.73）

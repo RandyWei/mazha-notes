@@ -69,7 +69,7 @@ fn try_construct(source: &str, s: &str, base: usize, i: usize) -> Option<(usize,
         b'[' if bytes.get(i + 1) == Some(&b'[') => wiki_link(source, base, bytes, i),
         b'[' if bytes.get(i + 1) == Some(&b'^') => footnote_ref(base, bytes, i),
         b'[' => link(source, base, bytes, i),
-        b'<' => autolink(base, s, i),
+        b'<' => html_tag_inline(source, s, base, i).or_else(|| autolink(base, s, i)),
         b'#' => tag(base, bytes, i),
         b'~' if bytes.get(i + 1) == Some(&b'~') => strike(source, base, bytes, i),
         b'*' | b'_' => emphasis(source, base, bytes, i),
@@ -242,6 +242,7 @@ fn image(source: &str, base: usize, bytes: &[u8], i: usize) -> Option<(usize, Ve
         range: base + i..base + i + total,
         kind: SpanKind::Widget,
         role: SpanRole::ImageMarker,
+        color: None,
     }];
     Some((total, spans))
 }
@@ -473,6 +474,233 @@ fn autolink(base: usize, s: &str, i: usize) -> Option<(usize, Vec<SyntaxSpan>)> 
         SyntaxSpan::marker(base + i + 1 + gt..base + i + 2 + gt, SpanRole::LinkMarker),
     ];
     Some((gt + 2, spans))
+}
+
+/// 简单 HTML 内联标签（Typora 常用）：`<font ...>...</font>`、`<span ...>...</span>`、
+/// `<b>`/`<strong>`/`<i>`/`<em>`/`<u>`/`<s>`/`<del>` 等。
+/// 仅做最小处理：剥离标签，尽量保留内容；支持 `color`/`style` 中的 color（桌面端后续应用）。
+fn parse_color_attr(val: &str) -> Option<(u8, u8, u8)> {
+    let v = val.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+    let vl = v.to_ascii_lowercase();
+    if vl.starts_with('#') {
+        let hex = &vl[1..];
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some((r, g, b));
+        }
+        if hex.len() == 3 {
+            let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
+            let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
+            let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
+            return Some((r, g, b));
+        }
+        return None;
+    }
+    if vl.starts_with("rgb(") {
+        let inner = vl.trim_start_matches("rgb(").trim_end_matches(')');
+        let mut parts = inner.split(',');
+        let r: u8 = parts.next()?.trim().parse().ok()?;
+        let g: u8 = parts.next()?.trim().parse().ok()?;
+        let b: u8 = parts.next()?.trim().parse().ok()?;
+        return Some((r, g, b));
+    }
+    // 简单命名（黑白红绿蓝常用）
+    match vl.as_str() {
+        "black" => Some((0, 0, 0)),
+        "white" => Some((255, 255, 255)),
+        "red" => Some((255, 0, 0)),
+        "green" => Some((0, 128, 0)),
+        "blue" => Some((0, 0, 255)),
+        "gray" | "grey" => Some((128, 128, 128)),
+        _ => None,
+    }
+}
+
+fn parse_font_color(tag_inner: &str) -> Option<(u8, u8, u8)> {
+    let tl = tag_inner.to_ascii_lowercase();
+    // color="..."
+    if let Some(i) = tl.find("color") {
+        let rest = &tag_inner[i..];
+        // 找 = 
+        if let Some(eq) = rest.find('=') {
+            let after = rest[eq + 1..].trim();
+            if after.is_empty() {
+                return None;
+            }
+            if after.starts_with('"') {
+                if let Some(end) = after[1..].find('"') {
+                    return parse_color_attr(&after[1..1 + end]);
+                }
+            } else if after.starts_with('\'') {
+                if let Some(end) = after[1..].find('\'') {
+                    return parse_color_attr(&after[1..1 + end]);
+                }
+            } else {
+                // 空格或 > 之前
+                let mut end = 0;
+                let ab = after.as_bytes();
+                while end < ab.len() && ab[end] != b' ' && ab[end] != b'\t' && ab[end] != b'>' {
+                    end += 1;
+                }
+                if end > 0 {
+                    return parse_color_attr(&after[..end]);
+                }
+            }
+        }
+    }
+    // style="...color:rgb(...)..."
+    if let Some(i) = tl.find("style") {
+        let rest = &tag_inner[i..];
+        if let Some(eq) = rest.find('=') {
+            let after = rest[eq + 1..].trim();
+            let style_str = if after.starts_with('"') {
+                if let Some(end) = after[1..].find('"') {
+                    &after[1..1 + end]
+                } else {
+                    after
+                }
+            } else if after.starts_with('\'') {
+                if let Some(end) = after[1..].find('\'') {
+                    &after[1..1 + end]
+                } else {
+                    after
+                }
+            } else {
+                after
+            };
+            let sl = style_str.to_ascii_lowercase();
+            if let Some(ci) = sl.find("color") {
+                let srest = &style_str[ci..];
+                if let Some(col) = srest.find(':') {
+                    let val = &srest[col + 1..];
+                    // 分号前
+                    let mut vend = val.len();
+                    for (k, c) in val.char_indices() {
+                        if c == ';' {
+                            vend = k;
+                            break;
+                        }
+                    }
+                    if vend > 0 {
+                        return parse_color_attr(&val[..vend]);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn html_tag_inline(source: &str, s: &str, base: usize, i: usize) -> Option<(usize, Vec<SyntaxSpan>)> {
+    let bytes = s.as_bytes();
+    if bytes.get(i) != Some(&b'<') {
+        return None;
+    }
+    // 查找 '>'
+    let mut gt = None;
+    let mut j = i + 1;
+    while j < bytes.len() && bytes[j] != b'\n' {
+        if bytes[j] == b'>' {
+            gt = Some(j);
+            break;
+        }
+        j += 1;
+    }
+    let gt = gt?;
+    let tag_inner = &s[i + 1..gt];
+    let tag_trim = tag_inner.trim();
+    if tag_trim.is_empty() {
+        return None;
+    }
+    // 自闭合或注释等：直接剥离
+    if tag_trim.starts_with('!') || tag_trim.ends_with('/') {
+        return Some((gt + 1 - i, vec![]));
+    }
+    // 结束标签：直接剥离
+    if tag_trim.starts_with('/') {
+        return Some((gt + 1 - i, vec![]));
+    }
+    // 起始标签：取标签名（大小写不敏感）
+    let mut name_end = 0;
+    let tbytes = tag_trim.as_bytes();
+    while name_end < tbytes.len()
+        && (tbytes[name_end].is_ascii_alphabetic() || tbytes[name_end] == b':')
+    {
+        name_end += 1;
+    }
+    if name_end == 0 {
+        return None;
+    }
+    let name = tag_trim[..name_end].to_ascii_lowercase();
+    // 仅处理常用标签
+    match name.as_str() {
+        "font" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "del" | "strike" | "code" | "mark" => {}
+        _ => return None,
+    }
+    let custom_color = if name == "font" || name == "span" {
+        parse_font_color(tag_inner)
+    } else {
+        None
+    };
+    // 找对应结束标签 </name>
+    let end_tag = format!("</{}>", name);
+    let rest_abs = base + gt + 1;
+    // 在源文本中查找（region 是 s 对应的片段，这里用 source）
+    let search_start = rest_abs;
+    let lower_src = source.to_ascii_lowercase();
+    let end_pos = lower_src[search_start..].find(&end_tag)?;
+    let end_abs = search_start + end_pos;
+    // 标签之间的内容按行内语法解析，保留样式
+    let mut spans = Vec::new();
+    // 解析内部内容
+    if end_abs > rest_abs {
+        let inner_spans = parse_inline(source, rest_abs..end_abs);
+        // 根据标签应用简单样式映射
+        let mut mapped: Vec<SyntaxSpan> = inner_spans;
+        match name.as_str() {
+            "b" | "strong" => {
+                for sp in &mut mapped {
+                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
+                        sp.role = SpanRole::Strong;
+                    }
+                }
+            }
+            "i" | "em" => {
+                for sp in &mut mapped {
+                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
+                        sp.role = SpanRole::Emphasis;
+                    }
+                }
+            }
+            "s" | "del" | "strike" => {
+                for sp in &mut mapped {
+                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
+                        sp.role = SpanRole::Strikethrough;
+                    }
+                }
+            }
+            "code" => {
+                for sp in &mut mapped {
+                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
+                        sp.role = SpanRole::InlineCode;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(c) = custom_color {
+            for sp in &mut mapped {
+                if sp.kind == crate::span::SpanKind::Text {
+                    sp.color = Some(c);
+                }
+            }
+        }
+        spans.extend(mapped);
+    }
+    let total = (end_abs + end_tag.len()) - base - i;
+    Some((total, spans))
 }
 
 /// 把 `[from..]` 内"普通文本"片段重新着色为外层角色的强调文本。

@@ -418,6 +418,7 @@ fn reveal_inline(
                 source_range: (base + r.start)..(base + r.end),
                 display_start: 0,
                 style: RunStyle::Normal,
+                color: None,
                 text: text.to_string(),
             })
         })
@@ -4429,7 +4430,7 @@ fn to_gpui_runs(
 ) -> (String, Vec<gpui::TextRun>, Vec<oblique::ObliqueSpan>) {
     // 默认按正文样式；代码块整体覆盖为等宽字体（字号统一在 shape_line 时按块应用）
     let mut font = base_font.clone();
-    let mut color = palette.foreground;
+    let mut color = run.color.map(rgb_to_hsla).unwrap_or(palette.foreground);
     let mut background = None;
     let mut underline = None;
     let mut strikethrough = None;
@@ -5352,12 +5353,10 @@ impl Element for DocElement {
                     // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
                     // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
                     // 光标若落进分隔行则恢复正常高度，否则会出现"看不见的光标"。
+                    let is_delim_hidden = line.block.table_line == Some(TableLine::Delimiter)
+                        && caret_pos.line != idx;
                     if line.block.table_line == Some(TableLine::Delimiter) {
-                        line_px = if caret_pos.line == idx {
-                            line_px
-                        } else {
-                            Pixels::ZERO
-                        };
+                        line_px = if is_delim_hidden { Pixels::ZERO } else { line_px };
                     } else if line.block.table_line == Some(TableLine::Header) {
                         // 上下各多给约 6px，表头文字在行盒内垂直居中
                         line_px += px(12.);
@@ -5379,6 +5378,7 @@ impl Element for DocElement {
                     } else {
                         shaped.wrap_boundaries().len() + 1
                     };
+                    let rows_eff = if is_delim_hidden { 0usize } else { rows };
 
                     // 光标行（内容坐标）：表格按单元格几何取 x/y，普通行按换行后的视觉行取
                     if let Some(col) = caret_col {
@@ -5490,9 +5490,9 @@ impl Element for DocElement {
 
                     row_starts.push(row_acc);
                     row_tops.push(top_acc);
-                    row_acc += rows;
+                    row_acc += rows_eff;
                     // 块内各行同高：内容 y 累计 = 行高 × 视觉行数
-                    top_acc += line_px * rows as f32;
+                    top_acc += line_px * rows_eff as f32;
                     // 选区显示列：展开态显示文本变长（URL/标记可见），按源区间在本行内重算
                     let selection_cols = if is_revealed {
                         let (start, end) = (line.source_range.start, line.source_range.end);
@@ -5520,7 +5520,7 @@ impl Element for DocElement {
                     v.push(BlockGeom {
                         proj: line.clone(),
                         shaped: Arc::new(shaped),
-                        rows,
+                        rows: rows_eff,
                         prefix_bytes,
                         indent,
                         revealed: is_revealed,

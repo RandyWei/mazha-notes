@@ -434,6 +434,8 @@ pub struct TextRun {
     pub display_start: usize,
     /// 文本样式。
     pub style: RunStyle,
+    /// 自定义前景色（RGB 0-255），用于 `<font color=...>` 等简单 HTML 样式。
+    pub color: Option<(u8, u8, u8)>,
     /// 可见文本内容。
     pub text: String,
 }
@@ -918,8 +920,13 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
             }
             let chars = text.chars().count();
             disp_bytes += text.len();
+            let color = span.color;
             match runs.last_mut() {
-                Some(last) if last.style == style && last.source_range.end == span.range.start => {
+                Some(last)
+                    if last.style == style
+                        && last.color == color
+                        && last.source_range.end == span.range.start =>
+                {
                     last.text.push_str(&text);
                     last.source_range.end = span.range.end;
                 }
@@ -927,6 +934,7 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
                     source_range: span.range.clone(),
                     display_start: disp_col,
                     style,
+                    color,
                     text,
                 }),
             }

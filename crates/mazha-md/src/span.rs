@@ -98,6 +98,8 @@ pub struct SyntaxSpan {
     pub kind: SpanKind,
     /// 片段角色。
     pub role: SpanRole,
+    /// 自定义前景色（RGB 0-255），用于 `<font color=...>` 等简单 HTML 样式。
+    pub color: Option<(u8, u8, u8)>,
 }
 
 impl SyntaxSpan {
@@ -107,6 +109,7 @@ impl SyntaxSpan {
             range,
             kind: SpanKind::Text,
             role,
+            color: None,
         }
     }
 
@@ -116,6 +119,17 @@ impl SyntaxSpan {
             range,
             kind: SpanKind::Marker,
             role,
+            color: None,
+        }
+    }
+
+    /// 构造一个带颜色的"可见文本"片段。
+    pub fn text_colored(range: Range<usize>, role: SpanRole, color: (u8, u8, u8)) -> Self {
+        Self {
+            range,
+            kind: SpanKind::Text,
+            role,
+            color: Some(color),
         }
     }
 
