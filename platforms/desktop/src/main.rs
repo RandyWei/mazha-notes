@@ -1470,6 +1470,10 @@ struct DocView {
     workspace: Option<Workspace<FileSystemProvider>>,
     /// 文件树是否展开
     tree_open: bool,
+    /// 文件树侧栏宽度（可拖动分隔条缩放，D58）。
+    sidebar_width: Pixels,
+    /// 是否正在拖动侧栏分隔条。
+    sidebar_resizing: bool,
     /// 大纲（目录导航）是否展开
     outline_open: bool,
     /// 已打开文件的保存快照（脏状态用）
@@ -1562,6 +1566,8 @@ impl DocView {
             workspace_root: ws_root,
             workspace: ws,
             tree_open: true,
+            sidebar_width: px(220.),
+            sidebar_resizing: false,
             outline_open: true,
             saved_text,
             cmd_palette: PaletteState::default(),
@@ -2935,24 +2941,66 @@ impl DocView {
         self.switch_tab(idx as usize, cx);
     }
 
-    #[allow(dead_code)]
-    fn switch_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx >= self.tabs.len() {
+    /// 把当前编辑态写回 `tabs[active]`。
+    ///
+    /// `DocView` 的 `doc`/`cursors` 等字段是当前标签的工作副本，标签切换前必须先回写，
+    /// 否则切走再切回会看到旧文档（这也是“切 Tab 内容不刷新”的根因之一）。
+    fn sync_current_tab(&mut self) {
+        // `Document` 没有实现 `Clone`（内含解析缓存/撤销栈），这里用 move 保留每个标签的
+        // 撤销历史；先换成空文档，避免借用冲突。
+        let doc = std::mem::replace(&mut self.doc, Document::new(""));
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            self.doc = doc;
             return;
-        }
+        };
+        t.path = self.path.clone();
+        t.doc = doc;
+        t.cursors = self.cursors.clone();
+        t.primary = self.primary;
+        t.selecting = self.selecting;
+        t.layout = self.layout.clone();
+        // 高亮器/查找态与视口相关，不跨标签复用。
+        t.highlighter = None;
+        t.find = FindState::default();
+        t.saved_text = self.saved_text.clone();
+    }
+
+    /// 从 `tabs[idx]` 装载编辑态到当前字段（调用方负责先回写旧标签）。
+    fn activate_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(t) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        let path = t.path.clone();
+        // 把目标标签的文档 move 出来，切回时撤销/重做历史仍在。
+        let doc = std::mem::replace(&mut t.doc, Document::new(""));
+        let cursors = t.cursors.clone();
+        let primary = t.primary;
+        let selecting = t.selecting;
+        let saved_text = t.saved_text.clone();
         self.active = idx;
-        let t = &self.tabs[self.active];
-        self.path = t.path.clone();
-        self.doc = Document::new(&t.doc.text());
-        self.cursors = t.cursors.clone();
-        self.primary = t.primary;
-        self.selecting = t.selecting;
+        self.path = path;
+        self.doc = doc;
+        self.cursors = cursors;
+        self.primary = primary;
+        self.selecting = selecting;
+        // 布局/滚动位置依赖当前视口，切换后重建，避免沿用上一个文档的坐标。
         self.layout = None;
         self.caret_scroll_key = None;
         self.highlighter = None;
         self.find = FindState::default();
-        self.saved_text = t.saved_text.clone();
+        self.saved_text = saved_text;
+        self.scroll = gpui::ScrollHandle::new();
+        self.content_height = px(0.);
         cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn switch_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() || idx == self.active {
+            return;
+        }
+        self.sync_current_tab();
+        self.activate_tab(idx, cx);
     }
 
     #[allow(dead_code)]
@@ -2960,30 +3008,10 @@ impl DocView {
         if self.tabs.is_empty() {
             return;
         }
-        let t = &self.tabs[0];
-        self.tabs = vec![Tab {
-            path: t.path.clone(),
-            doc: Document::new(&t.doc.text()),
-            cursors: t.cursors.clone(),
-            primary: t.primary,
-            selecting: t.selecting,
-            layout: None,
-            highlighter: None,
-            find: FindState::default(),
-            saved_text: t.saved_text.clone(),
-        }];
-        self.active = 0;
-        self.path = self.tabs[0].path.clone();
-        self.doc = Document::new(&self.tabs[0].doc.text());
-        self.cursors = self.tabs[0].cursors.clone();
-        self.primary = self.tabs[0].primary;
-        self.selecting = self.tabs[0].selecting;
-        self.layout = None;
-        self.caret_scroll_key = None;
-        self.highlighter = None;
-        self.find = FindState::default();
-        self.saved_text = self.tabs[0].saved_text.clone();
-        cx.notify();
+        // 保留首个标签；先把当前编辑态回写，避免正在编辑的标签被旧快照覆盖。
+        self.sync_current_tab();
+        self.tabs.truncate(1);
+        self.activate_tab(0, cx);
     }
 
     #[allow(dead_code)]
@@ -2991,63 +3019,40 @@ impl DocView {
         if self.tabs.len() <= 1 {
             return;
         }
+        // 关闭的是当前标签，无需回写被丢弃的状态；其余标签在切走时已回写。
         self.tabs.remove(self.active);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
-        // sync to current fields
-        let t = &self.tabs[self.active];
-        self.path = t.path.clone();
-        self.doc = Document::new(&t.doc.text());
-        self.cursors = t.cursors.clone();
-        self.primary = t.primary;
-        self.selecting = t.selecting;
-        self.layout = t.layout.clone();
-        self.highlighter = None;
-        self.find = FindState::default();
-        self.saved_text = t.saved_text.clone();
-        cx.notify();
+        self.activate_tab(self.active, cx);
     }
 
     #[allow(dead_code)]
     fn new_tab_empty(&mut self, cx: &mut Context<Self>) {
+        self.sync_current_tab();
         self.tabs.push(Tab::new(String::new(), None));
-        self.active = self.tabs.len() - 1;
-        cx.notify();
+        self.activate_tab(self.tabs.len() - 1, cx);
     }
 
     #[allow(dead_code)]
     fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let full = path.canonicalize().unwrap_or_else(|_| path.clone());
-        // check existing
-        for (i, t) in self.tabs.iter_mut().enumerate() {
-            if t.path
+        // 已打开过：走统一的切换流程（会先回写当前标签，再装载目标标签）。
+        let existing = self.tabs.iter().position(|t| {
+            t.path
                 .as_ref()
                 .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-                .as_ref()
-                == Some(&full)
-            {
-                self.active = i;
-                self.layout = None;
-                self.caret_scroll_key = None;
-                self.highlighter = None;
-                cx.notify();
-                return;
-            }
+                == Some(full.clone())
+        });
+        if let Some(i) = existing {
+            self.switch_tab(i, cx);
+            return;
         }
+        // 新建标签前保存当前编辑态，避免从侧栏打开新文件时旧标签丢改动。
+        self.sync_current_tab();
         if let Ok(text) = std::fs::read_to_string(&full) {
-            self.tabs.push(Tab::new(text.clone(), Some(full.clone())));
-            self.active = self.tabs.len() - 1;
-            self.path = Some(full.clone());
-            self.doc = Document::new(&text);
-            self.cursors = vec![Cursor::new(0)];
-            self.primary = 0;
-            self.selecting = false;
-            self.layout = None;
-            self.caret_scroll_key = None;
-            self.highlighter = None;
-            self.find = FindState::default();
-            self.saved_text = Some(text.clone());
+            self.tabs.push(Tab::new(text, Some(full.clone())));
+            self.activate_tab(self.tabs.len() - 1, cx);
             if let Some(parent) = full.parent() {
                 if self.workspace.is_none() {
                     if let Ok(p) = FileSystemProvider::open(parent) {
@@ -3062,10 +3067,9 @@ impl DocView {
             cx.notify();
             return;
         }
-        // fallback
+        // 读取失败也保留一个空标签，方便用户继续新建/保存。
         self.tabs.push(Tab::new(String::new(), Some(full)));
-        self.active = self.tabs.len() - 1;
-        cx.notify();
+        self.activate_tab(self.tabs.len() - 1, cx);
     }
 
     fn save_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3074,6 +3078,8 @@ impl DocView {
                 eprintln!("保存失败：{}", e);
             } else {
                 self.saved_text = Some(self.doc.text().to_string());
+                // 当前标签标题直接从 `self` 实时读取；`tabs[active]` 在切走时统一回写，
+                // 这里不能调用 `sync_current_tab`（它会把 `self.doc` move 走）。
                 cx.notify();
             }
         } else {
@@ -3255,6 +3261,8 @@ impl DocView {
                         view.workspace = Some(Workspace::new(p));
                         view.tree_open = true;
                     }
+                    // 与 `save_current` 同理：当前文档仍由 `self.doc` 持有，
+                    // 标签快照等切走时再回写。
                     cx.notify();
                 });
             }
@@ -3502,8 +3510,8 @@ impl Render for DocView {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
+                                    // `truncate()` = nowrap + hidden + 末尾省略号（D58）。
+                                    .truncate()
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
@@ -3544,7 +3552,7 @@ impl Render for DocView {
         }
         let sidebar_el = div()
             .id("sidebar")
-            .w(px(220.))
+            .w(self.sidebar_width)
             .flex_none()
             .h_full()
             .border_r_1()
@@ -3553,11 +3561,28 @@ impl Render for DocView {
             .flex()
             .flex_col()
             .children(sb);
+        // 侧栏分隔条：按下后由 `#app` 的 move/up 监听统一改宽度，避免鼠标快速移出
+        // 4px 手柄后丢失拖拽（D58）。
+        let sidebar_resize = div()
+            .id("sidebar-resize")
+            .w(px(4.))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .hover(|d| d.bg(palette.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _ev, _w, cx| {
+                    view.sidebar_resizing = true;
+                    cx.notify();
+                }),
+            );
         // 标签栏
         let mut tbc: Vec<gpui::AnyElement> = Vec::new();
         for (i, t) in self.tabs.iter().enumerate() {
-            let name = t.name();
             let act = i == self.active;
+            // 当前标签用实时编辑态算标题（含脏标记）；其余标签用切走时回写的快照。
+            let name = if act { self.header_text() } else { t.name() };
             tbc.push(
                 div()
                     .id(gpui::ElementId::Name(format!("tab-{i}").into()))
@@ -3569,8 +3594,9 @@ impl Render for DocView {
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(move |v, _ev, _w, cx| {
-                            v.active = i;
-                            cx.notify();
+                            // 必须走 switch_tab：直接改 active 只会切换高亮，
+                            // 编辑器仍持有上一个文档的 doc/cursors。
+                            v.switch_tab(i, cx);
                         }),
                     )
                     .child(name)
@@ -3608,7 +3634,28 @@ impl Render for DocView {
             .flex_row()
             .bg(palette.background)
             .text_color(palette.foreground)
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _w, cx| {
+                if !view.sidebar_resizing {
+                    return;
+                }
+                // 侧栏贴左缘，鼠标窗口 x 即目标宽度；限幅避免拖没或占满正文。
+                let width = event.position.x.clamp(px(160.), px(420.));
+                if width != view.sidebar_width {
+                    view.sidebar_width = width;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseUpEvent, _w, cx| {
+                    if view.sidebar_resizing {
+                        view.sidebar_resizing = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .child(sidebar_el)
+            .child(sidebar_resize)
             // 右侧主列：标签栏 + 信息条 + 查找/命令浮层 + 编辑区（纵向排列）
             .child(
                 div()
@@ -3768,19 +3815,8 @@ impl Render for DocView {
                             .border_color(palette.border)
                             .text_sm()
                             .text_color(palette.muted)
-                            .child(
-                                self.tabs
-                                    .get(self.active)
-                                    .map(|t| t.name())
-                                    .unwrap_or_else(|| self.header_text()),
-                            )
-                            .child(format!(
-                                "· {}",
-                                self.tabs
-                                    .get(self.active)
-                                    .map(|t| t.full())
-                                    .unwrap_or_else(|| self.header_full_path())
-                            ))
+                            .child(self.header_text())
+                            .child(format!("· {}", self.header_full_path()))
                             .child(format!(
                                 "· {line_count} 行 · 光标×{} · Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换",
                                 caret_count
