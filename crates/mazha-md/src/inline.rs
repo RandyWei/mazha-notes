@@ -480,10 +480,15 @@ fn autolink(base: usize, s: &str, i: usize) -> Option<(usize, Vec<SyntaxSpan>)> 
 /// `<b>`/`<strong>`/`<i>`/`<em>`/`<u>`/`<s>`/`<del>` 等。
 /// 仅做最小处理：剥离标签，尽量保留内容；支持 `color`/`style` 中的 color（桌面端后续应用）。
 fn parse_color_attr(val: &str) -> Option<(u8, u8, u8)> {
-    let v = val.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+    let v = val
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
     let vl = v.to_ascii_lowercase();
-    if vl.starts_with('#') {
-        let hex = &vl[1..];
+    if let Some(hex) = vl.strip_prefix('#') {
+        // 先确认纯 ASCII，避免按字节切片时把多字节字符切成半个而 panic
+        if !hex.is_ascii() {
+            return None;
+        }
         if hex.len() == 6 {
             let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
             let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
@@ -523,19 +528,16 @@ fn parse_font_color(tag_inner: &str) -> Option<(u8, u8, u8)> {
     // color="..."
     if let Some(i) = tl.find("color") {
         let rest = &tag_inner[i..];
-        // 找 = 
+        // 找 =
         if let Some(eq) = rest.find('=') {
             let after = rest[eq + 1..].trim();
             if after.is_empty() {
                 return None;
             }
-            if after.starts_with('"') {
-                if let Some(end) = after[1..].find('"') {
-                    return parse_color_attr(&after[1..1 + end]);
-                }
-            } else if after.starts_with('\'') {
-                if let Some(end) = after[1..].find('\'') {
-                    return parse_color_attr(&after[1..1 + end]);
+            if let Some(q @ ('"' | '\'')) = after.chars().next() {
+                let body = &after[1..];
+                if let Some(end) = body.find(q) {
+                    return parse_color_attr(&body[..end]);
                 }
             } else {
                 // 空格或 > 之前
@@ -555,18 +557,8 @@ fn parse_font_color(tag_inner: &str) -> Option<(u8, u8, u8)> {
         let rest = &tag_inner[i..];
         if let Some(eq) = rest.find('=') {
             let after = rest[eq + 1..].trim();
-            let style_str = if after.starts_with('"') {
-                if let Some(end) = after[1..].find('"') {
-                    &after[1..1 + end]
-                } else {
-                    after
-                }
-            } else if after.starts_with('\'') {
-                if let Some(end) = after[1..].find('\'') {
-                    &after[1..1 + end]
-                } else {
-                    after
-                }
+            let style_str = if let Some(q @ ('"' | '\'')) = after.chars().next() {
+                after[1..].find(q).map_or(after, |end| &after[1..=end])
             } else {
                 after
             };
@@ -593,7 +585,12 @@ fn parse_font_color(tag_inner: &str) -> Option<(u8, u8, u8)> {
     None
 }
 
-fn html_tag_inline(source: &str, s: &str, base: usize, i: usize) -> Option<(usize, Vec<SyntaxSpan>)> {
+fn html_tag_inline(
+    source: &str,
+    s: &str,
+    base: usize,
+    i: usize,
+) -> Option<(usize, Vec<SyntaxSpan>)> {
     let bytes = s.as_bytes();
     if bytes.get(i) != Some(&b'<') {
         return None;
@@ -636,7 +633,13 @@ fn html_tag_inline(source: &str, s: &str, base: usize, i: usize) -> Option<(usiz
     let name = tag_trim[..name_end].to_ascii_lowercase();
     // 仅处理常用标签
     match name.as_str() {
-        "font" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "del" | "strike" | "code" | "mark" => {}
+        "font" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "del" | "strike" | "code"
+        | "mark" => {}
+        "br" => {
+            // `<br>` 是行内模型无法表达的真实换行：只隐藏标签本身、不插入字符
+            // （插入空格会改变源文本↔显示列映射）。跨行换行请直接回车。
+            return Some((gt + 1 - i, vec![]));
+        }
         _ => return None,
     }
     let custom_color = if name == "font" || name == "span" {
@@ -644,14 +647,13 @@ fn html_tag_inline(source: &str, s: &str, base: usize, i: usize) -> Option<(usiz
     } else {
         None
     };
-    // 找对应结束标签 </name>
-    let end_tag = format!("</{}>", name);
+    // 找对应结束标签 </name>。**只在当前解析区间内查找**：行内解析按行/块进行，
+    // 若允许越过区间，未闭合的 `<font>` 会吞掉后续多行内容并破坏偏移映射。
+    let end_tag = format!("</{name}>");
     let rest_abs = base + gt + 1;
-    // 在源文本中查找（region 是 s 对应的片段，这里用 source）
-    let search_start = rest_abs;
-    let lower_src = source.to_ascii_lowercase();
-    let end_pos = lower_src[search_start..].find(&end_tag)?;
-    let end_abs = search_start + end_pos;
+    let lower_region = s[gt + 1..].to_ascii_lowercase();
+    let end_pos = lower_region.find(&end_tag)?;
+    let end_abs = rest_abs + end_pos;
     // 标签之间的内容按行内语法解析，保留样式
     let mut spans = Vec::new();
     // 解析内部内容
@@ -1095,5 +1097,96 @@ mod tests {
         let src = "\\$x$";
         let spans = parse(src);
         assert!(spans.iter().all(|s| s.role != SpanRole::Math));
+    }
+
+    // ---------------- 内联 HTML 标签（D56） ----------------
+
+    #[test]
+    fn html_font_named_color() {
+        let src = "<font color=\"red\">红</font>";
+        let spans = parse(src);
+        // 标签本身隐藏，只留内部可见文本
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(&src[spans[0].range.clone()], "红");
+        assert_eq!(spans[0].color, Some((255, 0, 0)));
+        assert_eq!(crate::span::visible_runs(&spans), vec![18..21]);
+    }
+
+    #[test]
+    fn html_span_style_hex_color() {
+        let src = "<span style=\"color:#0af\">x</span>";
+        let spans = parse(src);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].color, Some((0, 170, 255)));
+    }
+
+    #[test]
+    fn html_font_rgb_color() {
+        let src = "<font color=\"rgb(1,2,3)\">x</font>";
+        let spans = parse(src);
+        assert_eq!(spans[0].color, Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn html_strong_maps_to_strong_role() {
+        let src = "<strong>粗</strong>";
+        let spans = parse(src);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].role, SpanRole::Strong);
+        assert_eq!(spans[0].kind, SpanKind::Text);
+    }
+
+    #[test]
+    fn html_br_hidden_without_inserting_text() {
+        // 行内模型不能真正换行：`<br>` 只隐藏标签，不能凭空插入空格
+        let src = "a<br>b";
+        let spans = parse(src);
+        assert_eq!(crate::span::visible_runs(&spans), vec![0..1, 5..6]);
+    }
+
+    #[test]
+    fn html_unclosed_tag_stays_literal() {
+        let src = "a <font color=red>b";
+        let spans = parse(src);
+        assert_eq!(
+            crate::span::visible_runs(&spans),
+            vec![0..src.len()],
+            "未闭合标签应按普通文本显示"
+        );
+    }
+
+    #[test]
+    fn html_closing_tag_outside_region_not_swallowed() {
+        // 结束标签在下一行：当前区间内不得吞掉后续内容
+        let src = "a <font color=red>b\nz</font>";
+        let line_end = src.find('\n').unwrap();
+        let spans = parse_inline(src, 0..line_end);
+        assert_eq!(crate::span::visible_runs(&spans), vec![0..line_end]);
+    }
+
+    #[test]
+    fn html_bad_hex_color_does_not_panic() {
+        // 非 ASCII / 位数不对的十六进制颜色应安全忽略
+        let spans = parse("<font color=\"#éa\">x</font>");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].color, None);
+    }
+
+    #[test]
+    fn html_nested_emphasis_inside_font() {
+        let src = "<font color=\"#ff0000\">a *b* c</font>";
+        let spans = parse(src);
+        // 外层颜色施加到所有文本片段，内层斜体保留
+        assert!(
+            spans
+                .iter()
+                .filter(|s| s.kind == SpanKind::Text)
+                .all(|s| s.color == Some((255, 0, 0)))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.role == SpanRole::Emphasis && s.kind == SpanKind::Marker)
+        );
     }
 }

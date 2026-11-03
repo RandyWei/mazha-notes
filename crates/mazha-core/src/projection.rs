@@ -1054,6 +1054,17 @@ mod tests {
     }
 
     #[test]
+    fn html_font_color_reaches_text_run() {
+        let l = one("<font color=\"#ff0000\">红</font>字");
+        assert_eq!(l.display_text(), "红字");
+        assert_eq!(l.runs.len(), 2);
+        assert_eq!(l.runs[0].text, "红");
+        assert_eq!(l.runs[0].color, Some((255, 0, 0)));
+        assert_eq!(l.runs[1].text, "字");
+        assert_eq!(l.runs[1].color, None);
+    }
+
+    #[test]
     fn list_item_has_bullet() {
         let l = one("- item");
         assert_eq!(l.display_text(), "item");

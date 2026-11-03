@@ -605,6 +605,8 @@ impl BlockGeom {
 
 /// 表格单元格左右内边距（源码里的空格不再作为唯一留白，网格模式统一加内边距）。
 const TABLE_CELL_PAD: Pixels = px(10.);
+/// 超宽表格压缩列宽时的单元格最小内容宽度（不含左右 padding）。
+const TABLE_CELL_MIN_INNER: Pixels = px(48.);
 
 /// 一张网格化表格的公共几何（所有行共享列宽与边界）。
 ///
@@ -625,10 +627,10 @@ struct TableCellGeom {
     display: Range<usize>,
     /// 单元格首字符在整行显示文本中的字符列（供命中测试换算列号）。
     start_col: usize,
-    /// 文本绘制 x（相对表格左缘，已含内边距）。
+    /// 文本绘制 x（相对表格左缘，已含内边距；单行单元格含对齐偏移）。
     x: Pixels,
-    /// 形状化后的单元格文本（单行，不换行）。
-    shaped: Arc<ShapedLine>,
+    /// 形状化后的单元格文本（可软换行）。
+    shaped: Arc<WrappedLine>,
 }
 
 /// 一行表格的网格几何。
@@ -640,6 +642,10 @@ struct TableRowGeom {
     cells: Vec<TableCellGeom>,
     /// 文本相对行顶的纵向偏移（表头行加高后垂直居中）。
     offset_y: Pixels,
+    /// 单元格内每个视觉行的行高。
+    line_height: Pixels,
+    /// 整行高度（含单元格换行与表头内边距）。
+    height: Pixels,
 }
 
 /// 最近的单元格：显示字节 → (单元格序号, 单元格内相对字节)。
@@ -687,11 +693,15 @@ fn table_point_of_col(
     col: usize,
 ) -> Option<Point<Pixels>> {
     let (cell, local) = table_cell_of_col(row, line, col)?;
-    Some(point(cell.x + cell.shaped.x_for_index(local), row.offset_y))
+    let p = cell
+        .shaped
+        .position_for_index(local, row.line_height)
+        .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
+    Some(point(cell.x + p.x, row.offset_y + p.y))
 }
 
-/// 表格行：块内 x → 显示列。
-fn table_col_of_point(row: &TableRowGeom, x: Pixels) -> Option<usize> {
+/// 表格行：块内坐标 → 显示列。
+fn table_col_of_point(row: &TableRowGeom, x: Pixels, y: Pixels) -> Option<usize> {
     let idx = row
         .grid
         .boundaries
@@ -700,7 +710,14 @@ fn table_col_of_point(row: &TableRowGeom, x: Pixels) -> Option<usize> {
         .min(row.cells.len().saturating_sub(1));
     let cell = row.cells.get(idx)?;
     let local_x = x - cell.x;
-    let mut byte = cell.shaped.closest_index_for_x(local_x);
+    // 行高内钳住 y，避免点在单元格底部 padding 时越界到第 0 行
+    let lines = cell.shaped.wrap_boundaries().len() + 1;
+    let max_y = row.line_height * lines.saturating_sub(1) as f32;
+    let local_y = (y - row.offset_y).clamp(Pixels::ZERO, max_y);
+    let mut byte = cell
+        .shaped
+        .closest_index_for_position(point(local_x, local_y), row.line_height)
+        .unwrap_or_else(|ix| ix);
     while byte > 0 && !cell.shaped.text.is_char_boundary(byte) {
         byte -= 1;
     }
@@ -722,8 +739,8 @@ impl BlockGeom {
     ///
     /// x 先按列边界定位列，再在单元格内做最近字节命中；落在单元格右侧内边距时
     /// 归到该格末尾（与点击表格右半部分的行为一致）。
-    fn table_col_of_point(&self, x: Pixels) -> Option<usize> {
-        table_col_of_point(self.table.as_ref()?, x)
+    fn table_col_of_point(&self, x: Pixels, y: Pixels) -> Option<usize> {
+        table_col_of_point(self.table.as_ref()?, x, y)
     }
 
     /// 显示列 → 块内坐标（表格走单元格排版，普通行走整行 shape）。
@@ -739,7 +756,7 @@ impl BlockGeom {
     /// 块内坐标 → 显示列（表格走单元格排版，普通行走整行 shape）。
     fn col_of_point(&self, x: Pixels, y: Pixels) -> Option<usize> {
         if self.table.is_some() {
-            self.table_col_of_point(x)
+            self.table_col_of_point(x, y)
         } else {
             let byte = self
                 .shaped
@@ -906,7 +923,6 @@ fn build_table_grids(
             .map_or(indent_base, |l| block_indent(l, indent_base));
         let avail = (content_width_total - indent - BASE).max(px(48.));
 
-        // 先收集各行文本/样式（每行只 build 一次），确定实际列数。
         struct RawRow {
             idx: usize,
             header: bool,
@@ -951,19 +967,18 @@ fn build_table_grids(
             continue;
         }
 
-        // 形状化每个单元格并取自然宽度；列宽取该列所有行中的最大值。
         let pad = TABLE_CELL_PAD;
-        let mut widths: Vec<Pixels> = vec![px(40.); cols];
-        struct CellRaw {
-            display: Range<usize>,
-            start_col: usize,
-            shaped: Arc<ShapedLine>,
-            natural: Pixels,
+        let min_width = (pad * 2. + TABLE_CELL_MIN_INNER).max(px(2.));
+        let floor_width = (avail / cols as f32).max(px(2.));
+        if avail < pad * 2. * cols as f32 + px(16.) {
+            // 可用宽度连最小内边距都放不下，保持旧的流式回退
+            continue;
         }
-        let mut shaped_rows: Vec<(usize, bool, Vec<CellRaw>, Pixels)> = Vec::new();
+        let min_width = min_width.min(floor_width);
+
+        // 先量自然宽度（列宽包含左右 padding），再决定是否压缩
+        let mut widths: Vec<Pixels> = vec![min_width; cols];
         for row in &raw {
-            let line = &projection.lines[row.idx];
-            let mut cells_out = Vec::with_capacity(cols);
             for (c, width) in widths.iter_mut().enumerate() {
                 let range = row.cells.get(c).cloned().unwrap_or(0..0);
                 let abs = row.prefix + range.start..row.prefix + range.end;
@@ -972,24 +987,30 @@ fn build_table_grids(
                     window
                         .text_system()
                         .shape_line(ctext.into(), row.font_size, &cruns, None);
-                let natural = shaped.width();
-                *width = (*width).max(natural + pad * 2.);
-                cells_out.push(CellRaw {
-                    display: range.clone(),
-                    start_col: line.display_col_of_byte(range.start),
-                    shaped: Arc::new(shaped),
-                    natural,
-                });
+                *width = (*width).max(shaped.width() + pad * 2.);
             }
-            let line_px = block_line_px(&line.block, row.font_size)
-                + if row.header { px(12.) } else { Pixels::ZERO };
-            shaped_rows.push((row.idx, row.header, cells_out, line_px));
         }
-        let total: Pixels = widths.iter().copied().sum();
+        let natural_total: Pixels = widths.iter().copied().sum();
+        if natural_total > avail {
+            // 在 [min_width, natural] 之间做线性压缩：总宽超出越多，列越接近最小宽度
+            let min_total = min_width * cols as f32;
+            let scale = if natural_total > min_total {
+                ((avail - min_total) / (natural_total - min_total)).clamp(0., 1.)
+            } else {
+                0.
+            };
+            for w in &mut widths {
+                let natural = (*w).max(min_width);
+                *w = min_width + (natural - min_width) * scale;
+            }
+        }
+        // 防止浮点累计略超可用宽度；最后一列吸收误差
+        let mut total: Pixels = widths.iter().copied().sum();
         if total > avail {
-            continue;
+            let last = widths.len() - 1;
+            widths[last] = (widths[last] - (total - avail)).max(min_width);
+            total = widths.iter().copied().sum();
         }
-        // 列边界与单元格 x（文本在列内左对齐；宽度已保证放得下）。
         let mut boundaries = Vec::with_capacity(cols + 1);
         boundaries.push(Pixels::ZERO);
         for w in &widths {
@@ -1000,39 +1021,60 @@ fn build_table_grids(
             boundaries: boundaries.clone(),
             width: total,
         });
-        for (idx, header, cells, line_px) in shaped_rows {
-            let offset_y = if header {
-                ((line_px - LINE_HEIGHT) / 2.).max(Pixels::ZERO)
-            } else {
-                Pixels::ZERO
-            };
-            let cells = cells
-                .into_iter()
-                .enumerate()
-                .map(|(c, cell)| {
-                    // 列内对齐：分隔行 `:--`/`:-:`/`--:` 决定文本在可用宽度内的位置
-                    let inner = (widths[c] - pad * 2.).max(Pixels::ZERO);
-                    let align = align.get(c).copied().unwrap_or(Align::Left);
-                    let extra = (inner - cell.natural).max(Pixels::ZERO);
-                    let x = boundaries[c]
-                        + pad
-                        + match align {
-                            Align::Left => Pixels::ZERO,
-                            Align::Center => extra / 2.,
-                            Align::Right => extra,
-                        };
-                    TableCellGeom {
-                        display: cell.display,
-                        start_col: cell.start_col,
-                        x,
-                        shaped: cell.shaped,
-                    }
-                })
-                .collect();
-            out[idx] = Some(TableRowGeom {
+
+        for row in &raw {
+            let line = &projection.lines[row.idx];
+            let line_height = block_line_px(&line.block, row.font_size);
+            let mut cells = Vec::with_capacity(cols);
+            let mut max_lines = 1usize;
+            for (c, w) in widths.iter().enumerate() {
+                let range = row.cells.get(c).cloned().unwrap_or(0..0);
+                let abs = row.prefix + range.start..row.prefix + range.end;
+                let (ctext, cruns) = slice_line_runs(&row.text, &row.runs, abs);
+                let inner = (*w - pad * 2.).max(Pixels::ZERO);
+                let shaped = shape_wrapped_line(
+                    window,
+                    ctext.into(),
+                    row.font_size,
+                    &cruns,
+                    inner.max(px(1.)),
+                );
+                let lines = shaped.wrap_boundaries().len() + 1;
+                max_lines = max_lines.max(lines);
+                // 单行时保留原有的居中/右对齐；换行后的单元格统一左对齐，
+                // 避免每行的对齐偏移与光标/选区换算不一致。
+                let extra = if lines == 1 {
+                    (inner - shaped.width()).max(Pixels::ZERO)
+                } else {
+                    Pixels::ZERO
+                };
+                let align = align.get(c).copied().unwrap_or(Align::Left);
+                let x = boundaries[c]
+                    + pad
+                    + match align {
+                        Align::Left => Pixels::ZERO,
+                        Align::Center => extra / 2.,
+                        Align::Right => extra,
+                    };
+                cells.push(TableCellGeom {
+                    display: range.clone(),
+                    start_col: line.display_col_of_byte(range.start),
+                    x,
+                    shaped: Arc::new(shaped),
+                });
+            }
+            let header_pad = if row.header { px(12.) } else { Pixels::ZERO };
+            let height = line_height * max_lines as f32 + header_pad;
+            out[row.idx] = Some(TableRowGeom {
                 grid: grid.clone(),
                 cells,
-                offset_y,
+                offset_y: if row.header {
+                    header_pad / 2.
+                } else {
+                    Pixels::ZERO
+                },
+                line_height,
+                height,
             });
         }
     }
@@ -1068,11 +1110,6 @@ struct DocLayout {
     caret_row: Option<(Pixels, Pixels)>,
     /// 任务复选框：`(窗口坐标矩形, `[ ]`/`[x]` 的源字节区间)`；点击可切换完成状态。
     task_boxes: Vec<(Bounds<Pixels>, Range<usize>)>,
-    /// 滚动视口（滚动容器的窗口坐标 bounds；prepaint 从 `ScrollHandle` 读取）。
-    ///
-    /// 内容随滚动上移后仅凭 `origin` 无法区分"标签栏/信息条"与"已滚出视口的内容"，
-    /// 命中测试用它把点击先限定在编辑区视口内。
-    viewport: Bounds<Pixels>,
 }
 
 impl DocLayout {
@@ -2692,10 +2729,13 @@ impl DocView {
             // 拖到最下方：落到文末
             let last_idx = layout.blocks.len() - 1;
             let last_row = *layout.row_starts.last().unwrap_or(&0);
-            let rel_x = (position.x - layout.origin.x - layout.blocks[last_idx].indent).max(Pixels::ZERO);
+            let rel_x =
+                (position.x - layout.origin.x - layout.blocks[last_idx].indent).max(Pixels::ZERO);
             let local_y = layout.row_height(last_row) - layout.line_height / 2.;
             if let Some(col) = layout.blocks[last_idx].col_of_point(rel_x, local_y) {
-                let src = self.doc.snap_to_boundary(layout.blocks[last_idx].source_of_col(col));
+                let src = self
+                    .doc
+                    .snap_to_boundary(layout.blocks[last_idx].source_of_col(col));
                 return Some(src);
             }
             return Some(self.doc.snap_to_boundary(self.doc.len()));
@@ -3461,6 +3501,9 @@ impl Render for DocView {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w(px(0.))
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
@@ -3610,13 +3653,11 @@ impl Render for DocView {
                             let mut clicks = 1u32;
                             if let Some(last_t) = view.last_click_at
                                 && let Some(last_p) = view.last_click_pos
+                                && now.saturating_duration_since(last_t).as_millis() < 400
+                                && (event.position.x - last_p.x).abs() < px(4.)
+                                && (event.position.y - last_p.y).abs() < px(4.)
                             {
-                                if now.saturating_duration_since(last_t).as_millis() < 400
-                                    && (event.position.x - last_p.x).abs() < px(4.)
-                                    && (event.position.y - last_p.y).abs() < px(4.)
-                                {
-                                    clicks = view.click_count.saturating_add(1).min(3);
-                                }
+                                clicks = view.click_count.saturating_add(1).min(3);
                             }
                             view.last_click_at = Some(now);
                             view.last_click_pos = Some(event.position);
@@ -3641,10 +3682,10 @@ impl Render for DocView {
                                 } else if clicks == 2 {
                                     view.select_word_at(src);
                                     // 双击选词后允许拖拽扩展选区（像主流编辑器）
-                                    if let Some(c) = view.cursors.get_mut(view.primary) {
-                                        if c.anchor.is_none() {
-                                            c.anchor = Some(c.caret);
-                                        }
+                                    if let Some(c) = view.cursors.get_mut(view.primary)
+                                        && c.anchor.is_none()
+                                    {
+                                        c.anchor = Some(c.caret);
                                     }
                                     view.selecting = true;
                                 } else {
@@ -5345,7 +5386,12 @@ impl Element for DocElement {
                     } else {
                         None
                     };
-                    let mut line_px = block_line_px(&line.block, font_size);
+                    // 网格表格行高由单元格换行后的实际视觉行数决定。
+                    let mut line_px = if let Some(row) = &table_row {
+                        row.height
+                    } else {
+                        block_line_px(&line.block, font_size)
+                    };
                     // 独占图片行：行高跟随图片（含上下呼吸间距），命中测试/滚动同步生效。
                     if let Some(image) = &image_preview {
                         line_px = image.size.height + IMAGE_VERTICAL_PAD * 2.;
@@ -5355,11 +5401,17 @@ impl Element for DocElement {
                     // 光标若落进分隔行则恢复正常高度，否则会出现"看不见的光标"。
                     let is_delim_hidden = line.block.table_line == Some(TableLine::Delimiter)
                         && caret_pos.line != idx;
-                    if line.block.table_line == Some(TableLine::Delimiter) {
-                        line_px = if is_delim_hidden { Pixels::ZERO } else { line_px };
-                    } else if line.block.table_line == Some(TableLine::Header) {
-                        // 上下各多给约 6px，表头文字在行盒内垂直居中
-                        line_px += px(12.);
+                    if table_row.is_none() {
+                        if line.block.table_line == Some(TableLine::Delimiter) {
+                            line_px = if is_delim_hidden {
+                                Pixels::ZERO
+                            } else {
+                                line_px
+                            };
+                        } else if line.block.table_line == Some(TableLine::Header) {
+                            // 上下各多给约 6px，表头文字在行盒内垂直居中
+                            line_px += px(12.);
+                        }
                     }
                     // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
                     let wrap_width = if line.block.code_block {
@@ -5384,7 +5436,7 @@ impl Element for DocElement {
                     if let Some(col) = caret_col {
                         if let Some(row) = &table_row {
                             if let Some(p) = table_point_of_col(row, line, col) {
-                                caret_row = Some((top_acc + p.y, line_px));
+                                caret_row = Some((top_acc + p.y, row.line_height));
                             }
                         } else {
                             let cbyte = if let Some(src) = &raw_src {
@@ -5489,10 +5541,15 @@ impl Element for DocElement {
                     }
 
                     row_starts.push(row_acc);
-                    row_tops.push(top_acc);
+                    // `row_tops` 按**全局视觉行**建表（软换行后一行会占多行）：
+                    // 之前的实现每逻辑行只 push 一个顶边，后续块用 `row_starts` 里的
+                    // 视觉行号索引时会取到别的行/越界为 0，导致块与块重叠、图片与
+                    // 段落错位、内容下方出现大段空白。
+                    for _ in 0..rows_eff {
+                        row_tops.push(top_acc);
+                        top_acc += line_px;
+                    }
                     row_acc += rows_eff;
-                    // 块内各行同高：内容 y 累计 = 行高 × 视觉行数
-                    top_acc += line_px * rows_eff as f32;
                     // 选区显示列：展开态显示文本变长（URL/标记可见），按源区间在本行内重算
                     let selection_cols = if is_revealed {
                         let (start, end) = (line.source_range.start, line.source_range.end);
@@ -5542,10 +5599,6 @@ impl Element for DocElement {
                 (v, widgets, row_starts, row_tops, caret_row, task_cand)
             });
 
-        // 滚动视口：滚动容器（`#editor` 的 `track_scroll`）是本元素的祖先，
-        // 其布局先于本元素完成，此刻 `ScrollHandle::bounds()` 即为滚动视口。
-        let viewport = self.view.read(cx).scroll.bounds();
-
         // 任务复选框的源字节区间：`[ ]`/`[x]` 埋在源行（`- [ ] 文本`）里，
         // 等 update 返回（projection 已释放）再读 doc，并算出窗口坐标矩形。
         let mut task_boxes = Vec::new();
@@ -5578,7 +5631,6 @@ impl Element for DocElement {
             row_tops,
             caret_row,
             task_boxes,
-            viewport,
         }
     }
 
@@ -5835,36 +5887,46 @@ impl Element for DocElement {
                         // 表格单元格范围相对"显示文本"（不含引用前缀），故重算起止字节
                         let b0 = block.proj.display_byte_of_col(cols.start);
                         let b1 = block.proj.display_byte_of_col(cols.end);
-                        // 表格：逐单元格画高亮（竖线/内边距不参与选区）
+                        // 表格：逐单元格、逐视觉行画高亮（竖线/内边距不参与选区）
                         for cell in &row.cells {
-                            let s = b0.max(cell.display.start);
-                            let e = b1.min(cell.display.end);
+                            let s = b0.max(cell.display.start).min(cell.display.end);
+                            let e = b1.max(cell.display.start).min(cell.display.end);
                             if e <= s {
                                 continue;
                             }
-                            let x0 = if s == cell.display.start {
-                                Pixels::ZERO
-                            } else {
-                                cell.shaped.x_for_index(s - cell.display.start)
-                            };
-                            let x1 = if e == cell.display.end {
-                                cell.shaped.width()
-                            } else {
-                                cell.shaped.x_for_index(e - cell.display.start)
-                            };
-                            let width = (x1 - x0).max(Pixels::ZERO);
-                            window.paint_quad(fill(
-                                bounds(
-                                    point(text_x + cell.x + x0, row_top + row.offset_y),
-                                    size(width, LINE_HEIGHT),
-                                ),
-                                Hsla {
-                                    h: 0.61,
-                                    s: 0.9,
-                                    l: 0.55,
-                                    a: 0.32,
-                                },
-                            ));
+                            let rb = row_byte_bounds(&cell.shaped);
+                            for r in 0..rb.len().saturating_sub(1) {
+                                let (rs, re) = (rb[r], rb[r + 1]);
+                                let ss = s.max(rs);
+                                let ee = e.min(re);
+                                if ee <= ss {
+                                    continue;
+                                }
+                                let p0 = cell
+                                    .shaped
+                                    .position_for_index(ss - cell.display.start, row.line_height)
+                                    .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
+                                let p1 = cell
+                                    .shaped
+                                    .position_for_index(ee - cell.display.start, row.line_height)
+                                    .unwrap_or(p0);
+                                let width = (p1.x - p0.x).max(Pixels::ZERO);
+                                window.paint_quad(fill(
+                                    bounds(
+                                        point(
+                                            text_x + cell.x + p0.x,
+                                            row_top + row.offset_y + row.line_height * r as f32,
+                                        ),
+                                        size(width, row.line_height),
+                                    ),
+                                    Hsla {
+                                        h: 0.61,
+                                        s: 0.9,
+                                        l: 0.55,
+                                        a: 0.32,
+                                    },
+                                ));
+                            }
                         }
                     } else {
                         let rb = row_byte_bounds(&block.shaped);
@@ -5947,7 +6009,7 @@ impl Element for DocElement {
                 for cell in &row.cells {
                     let _ = cell.shaped.paint(
                         point(text_x + cell.x, row_top + row.offset_y),
-                        LINE_HEIGHT,
+                        row.line_height,
                         TextAlign::Left,
                         None,
                         window,
@@ -6013,8 +6075,8 @@ impl Element for DocElement {
             {
                 // p.y = 光标所在视觉行在块内的顶边偏移（软换行下不再画错行）
                 // 表格单元格是单行 shape，光标高度按基准行高，避免表头行加高后光标过长
-                let caret_h = if block.table.is_some() {
-                    LINE_HEIGHT
+                let caret_h = if let Some(row) = &block.table {
+                    row.line_height
                 } else {
                     line_px
                 };
