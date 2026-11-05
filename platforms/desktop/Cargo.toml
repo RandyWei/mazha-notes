@@ -32,3 +32,7 @@ core-text = "21"
 core-graphics = "0.24"
 core-foundation = "0.10"
 foreign-types = "0.5"
+# Dock 图标：把 assets/appicon.png 解码为 NSImage 后设置到 NSApplication
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["NSData"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }

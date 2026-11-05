@@ -6254,6 +6254,32 @@ impl IntoElement for DocElement {
     }
 }
 
+/// 把编译进二进制的应用图标设为 macOS Dock 图标。
+///
+/// `cargo run` 启动的是裸可执行文件，没有 `.app/Contents/Resources`，系统默认显示通用
+/// 可执行图标；这里直接通过 AppKit 设置 `NSApplication.applicationIconImage`。
+#[cfg(target_os = "macos")]
+fn install_app_icon() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/appicon.png"));
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // 图标必须在主线程设置；调用点位于 GPUI 的主线程回调。
+    unsafe {
+        NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_app_icon() {}
+
 fn main() {
     // 可选参数：要打开的 .md 路径；缺省时渲染内置示例
     let path = std::env::args().nth(1).map(PathBuf::from);
@@ -6280,6 +6306,7 @@ fn main() {
     application()
         .with_http_client(Arc::new(http_client))
         .run(move |cx| {
+            install_app_icon();
             gpui_kit::init(cx);
             // Tab/Shift+Tab 在编辑器内由本应用处理；Root 的全局 tab 绑定会吞掉按键
             // （命中绑定后 gpui 不再调用 on_key_down），故必须用更具体的 key context 覆盖。
