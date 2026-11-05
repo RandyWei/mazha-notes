@@ -129,6 +129,8 @@ struct Palette {
     code_block_bg: Hsla,
     /// 引用块整行浅底（比 `subtle` 更淡，避免压过正文）。
     quote_bg: Hsla,
+    /// 选中态浅灰底（标签页 / 文件树当前项），与蓝色文本选区区分。
+    selected_bg: Hsla,
     /// 选区高亮底色（accent 的低透明度）。
     selection: Hsla,
 }
@@ -163,6 +165,11 @@ impl Palette {
                 a: 0.04,
                 ..theme.foreground
             },
+            // 选中底色：中性浅灰（前景色低透明度），不抢正文也不与蓝色选区混淆
+            selected_bg: Hsla {
+                a: 0.12,
+                ..theme.foreground
+            },
             // 选区底色：常规编辑器风格（蓝底高亮）
             selection: Hsla {
                 h: 215.0,
@@ -193,6 +200,7 @@ impl Palette {
             code_bg: fg,
             code_block_bg: fg,
             quote_bg: fg,
+            selected_bg: fg,
             selection: fg,
         }
     }
@@ -1444,6 +1452,10 @@ struct DocView {
     /// 上次滚动跟随的光标行 `(顶边, 行高)`（内容坐标）；变化才再次介入滚动，
     /// 避免把用户手动滚上去的视口又拽回来。
     caret_scroll_key: Option<(Pixels, Pixels)>,
+    /// 待处理的大纲跳转源偏移：下次 prepaint 把该行顶边对齐到视口顶部。
+    ///
+    /// 与 `caret_scroll_key` 分开，避免普通光标移动的“最小滚动”覆盖跳转置顶。
+    scroll_to_source_top: Option<usize>,
     /// 焦点句柄：键盘事件只在获得焦点后送达。
     focus: FocusHandle,
     /// 光标当前是否处于闪烁的“可见”相位（每 500ms 翻转）。
@@ -1553,6 +1565,7 @@ impl DocView {
             scroll: ScrollHandle::new(),
             content_height: px(0.),
             caret_scroll_key: None,
+            scroll_to_source_top: None,
             focus,
             cursor_visible: false,
             _blink_task: Task::ready(()),
@@ -2499,6 +2512,8 @@ impl DocView {
         self.cursors = vec![Cursor::new(src)];
         self.primary = 0;
         self.selecting = false;
+        // 下一次 prepaint 把目标行顶边对齐视口顶部（普通光标移动仍走最小滚动）。
+        self.scroll_to_source_top = Some(src);
         cx.notify();
     }
 
@@ -2986,6 +3001,7 @@ impl DocView {
         // 布局/滚动位置依赖当前视口，切换后重建，避免沿用上一个文档的坐标。
         self.layout = None;
         self.caret_scroll_key = None;
+        self.scroll_to_source_top = None;
         self.highlighter = None;
         self.find = FindState::default();
         self.saved_text = saved_text;
@@ -3025,6 +3041,26 @@ impl DocView {
             self.active = self.tabs.len() - 1;
         }
         self.activate_tab(self.active, cx);
+    }
+
+    /// 关闭指定标签页（Tab 上的关闭按钮）。
+    ///
+    /// 关闭非当前标签只移除快照并修正 `active` 下标，当前编辑器状态不受影响；
+    /// 关闭当前标签复用 `close_current_tab`，由它激活相邻标签。
+    #[allow(dead_code)]
+    fn close_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() || self.tabs.len() <= 1 {
+            return;
+        }
+        if idx == self.active {
+            self.close_current_tab(cx);
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.active > idx {
+            self.active -= 1;
+        }
+        cx.notify();
     }
 
     #[allow(dead_code)]
@@ -3505,7 +3541,7 @@ impl Render for DocView {
                             .flex()
                             .justify_between()
                             .items_center()
-                            .when(cur, |d| d.bg(palette.selection))
+                            .when(cur, |d| d.bg(palette.selected_bg))
                             .child(
                                 div()
                                     .flex_1()
@@ -3586,20 +3622,48 @@ impl Render for DocView {
             tbc.push(
                 div()
                     .id(gpui::ElementId::Name(format!("tab-{i}").into()))
-                    .px_2()
-                    .py_0p5()
+                    .flex()
+                    .items_center()
                     .text_sm()
-                    .cursor_pointer()
-                    .when(act, |d| d.bg(palette.selection))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |v, _ev, _w, cx| {
-                            // 必须走 switch_tab：直接改 active 只会切换高亮，
-                            // 编辑器仍持有上一个文档的 doc/cursors。
-                            v.switch_tab(i, cx);
-                        }),
+                    .when(act, |d| d.bg(palette.selected_bg))
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(format!("tab-label-{i}").into()))
+                            .px_2()
+                            .py_0p5()
+                            .max_w(px(190.))
+                            .truncate()
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |v, _ev, _w, cx| {
+                                    // 必须走 switch_tab：直接改 active 只会切换高亮，
+                                    // 编辑器仍持有上一个文档的 doc/cursors。
+                                    v.switch_tab(i, cx);
+                                }),
+                            )
+                            .child(name),
                     )
-                    .child(name)
+                    // 单标签时不显示关闭按钮，避免把唯一的编辑区关空。
+                    .when(self.tabs.len() > 1, |d| {
+                        d.child(
+                            div()
+                                .id(gpui::ElementId::Name(format!("tab-close-{i}").into()))
+                                .px_1()
+                                .py_0p5()
+                                .text_xs()
+                                .text_color(palette.muted)
+                                .cursor_pointer()
+                                .hover(|d| d.text_color(palette.foreground))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |v, _ev, _w, cx| {
+                                        v.close_tab(i, cx);
+                                    }),
+                                )
+                                .child("✕"),
+                        )
+                    })
                     .into_any_element(),
             );
         }
@@ -3627,11 +3691,44 @@ impl Render for DocView {
             .border_color(palette.border)
             .bg(palette.subtle)
             .children(tbc);
+        // 底部状态栏：文件信息 + 行数/光标 + 常用快捷键，横跨整个窗口。
+        let status_bar = h_flex()
+            .id("statusbar")
+            .w_full()
+            .h(px(24.))
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .border_t_1()
+            .border_color(palette.border)
+            .bg(palette.subtle)
+            .text_xs()
+            .text_color(palette.muted)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(format!(
+                        "{} · {}",
+                        self.header_text(),
+                        self.header_full_path()
+                    )))
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(format!("{line_count} 行 · 光标×{caret_count}")),
+                    ),
+            )
+            .child("Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换");
         div()
             .id("app")
             .size_full()
             .flex()
-            .flex_row()
+            .flex_col()
             .bg(palette.background)
             .text_color(palette.foreground)
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _w, cx| {
@@ -3654,207 +3751,200 @@ impl Render for DocView {
                     }
                 }),
             )
-            .child(sidebar_el)
-            .child(sidebar_resize)
-            // 右侧主列：标签栏 + 信息条 + 查找/命令浮层 + 编辑区（纵向排列）
             .child(
                 div()
-                    .id("doc")
-                    .h_full()
+                    .id("main")
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
-                    .min_w(px(0.))
-                    .child(tabbar_el)
-                    .key_context("mazha-doc")
-                    .on_action(cx.listener(|view, _: &InsertTab, _window, cx| {
-                        view.handle_tab_action(false, cx);
-                        cx.stop_propagation();
-                    }))
-                    .on_action(cx.listener(|view, _: &Outdent, _window, cx| {
-                        view.handle_tab_action(true, cx);
-                        cx.stop_propagation();
-                    }))
-                    .track_focus(&focus)
-                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                        handle_key(view, event, window, cx);
-                    }))
-                    // 左键按下：先试任务复选框切换，再放置光标；支持双击选词、三击选行
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|view, event: &MouseDownEvent, window, cx| {
-                            // Cmd+点击（Windows/Linux 为 Ctrl+点击）链接：交给系统默认应用打开，不移动光标
-                            if event.modifiers.secondary()
-                                && let Some(url) = view.link_at(event.position)
-                            {
-                                cx.open_url(&url);
-                                return;
-                            }
-                            // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（Shift/Alt 点击不切换，
-                            // 让它们保持“扩选/多光标”语义；命中失败则继续放光标）
-                            if !event.modifiers.shift && !event.modifiers.alt {
-                                view.toggle_task_at(event.position, cx);
-                            }
-                            // 双击/三击判定（同一区域 400ms 内连续点击）
-                            let now = std::time::Instant::now();
-                            let mut clicks = 1u32;
-                            if let Some(last_t) = view.last_click_at
-                                && let Some(last_p) = view.last_click_pos
-                                && now.saturating_duration_since(last_t).as_millis() < 400
-                                && (event.position.x - last_p.x).abs() < px(4.)
-                                && (event.position.y - last_p.y).abs() < px(4.)
-                            {
-                                clicks = view.click_count.saturating_add(1).min(3);
-                            }
-                            view.last_click_at = Some(now);
-                            view.last_click_pos = Some(event.position);
-                            view.click_count = clicks;
-                            if let Some(src) = view.hit_source(event.position) {
-                                if event.modifiers.alt {
-                                    // Alt+Click: 添加/移除光标
-                                    view.add_or_remove_cursor(src);
-                                    view.selecting = false;
-                                } else if event.modifiers.shift {
-                                    // Shift+Click: 从当前锚点扩选到点击处；无选区时以原光标为锚点。
-                                    // 保留 `selecting=true`，按住 Shift 继续拖拽也能继续扩选。
-                                    let c = &mut view.cursors[view.primary];
-                                    if c.anchor.is_none() {
-                                        c.anchor = Some(c.caret);
-                                    }
-                                    c.caret = src;
-                                    view.selecting = true;
-                                } else if clicks == 3 {
-                                    view.select_line_at(src);
-                                    view.selecting = false;
-                                } else if clicks == 2 {
-                                    view.select_word_at(src);
-                                    // 双击选词后允许拖拽扩展选区（像主流编辑器）
-                                    if let Some(c) = view.cursors.get_mut(view.primary)
-                                        && c.anchor.is_none()
-                                    {
-                                        c.anchor = Some(c.caret);
-                                    }
-                                    view.selecting = true;
-                                } else {
-                                    // 普通点击: 重置为单光标，锚点=点击处，供按住左键拖选使用。
-                                    let mut cursor = Cursor::new(src);
-                                    cursor.anchor = Some(src);
-                                    view.cursors = vec![cursor];
-                                    view.primary = 0;
-                                    view.selecting = true;
-                                }
-                                // 点击/拖选都让光标先显示，避免刚好落在隐藏相位。
-                                view.reset_blink(cx);
-                            }
-                            let focus = view.focus.clone();
-                            window.focus(&focus, cx);
-                            cx.notify();
-                        }),
-                    )
-                    // 拖动中：持续更新主光标；到视口外时自动滚动以扩选
-                    .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
-                        if !view.selecting {
-                            return;
-                        }
-                        // 若拖到视口外，按方向自动滚动（每帧按距离加速）
-                        let sc = view.scroll.clone();
-                        let vp = sc.bounds();
-                        if vp.size.height > Pixels::ZERO {
-                            let y = event.position.y;
-                            if y < vp.top() {
-                                let dist_f: f32 = (vp.top() - y).into();
-                                let delta_f = (dist_f / 12.0).max(2.0);
-                                let cur = sc.offset();
-                                let max_off = sc.max_offset().y;
-                                let want = (cur.y - px(delta_f)).clamp(-max_off, Pixels::ZERO);
-                                if want != cur.y {
-                                    sc.set_offset(point(cur.x, want));
-                                    cx.notify();
-                                }
-                            } else if y > vp.bottom() {
-                                let dist_f: f32 = (y - vp.bottom()).into();
-                                let delta_f = (dist_f / 12.0).max(2.0);
-                                let cur = sc.offset();
-                                let max_off = sc.max_offset().y;
-                                let want = (cur.y + px(delta_f)).clamp(-max_off, Pixels::ZERO);
-                                if want != cur.y {
-                                    sc.set_offset(point(cur.x, want));
-                                    cx.notify();
-                                }
-                            }
-                        }
-                        if let Some(src) = view.hit_source(event.position) {
-                            // 只移动活动端；锚点在按下时已固定，不能在这里用新 caret 覆盖，
-                            // 否则 anchor == caret，拖选永远为空。
-                            if let Some(c) = view.cursors.get_mut(view.primary) {
-                                c.caret = view.doc.snap_to_boundary(src);
-                            }
-                            view.reset_blink(cx);
-                            cx.notify();
-                            let _ = window;
-                        }
-                    }))
-                    // 左键松开：结束拖选
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|view, _event: &MouseUpEvent, _, cx| {
-                            view.selecting = false;
-                            cx.notify();
-                        }),
-                    )
-                    // 顶部信息条
+                    .min_h(px(0.))
+                    .child(sidebar_el)
+                    .child(sidebar_resize)
+                    // 右侧主列：标签栏 + 查找/命令浮层 + 编辑区（纵向排列）
                     .child(
-                        h_flex()
-                            .id("header")
-                            .w_full()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .h(px(28.))
-                            .border_b_1()
-                            .border_color(palette.border)
-                            .text_sm()
-                            .text_color(palette.muted)
-                            .child(self.header_text())
-                            .child(format!("· {}", self.header_full_path()))
-                            .child(format!(
-                                "· {line_count} 行 · 光标×{} · Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换",
-                                caret_count
-                            )),
-                    )
-                    // 查找/替换条（`Cmd+F` 展开时才渲染）
-                    .children(find_bar)
-                    .children(palette_overlay)
-                    // 正文滚动区：滚动**只包正文**——标签栏/信息条不随之卷走。
-                    // 自己 `track_scroll` 绑定 `self.scroll`：可见区/滚动量回填到该句柄，
-                    // 供命中测试与光标滚动跟随使用；DocElement 上报绝对像素高度，
-                    // 内容超视口才有滚动量（D65）。
-                    .child(
-                        // 外层只负责定位：滚动条叠加在视口上（不随内容位移），
-                        // 内层才是滚动容器（内容随 `self.scroll` 滚动）。
                         div()
-                            .id("editor")
-                            .relative()
+                            .id("doc")
+                            .h_full()
+                            .flex()
+                            .flex_col()
                             .flex_1()
-                            .min_h(px(0.))
-                            .child(
-                                div()
-                                    .id("editor-scroll")
-                                    .absolute()
-                                    .inset_0()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&self.scroll)
-                                    .child(DocElement { view: cx.entity() }),
+                            .min_w(px(0.))
+                            .child(tabbar_el)
+                            .key_context("mazha-doc")
+                            .on_action(cx.listener(|view, _: &InsertTab, _window, cx| {
+                                view.handle_tab_action(false, cx);
+                                cx.stop_propagation();
+                            }))
+                            .on_action(cx.listener(|view, _: &Outdent, _window, cx| {
+                                view.handle_tab_action(true, cx);
+                                cx.stop_propagation();
+                            }))
+                            .track_focus(&focus)
+                            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                                handle_key(view, event, window, cx);
+                            }))
+                            // 左键按下：先试任务复选框切换，再放置光标；支持双击选词、三击选行
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                                    // Cmd+点击（Windows/Linux 为 Ctrl+点击）链接：交给系统默认应用打开，不移动光标
+                                    if event.modifiers.secondary()
+                                        && let Some(url) = view.link_at(event.position)
+                                    {
+                                        cx.open_url(&url);
+                                        return;
+                                    }
+                                    // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（Shift/Alt 点击不切换，
+                                    // 让它们保持“扩选/多光标”语义；命中失败则继续放光标）
+                                    if !event.modifiers.shift && !event.modifiers.alt {
+                                        view.toggle_task_at(event.position, cx);
+                                    }
+                                    // 双击/三击判定（同一区域 400ms 内连续点击）
+                                    let now = std::time::Instant::now();
+                                    let mut clicks = 1u32;
+                                    if let Some(last_t) = view.last_click_at
+                                        && let Some(last_p) = view.last_click_pos
+                                        && now.saturating_duration_since(last_t).as_millis() < 400
+                                        && (event.position.x - last_p.x).abs() < px(4.)
+                                        && (event.position.y - last_p.y).abs() < px(4.)
+                                    {
+                                        clicks = view.click_count.saturating_add(1).min(3);
+                                    }
+                                    view.last_click_at = Some(now);
+                                    view.last_click_pos = Some(event.position);
+                                    view.click_count = clicks;
+                                    if let Some(src) = view.hit_source(event.position) {
+                                        if event.modifiers.alt {
+                                            // Alt+Click: 添加/移除光标
+                                            view.add_or_remove_cursor(src);
+                                            view.selecting = false;
+                                        } else if event.modifiers.shift {
+                                            // Shift+Click: 从当前锚点扩选到点击处；无选区时以原光标为锚点。
+                                            // 保留 `selecting=true`，按住 Shift 继续拖拽也能继续扩选。
+                                            let c = &mut view.cursors[view.primary];
+                                            if c.anchor.is_none() {
+                                                c.anchor = Some(c.caret);
+                                            }
+                                            c.caret = src;
+                                            view.selecting = true;
+                                        } else if clicks == 3 {
+                                            view.select_line_at(src);
+                                            view.selecting = false;
+                                        } else if clicks == 2 {
+                                            view.select_word_at(src);
+                                            // 双击选词后允许拖拽扩展选区（像主流编辑器）
+                                            if let Some(c) = view.cursors.get_mut(view.primary)
+                                                && c.anchor.is_none()
+                                            {
+                                                c.anchor = Some(c.caret);
+                                            }
+                                            view.selecting = true;
+                                        } else {
+                                            // 普通点击: 重置为单光标，锚点=点击处，供按住左键拖选使用。
+                                            let mut cursor = Cursor::new(src);
+                                            cursor.anchor = Some(src);
+                                            view.cursors = vec![cursor];
+                                            view.primary = 0;
+                                            view.selecting = true;
+                                        }
+                                        // 点击/拖选都让光标先显示，避免刚好落在隐藏相位。
+                                        view.reset_blink(cx);
+                                    }
+                                    let focus = view.focus.clone();
+                                    window.focus(&focus, cx);
+                                    cx.notify();
+                                }),
                             )
+                            // 拖动中：持续更新主光标；到视口外时自动滚动以扩选
+                            .on_mouse_move(cx.listener(
+                                |view, event: &MouseMoveEvent, window, cx| {
+                                    if !view.selecting {
+                                        return;
+                                    }
+                                    // 若拖到视口外，按方向自动滚动（每帧按距离加速）
+                                    let sc = view.scroll.clone();
+                                    let vp = sc.bounds();
+                                    if vp.size.height > Pixels::ZERO {
+                                        let y = event.position.y;
+                                        if y < vp.top() {
+                                            let dist_f: f32 = (vp.top() - y).into();
+                                            let delta_f = (dist_f / 12.0).max(2.0);
+                                            let cur = sc.offset();
+                                            let max_off = sc.max_offset().y;
+                                            let want =
+                                                (cur.y - px(delta_f)).clamp(-max_off, Pixels::ZERO);
+                                            if want != cur.y {
+                                                sc.set_offset(point(cur.x, want));
+                                                cx.notify();
+                                            }
+                                        } else if y > vp.bottom() {
+                                            let dist_f: f32 = (y - vp.bottom()).into();
+                                            let delta_f = (dist_f / 12.0).max(2.0);
+                                            let cur = sc.offset();
+                                            let max_off = sc.max_offset().y;
+                                            let want =
+                                                (cur.y + px(delta_f)).clamp(-max_off, Pixels::ZERO);
+                                            if want != cur.y {
+                                                sc.set_offset(point(cur.x, want));
+                                                cx.notify();
+                                            }
+                                        }
+                                    }
+                                    if let Some(src) = view.hit_source(event.position) {
+                                        // 只移动活动端；锚点在按下时已固定，不能在这里用新 caret 覆盖，
+                                        // 否则 anchor == caret，拖选永远为空。
+                                        if let Some(c) = view.cursors.get_mut(view.primary) {
+                                            c.caret = view.doc.snap_to_boundary(src);
+                                        }
+                                        view.reset_blink(cx);
+                                        cx.notify();
+                                        let _ = window;
+                                    }
+                                },
+                            ))
+                            // 左键松开：结束拖选
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _event: &MouseUpEvent, _, cx| {
+                                    view.selecting = false;
+                                    cx.notify();
+                                }),
+                            )
+                            // 查找/替换条（`Cmd+F` 展开时才渲染）
+                            .children(find_bar)
+                            .children(palette_overlay)
+                            // 正文滚动区：滚动**只包正文**——标签栏不随之卷走。
+                            // 自己 `track_scroll` 绑定 `self.scroll`：可见区/滚动量回填到该句柄，
+                            // 供命中测试与光标滚动跟随使用；DocElement 上报绝对像素高度，
+                            // 内容超视口才有滚动量（D65）。
                             .child(
-                                div().absolute().inset_0().child(
-                                    Scrollbar::vertical(&self.scroll)
-                                        .id("editor-scrollbar")
-                                        .viewport_from_layout(),
-                                ),
+                                // 外层只负责定位：滚动条叠加在视口上（不随内容位移），
+                                // 内层才是滚动容器（内容随 `self.scroll` 滚动）。
+                                div()
+                                    .id("editor")
+                                    .relative()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .child(
+                                        div()
+                                            .id("editor-scroll")
+                                            .absolute()
+                                            .inset_0()
+                                            .overflow_y_scroll()
+                                            .track_scroll(&self.scroll)
+                                            .child(DocElement { view: cx.entity() }),
+                                    )
+                                    .child(
+                                        div().absolute().inset_0().child(
+                                            Scrollbar::vertical(&self.scroll)
+                                                .id("editor-scrollbar")
+                                                .viewport_from_layout(),
+                                        ),
+                                    ),
                             ),
                     ),
             )
+            .child(status_bar)
     }
 }
 
@@ -5689,6 +5779,15 @@ impl Element for DocElement {
         let layout_for_view = layout.clone();
         let total_height = layout.total_height();
         let caret_target = layout.caret_row;
+        // 大纲跳转：把目标源偏移映射到视觉行，再取该行顶边/行高。
+        // 必须在 `defer` 前算好，闭包拿走 layout 后就无法再查投影。
+        let jump_target = self.view.update(cx, |v, _| {
+            let src = v.scroll_to_source_top?;
+            let projection = v.doc.projection();
+            let pos = projection.source_to_doc_pos(src);
+            let row = *layout.row_starts.get(pos.line)?;
+            Some((layout.row_top(row), layout.block_line_height(pos.line)))
+        });
         let view = self.view.clone();
         window.defer(cx, move |_, cx| {
             view.update(cx, |v, cx| {
@@ -5697,7 +5796,19 @@ impl Element for DocElement {
                     v.content_height = total_height;
                     cx.notify(); // 高度变了：重排滚动区（内容超视口才会有滚动量）
                 }
-                if let Some((top, row_h)) = caret_target
+                if let Some((top, row_h)) = jump_target {
+                    let sc = v.scroll.clone();
+                    let viewport_h = sc.bounds().size.height;
+                    if viewport_h > Pixels::ZERO {
+                        // 用内容总高自己算上限，避免首次布局时 max_offset 尚未回填。
+                        let max_scroll = (total_height - viewport_h).max(Pixels::ZERO);
+                        let want = (-top).clamp(-max_scroll, Pixels::ZERO);
+                        sc.set_offset(point(sc.offset().x, want));
+                        v.scroll_to_source_top = None;
+                        v.caret_scroll_key = Some((top, row_h));
+                        cx.notify();
+                    }
+                } else if let Some((top, row_h)) = caret_target
                     && v.caret_scroll_key != Some((top, row_h))
                 {
                     let sc = v.scroll.clone();
