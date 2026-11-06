@@ -2,7 +2,7 @@
 
 技术栈：**GPUI + gpui-kit**（见 `SPEC.md` §7.1）。macOS / Windows 为 MVP 平台。
 
-**当前状态**：Phase 2 起步 —— **只读投影渲染**已可用。
+**当前状态**：Phase 4 桌面 MVP 主体达成（完整能力见 `HANDOFF.md` 与 `SPEC.md` §15）。
 
 - 独立于根 workspace 构建（GPUI 依赖很重，避免拖慢核心 crate 构建；根 `Cargo.toml` 已 `exclude = ["platforms"]`）。
 - 依赖：`gpui-kit = "0.7"`（内部锁定匹配的 `gpui-pre` 快照，**不要再单独引入 `gpui`**，否则两份类型不兼容）+ `mazha-core`（路径依赖）。
@@ -14,6 +14,28 @@ cd platforms/desktop
 cargo run                    # 打开内置示例文档（覆盖主要 Markdown 语法）
 cargo run -- path/to/note.md # 打开指定 .md
 ```
+
+## 打包 macOS .app
+
+```bash
+cd platforms/desktop
+./scripts/bundle-macos.sh          # release 构建 + ad-hoc 签名
+./scripts/bundle-macos.sh --debug  # debug 构建（快速验证打包）
+```
+
+产物在 `build/macos/码札.app` 与 `build/macos/Mazha-<版本>-macos.zip`。脚本会：
+
+- 从 `assets/appicon.png` 生成完整 `AppIcon.icns`；
+- 写入 `macos/Info.plist`（Bundle ID `icu.bughub.app.mazha`、版本取 `SPEC.md` 最新变更记录）；
+- 复制二进制、做 ad-hoc 签名并校验。
+
+正式对外分发需设置 `MAZHA_CODESIGN_IDENTITY="Developer ID Application: ..."` 做 Developer ID 签名，再配置 notarytool 凭据并执行：
+
+```bash
+MAZHA_NOTARY_PROFILE=mazha-notary ./scripts/notarize-macos.sh
+```
+
+该脚本提交 Apple 公证、`stapler` 装订票据，并用 `spctl` 验证 Gatekeeper 评估。
 
 ## 已实现（Phase 2 第一步）
 
