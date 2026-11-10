@@ -15,6 +15,27 @@ cargo run                    # 打开内置示例文档（覆盖主要 Markdown 
 cargo run -- path/to/note.md # 打开指定 .md
 ```
 
+## 外观设置（0.1.83，D62）
+
+主题、正文字体/等宽字体与字号可运行时调整，退出时自动保存：
+
+- 主题：跟随系统 / 浅色 / 深色；
+- 正文字体/等宽字体：预设列表循环（含主题默认）；
+- 正文字号：12–28px；等宽字号：10–24px。
+
+操作方式：
+
+| 操作 | 快捷键 |
+|------|--------|
+| 正文字号 +/− | `Cmd+=` / `Cmd+-` |
+| 等宽字号 +/− | `Cmd+Option+=` / `Cmd+Option+-` |
+| 循环主题 | `Cmd+Shift+L` |
+| 重置外观 | `Cmd+Option+0` |
+
+也可用 `Cmd+P` 命令面板执行「主题」「正文字体」「等宽字体」「字号」相关命令。当前字号与主题显示在底部状态栏。
+
+设置文件默认写到平台配置目录（macOS `~/Library/Application Support/Mazha/settings.json`，Linux `$XDG_CONFIG_HOME/mazha/settings.json`，Windows `%APPDATA%\Mazha\settings.json`）；设置 `MAZHA_SETTINGS_PATH=/path/to/settings.json` 可覆盖，便于测试或多套配置。
+
 ## 打包 macOS .app
 
 ```bash

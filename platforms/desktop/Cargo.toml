@@ -25,6 +25,9 @@ gpui-kit = "0.7"
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.9" }
 # 内联 data:image/...;base64 图片解码
 base64 = "0.22"
+# 外观设置持久化（settings.json）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 中文斜体合成倾斜：取 CoreText 字形轮廓 → 剪切 → 自绘（见 `src/oblique.rs`）

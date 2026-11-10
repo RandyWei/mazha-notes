@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::scroll::Scrollbar;
-use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::component::{ActiveTheme, Theme, ThemeMode};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use mazha_core::{
@@ -57,6 +57,9 @@ use mazha_md::{SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
 mod oblique;
+mod settings;
+
+use settings::{FONT_STEP, Settings, ThemePreference, clamp_font_size, clamp_mono_font_size};
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
 const SAMPLE: &str = "\
@@ -1032,7 +1035,7 @@ fn build_table_grids(
 
         for row in &raw {
             let line = &projection.lines[row.idx];
-            let line_height = block_line_px(&line.block, row.font_size);
+            let line_height = block_line_px_with_mono(&line.block, row.font_size, mono_size);
             let mut cells = Vec::with_capacity(cols);
             let mut max_lines = 1usize;
             for (c, w) in widths.iter().enumerate() {
@@ -1351,6 +1354,14 @@ enum PaletteAction {
     ToggleTree,
     ToggleOutline,
     MoveCurrentFile,
+    SetTheme(ThemePreference),
+    CycleUiFont,
+    CycleMonoFont,
+    FontSizeUp,
+    FontSizeDown,
+    MonoFontSizeUp,
+    MonoFontSizeDown,
+    ResetAppearance,
 }
 
 #[allow(dead_code)]
@@ -1418,6 +1429,30 @@ impl Tab {
     }
 }
 
+fn effective_ui_font(settings: &Settings, theme: &Theme) -> SharedString {
+    settings
+        .font_family
+        .clone()
+        .map(SharedString::from)
+        .unwrap_or_else(|| theme.font_family.clone())
+}
+
+fn effective_mono_font(settings: &Settings, theme: &Theme) -> SharedString {
+    settings
+        .mono_font_family
+        .clone()
+        .map(SharedString::from)
+        .unwrap_or_else(|| theme.mono_font_family.clone())
+}
+
+fn apply_theme_preference(preference: ThemePreference, window: &mut Window, cx: &mut App) {
+    match preference {
+        ThemePreference::System => Theme::sync_system_appearance(Some(window), cx),
+        ThemePreference::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+        ThemePreference::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+    }
+}
+
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
 struct DocView {
     #[allow(dead_code)]
@@ -1466,10 +1501,16 @@ struct DocView {
     _blink_subscriptions: Vec<Subscription>,
     /// 系统字体族（正文 run 的字体）。
     ui_font: SharedString,
-    /// 等宽字体族（来自主题，代码块/行内代码使用）。
+    /// 等宽字体族（来自设置或主题，代码块/行内代码使用）。
     mono_font: SharedString,
-    /// 等宽字号（来自主题）。
+    /// 等宽字号（来自设置或主题）。
     mono_font_size: Pixels,
+    /// 正文字号（来自设置或主题）。
+    font_size: Pixels,
+    /// 持久化的外观设置。
+    settings: Settings,
+    /// 系统深浅色变化订阅（仅「跟随系统」时生效）。
+    _appearance_sub: Subscription,
     /// 主题色快照。
     palette: Palette,
     /// 代码块语法高亮器（首次渲染时惰性创建并复用；`SyntaxSet` 较大）。
@@ -1508,17 +1549,28 @@ impl DocView {
     }
 
     /// 读入文件（或内置示例）并构建文档，光标置于文首。
-    fn new(path: Option<&PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        path: Option<&PathBuf>,
+        settings: Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let text = match path {
             Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| format!("> 读取失败：{e}\n")),
             None => SAMPLE.to_string(),
         };
+        let mut settings = settings;
+        settings.normalize();
         let theme = cx.theme();
         let palette = Palette::from_theme(theme);
         // 先复制字体信息，结束 `theme` 对 `cx` 的不可变借用，后面注册焦点订阅需可变借用。
-        let ui_font = theme.font_family.clone();
-        let mono_font = theme.mono_font_family.clone();
-        let mono_font_size = theme.mono_font_size;
+        let ui_font = effective_ui_font(&settings, theme);
+        let mono_font = effective_mono_font(&settings, theme);
+        let font_size = settings.font_size.map(px).unwrap_or(theme.font_size);
+        let mono_font_size = settings
+            .mono_font_size
+            .map(px)
+            .unwrap_or(theme.mono_font_size);
         let saved_text = path.is_some().then(|| text.clone());
         // 设置工作区根为文件所在目录或命令行目录
         let ws_root = path
@@ -1550,6 +1602,12 @@ impl DocView {
         let focus = cx.focus_handle();
         let focus_sub = cx.on_focus(&focus, window, |view, _, cx| view.start_blink(cx));
         let blur_sub = cx.on_blur(&focus, window, |view, _, cx| view.stop_blink(cx));
+        let appearance_sub = cx.observe_window_appearance(window, |view, window, cx| {
+            if view.settings.theme == ThemePreference::System {
+                Theme::sync_system_appearance(Some(window), cx);
+                view.refresh_appearance(cx);
+            }
+        });
         Self {
             tabs: vec![t],
             active: 0,
@@ -1573,6 +1631,9 @@ impl DocView {
             ui_font,
             mono_font,
             mono_font_size,
+            font_size,
+            settings,
+            _appearance_sub: appearance_sub,
             palette,
             highlighter: None,
             find: FindState::default(),
@@ -1586,6 +1647,88 @@ impl DocView {
             cmd_palette: PaletteState::default(),
             renaming: None,
         }
+    }
+
+    /// 依据当前主题与设置刷新字体、字号、调色板，并丢弃旧布局/高亮缓存。
+    fn refresh_appearance(&mut self, cx: &mut Context<Self>) {
+        let theme = cx.theme();
+        let palette = Palette::from_theme(theme);
+        let ui_font = effective_ui_font(&self.settings, theme);
+        let mono_font = effective_mono_font(&self.settings, theme);
+        let font_size = self.settings.font_size.map(px).unwrap_or(theme.font_size);
+        let mono_font_size = self
+            .settings
+            .mono_font_size
+            .map(px)
+            .unwrap_or(theme.mono_font_size);
+        self.palette = palette;
+        self.ui_font = ui_font;
+        self.mono_font = mono_font;
+        self.font_size = font_size;
+        self.mono_font_size = mono_font_size;
+        self.layout = None;
+        self.highlighter = None;
+        self.caret_scroll_key = None;
+        cx.notify();
+    }
+
+    fn persist_settings(&self) {
+        if let Err(error) = self.settings.save() {
+            eprintln!("保存外观设置失败：{error}");
+        }
+    }
+
+    fn set_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.theme == preference {
+            return;
+        }
+        self.settings.theme = preference;
+        self.persist_settings();
+        apply_theme_preference(preference, window, cx);
+        self.refresh_appearance(cx);
+    }
+
+    fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = self.settings.theme.next();
+        self.set_theme_preference(next, window, cx);
+    }
+
+    fn cycle_ui_font(&mut self, cx: &mut Context<Self>) {
+        self.settings.cycle_ui_font();
+        self.persist_settings();
+        self.refresh_appearance(cx);
+    }
+
+    fn cycle_mono_font(&mut self, cx: &mut Context<Self>) {
+        self.settings.cycle_mono_font();
+        self.persist_settings();
+        self.refresh_appearance(cx);
+    }
+
+    fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let current: f32 = self.font_size.into();
+        self.settings.font_size = Some(clamp_font_size(current + delta));
+        self.persist_settings();
+        self.refresh_appearance(cx);
+    }
+
+    fn adjust_mono_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let current: f32 = self.mono_font_size.into();
+        self.settings.mono_font_size = Some(clamp_mono_font_size(current + delta));
+        self.persist_settings();
+        self.refresh_appearance(cx);
+    }
+
+    fn reset_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.reset_appearance();
+        self.persist_settings();
+        apply_theme_preference(ThemePreference::System, window, cx);
+        self.refresh_appearance(cx);
     }
 
     /// 开始/重启光标闪烁：立即显示，并每 500ms 翻转一次可见性。
@@ -2845,6 +2988,15 @@ impl DocView {
             hint: hint.to_string(),
             action,
         };
+        let theme_hint = |preference: ThemePreference| {
+            if self.settings.theme == preference {
+                "当前"
+            } else {
+                ""
+            }
+        };
+        let font_size: f32 = self.font_size.into();
+        let mono_font_size: f32 = self.mono_font_size.into();
         vec![
             mk("新建标签页", "Cmd+T", NewTab),
             mk("关闭标签页", "Cmd+W", CloseTab),
@@ -2857,6 +3009,52 @@ impl DocView {
             mk("切换文件树", "", ToggleTree),
             mk("切换大纲", "Cmd+Shift+O", ToggleOutline),
             mk("移动当前文件…", "", MoveCurrentFile),
+            mk(
+                "主题：跟随系统",
+                theme_hint(ThemePreference::System),
+                SetTheme(ThemePreference::System),
+            ),
+            mk(
+                "主题：浅色",
+                theme_hint(ThemePreference::Light),
+                SetTheme(ThemePreference::Light),
+            ),
+            mk(
+                "主题：深色",
+                theme_hint(ThemePreference::Dark),
+                SetTheme(ThemePreference::Dark),
+            ),
+            mk(
+                &format!("正文字体：{}", self.settings.ui_font_label()),
+                "切换",
+                CycleUiFont,
+            ),
+            mk(
+                &format!("等宽字体：{}", self.settings.mono_font_label()),
+                "切换",
+                CycleMonoFont,
+            ),
+            mk(
+                &format!("增大正文字号（{font_size:.0} px）"),
+                "Cmd+=",
+                FontSizeUp,
+            ),
+            mk(
+                &format!("减小正文字号（{font_size:.0} px）"),
+                "Cmd+-",
+                FontSizeDown,
+            ),
+            mk(
+                &format!("增大等宽字号（{mono_font_size:.0} px）"),
+                "Cmd+Option+=",
+                MonoFontSizeUp,
+            ),
+            mk(
+                &format!("减小等宽字号（{mono_font_size:.0} px）"),
+                "Cmd+Option+-",
+                MonoFontSizeDown,
+            ),
+            mk("重置外观设置", "Cmd+Option+0", ResetAppearance),
         ]
     }
 
@@ -2912,6 +3110,14 @@ impl DocView {
                 cx.notify();
             }
             MoveCurrentFile => self.move_current_file_dialog(window, cx),
+            SetTheme(preference) => self.set_theme_preference(preference, window, cx),
+            CycleUiFont => self.cycle_ui_font(cx),
+            CycleMonoFont => self.cycle_mono_font(cx),
+            FontSizeUp => self.adjust_font_size(FONT_STEP, cx),
+            FontSizeDown => self.adjust_font_size(-FONT_STEP, cx),
+            MonoFontSizeUp => self.adjust_mono_font_size(FONT_STEP, cx),
+            MonoFontSizeDown => self.adjust_mono_font_size(-FONT_STEP, cx),
+            ResetAppearance => self.reset_appearance(window, cx),
         }
     }
 
@@ -3723,6 +3929,11 @@ impl Render for DocView {
                             .child(format!("{line_count} 行 · 光标×{caret_count}")),
                     ),
             )
+            .child(div().flex_none().child(format!(
+                "字号 {:.0} · 主题 {}",
+                f32::from(self.font_size),
+                self.settings.theme.label()
+            )))
             .child("Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换");
         div()
             .id("app")
@@ -4217,6 +4428,31 @@ fn handle_key(
     // Cmd/Ctrl 组合键：撤销/重做/全选/剪贴板/格式化/块类型；其余交给系统，避免误拦截
     if m.control || m.platform {
         match event.keystroke.key.as_str() {
+            // 外观：Cmd+=/- 正文字号，Cmd+Option+=/- 等宽字号，Cmd+Shift+L 循环主题。
+            "=" | "+" if m.platform && m.alt => {
+                view.adjust_mono_font_size(FONT_STEP, cx);
+                cx.stop_propagation();
+            }
+            "-" if m.platform && m.alt => {
+                view.adjust_mono_font_size(-FONT_STEP, cx);
+                cx.stop_propagation();
+            }
+            "=" | "+" if m.platform => {
+                view.adjust_font_size(FONT_STEP, cx);
+                cx.stop_propagation();
+            }
+            "-" if m.platform && !shift => {
+                view.adjust_font_size(-FONT_STEP, cx);
+                cx.stop_propagation();
+            }
+            "l" if m.platform && shift => {
+                view.cycle_theme(window, cx);
+                cx.stop_propagation();
+            }
+            "0" if m.platform && m.alt => {
+                view.reset_appearance(window, cx);
+                cx.stop_propagation();
+            }
             "z" if m.platform => {
                 if shift {
                     view.doc.redo();
@@ -4572,6 +4808,20 @@ fn block_font_size(block: &BlockStyle, base: Pixels, mono: Pixels) -> Pixels {
 fn block_line_px(block: &BlockStyle, font_size: Pixels) -> Pixels {
     let factor = if block.heading.is_some() { 1.6 } else { 1.5 };
     (font_size * factor).max(LINE_HEIGHT)
+}
+
+/// 行高要同时容下正文与行内等宽字号，避免等宽字号调大后行内代码压到相邻行。
+fn block_line_px_with_mono(
+    block: &BlockStyle,
+    font_size: Pixels,
+    mono_font_size: Pixels,
+) -> Pixels {
+    let line_font_size = if block.code_block {
+        font_size
+    } else {
+        font_size.max(mono_font_size)
+    };
+    block_line_px(block, line_font_size)
 }
 
 fn italic_fallbacks() -> gpui_kit::FontFallbacks {
@@ -5071,6 +5321,7 @@ fn paint_corner_label(
     label: &ShapedLine,
     right: Pixels,
     top: Pixels,
+    line_height: Pixels,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -5078,7 +5329,7 @@ fn paint_corner_label(
     let ly = top + px(3.);
     let _ = label.paint(
         point(lx, ly),
-        LINE_HEIGHT - px(6.),
+        (line_height - px(6.)).max(px(1.)),
         TextAlign::Left,
         None,
         window,
@@ -5127,7 +5378,7 @@ struct DocElement {
     view: Entity<DocView>,
 }
 
-/// 排版基数（正文行高 / 内边距）。
+/// 排版基数（左右内边距 / 列表标记区）。
 const BASE: Pixels = px(16.);
 
 /// 代码块文本相对块缩进的右移量（同时作为面板左内边距的一部分）。
@@ -5141,7 +5392,7 @@ const QUOTE_BAND_INSET: Pixels = px(4.);
 
 /// 引用文字距正文右缘的留白：底色右缘再收 4px，文字再收 16px，形成 12px 内边距。
 const QUOTE_TEXT_RIGHT_INSET: Pixels = px(16.);
-/// 统一行高（正文与等宽同高，保证命中测试的行序与块序一致）。
+/// 最小行高：正文/等宽字号较小时仍保持 24px，避免行距过密。
 const LINE_HEIGHT: Pixels = px(24.);
 
 /// 图片与上下相邻内容的呼吸间距。
@@ -5206,7 +5457,7 @@ impl Element for DocElement {
                 snapshot.palette,
                 gpui::font(snapshot.ui_font.clone()),
                 gpui::font(snapshot.mono_font.clone()),
-                BASE,
+                snapshot.font_size,
                 snapshot.mono_font_size,
                 snapshot.all_selections(),
             )
@@ -5516,7 +5767,7 @@ impl Element for DocElement {
                     let mut line_px = if let Some(row) = &table_row {
                         row.height
                     } else {
-                        block_line_px(&line.block, font_size)
+                        block_line_px_with_mono(&line.block, font_size, mono_size)
                     };
                     // 独占图片行：行高跟随图片（含上下呼吸间距），命中测试/滚动同步生效。
                     if let Some(image) = &image_preview {
@@ -5752,7 +6003,7 @@ impl Element for DocElement {
             blocks,
             widgets,
             origin: bounds.origin,
-            line_height: LINE_HEIGHT,
+            line_height: (base_size.max(mono_size) * 1.5).max(LINE_HEIGHT),
             row_starts,
             row_tops,
             caret_row,
@@ -5865,7 +6116,15 @@ impl Element for DocElement {
                         if !w.editing {
                             paint_rect_border(window, rect, palette.border, px(1.));
                             if let Some(label) = label {
-                                paint_corner_label(label, right - px(8.), top, window, cx);
+                                let line_height = layout.block_line_height(w.line_range.start);
+                                paint_corner_label(
+                                    label,
+                                    right - px(8.),
+                                    top,
+                                    line_height,
+                                    window,
+                                    cx,
+                                );
                             }
                         }
                     }
@@ -5874,7 +6133,8 @@ impl Element for DocElement {
                         window.paint_quad(fill(rect, palette.subtle));
                         paint_rect_border(window, rect, palette.border, px(1.));
                         if let Some(label) = label {
-                            paint_corner_label(label, right, top, window, cx);
+                            let line_height = layout.block_line_height(w.line_range.start);
+                            paint_corner_label(label, right, top, line_height, window, cx);
                         }
                     }
                     // 显示公式：整体描边（公式体文字自身为斜体主题色）
@@ -6283,6 +6543,7 @@ fn install_app_icon() {}
 fn main() {
     // 可选参数：要打开的 .md 路径；缺省时渲染内置示例
     let path = std::env::args().nth(1).map(PathBuf::from);
+    let settings = Settings::load();
     let title = match &path {
         Some(p) => format!(
             "码札 — {}",
@@ -6315,8 +6576,10 @@ fn main() {
                 KeyBinding::new("shift-tab", Outdent, Some("mazha-doc")),
             ]);
             let path = path.clone();
+            let settings = settings.clone();
             gpui_kit::open_window(options, cx, move |window, cx| {
-                let view = cx.new(|cx| DocView::new(path.as_ref(), window, cx));
+                apply_theme_preference(settings.theme, window, cx);
+                let view = cx.new(|cx| DocView::new(path.as_ref(), settings.clone(), window, cx));
                 // 打开即聚焦，键盘事件直接可用
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
@@ -6330,14 +6593,29 @@ fn main() {
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
-        BASE, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document, QUOTE_BAND_INSET,
-        QUOTE_TEXT_RIGHT_INSET, RunStyle, char_col_to_byte, code_block_wrap_width, horizontal_step,
-        inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
-        table_arrow_step, table_entry_snap,
+        BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
+        QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, block_line_px_with_mono,
+        char_col_to_byte, code_block_wrap_width, horizontal_step, inline_links, inline_reveals,
+        nearest_cell, oblique, quote_block_wrap_width, reveal_inline, table_arrow_step,
+        table_entry_snap,
     };
     use super::{decode_data_image, image_resource, px, size};
     use gpui_kit::{ImageFormat, Resource};
     use std::path::{Path, PathBuf};
+
+    /// 行高取正文与等宽字号的较大者；代码块只按自身等宽字号计算。
+    #[test]
+    fn block_line_height_accounts_for_larger_mono_font() {
+        let body = BlockStyle::default();
+        assert_eq!(block_line_px_with_mono(&body, px(14.), px(20.)), px(30.));
+        assert_eq!(block_line_px_with_mono(&body, px(16.), px(13.)), px(24.));
+
+        let code = BlockStyle {
+            code_block: true,
+            ..BlockStyle::default()
+        };
+        assert_eq!(block_line_px_with_mono(&code, px(24.), px(10.)), px(36.));
+    }
 
     /// 引用底色与文字都必须落在正文文本列内，左右不越界。
     #[test]
