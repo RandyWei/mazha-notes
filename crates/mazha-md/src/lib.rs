@@ -10,12 +10,14 @@
 mod block;
 mod incremental;
 mod inline;
+mod media;
 mod scanner;
 mod span;
 
 pub use block::{Align, Block, BlockKind, CalloutKind};
 pub use incremental::reparse;
 pub use inline::parse_inline;
+pub use media::{MediaElement, MediaKind, parse_media_element, parse_media_element_at};
 pub use scanner::parse;
 pub use span::{SpanKind, SpanRole, SyntaxSpan, visible_runs};
 

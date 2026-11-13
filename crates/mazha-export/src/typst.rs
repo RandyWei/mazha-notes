@@ -6,7 +6,7 @@
 //! 关键约束：输出必须是**可编译的 Typst 标记**——可见文本里的标记特殊字符
 //! 必须转义（见 [`escape_typst`]），块与块之间必须留空行（Typst 用空行分段）。
 
-use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
+use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse, parse_media_element};
 use std::fmt::Write as _;
 
 /// Typst 标记模式中具有结构含义、必须转义的字符。
@@ -344,13 +344,34 @@ fn push_inline_raw(out: &mut String, content: &str) {
 }
 
 /// 把一组行内片段转换为 Typst 标记。
+/// 音视频在 PDF 中不内嵌，也不把本地媒体路径交给 Typst 解析；只输出类型占位。
+fn media_to_typst(source: &str, out: &mut String) {
+    if let Some(media) = parse_media_element(source) {
+        let label = media.kind.label();
+        let _ = write!(out, "#text(\"[{label}]\")");
+    }
+}
+
+/// 图片 Widget 输出为 Typst `#image`；alt 是字符串参数而非尾随内容块。
+fn image_to_typst(source: &str, out: &mut String) {
+    let Some((alt, dest)) = parse_image_typst(source) else {
+        return;
+    };
+    let dest = escape_typst_string(&dest);
+    if alt.is_empty() {
+        let _ = write!(out, "#image(\"{dest}\")");
+    } else {
+        let alt = escape_typst_string(&alt);
+        let _ = write!(out, "#image(\"{dest}\", alt: \"{alt}\")");
+    }
+}
+
 fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
     let mut i = 0usize;
     let mut in_strike = false;
     while i < spans.len() {
         let sp = &spans[i];
         match (sp.kind, sp.role) {
-            // 标签：单独样式（须在通用 Text 之前）
             (SpanKind::Text, SpanRole::Tag) => {
                 let text = escape_typst(&source[sp.range.clone()]);
                 let _ = write!(out, "#text(fill: blue)[{text}]");
@@ -367,7 +388,6 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 let _ = write!(out, "#super[{text}]");
                 i += 1;
             }
-            // 可见文本一律输出内容（样式由成对 Marker 开合），特殊字符转义
             (SpanKind::Text, _) => {
                 out.push_str(&escape_typst(&source[sp.range.clone()]));
                 i += 1;
@@ -422,17 +442,11 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 i += 1;
             }
             (SpanKind::Widget, SpanRole::ImageMarker) => {
-                // 图片：#image("src", alt: "…") —— Typst 的 alt 是字符串参数，
-                // 不是尾随内容块（传内容块会报 unexpected argument）
-                if let Some((alt, dest)) = parse_image_typst(&source[sp.range.clone()]) {
-                    let dest = escape_typst_string(&dest);
-                    if alt.is_empty() {
-                        let _ = write!(out, "#image(\"{dest}\")");
-                    } else {
-                        let alt = escape_typst_string(&alt);
-                        let _ = write!(out, "#image(\"{dest}\", alt: \"{alt}\")");
-                    }
-                }
+                image_to_typst(&source[sp.range.clone()], out);
+                i += 1;
+            }
+            (SpanKind::Widget, SpanRole::MediaMarker) => {
+                media_to_typst(&source[sp.range.clone()], out);
                 i += 1;
             }
             (SpanKind::Marker, SpanRole::SoftBreak) => {
@@ -657,6 +671,13 @@ mod tests {
     fn typst_image() {
         let t = to_typst("![图](img.png)\n");
         assert!(t.contains("#image(\"img.png\", alt: \"图\")"), "{t}");
+    }
+
+    #[test]
+    fn typst_media_is_placeholder_without_resource_lookup() {
+        let t = to_typst("<video src=\"missing.mp4\"></video>\n");
+        assert!(t.contains("#text(\"[视频]\")"), "{t}");
+        assert!(!t.contains("missing.mp4"), "{t}");
     }
 
     #[test]

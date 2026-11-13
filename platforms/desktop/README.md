@@ -15,6 +15,39 @@ cargo run                    # 打开内置示例文档（覆盖主要 Markdown 
 cargo run -- path/to/note.md # 打开指定 .md
 ```
 
+## 音视频预览（0.1.85，D64，macOS）
+
+独占一行的单行 HTML `<video>` / `<audio>` 会渲染为播放控件，首次点击时才创建 AVPlayer。视频支持播放/暂停与点击进度条跳转，首帧前显示 `poster`，没有封面时使用 16:9 占位；音频只显示一个固定 `50×50` 的播放/暂停按钮，不占满正文宽度。光标进入该行会切回原始 HTML 以便编辑。
+
+```html
+<video src="https://example.com/demo.mp4" poster="cover.jpg" title="演示"></video>
+<audio src="audio/interview.m4a" title="访谈"></audio>
+<video controls><source src="demo.mp4"></video>
+```
+
+媒体标签必须完整写在一行，地址可为 `http(s)`、协议相对 URL、绝对路径、相对当前 Markdown 文件的本地路径或 `file://`。缺少 `src`、未闭合、跨行的标签保持原文；与正文混排时只显示占位标签。播放格式与编码取决于 macOS AVFoundation，暂不支持 data/blob 媒体、音量/字幕/倍速/循环/全屏/画中画或拖拽进度。
+
+HTML/EPUB 导出保留可播放的 `video/audio controls` 标签；DOCX 与 PDF 只输出 `[视频]` / `[音频]` 占位。
+
+## macOS 原生应用菜单（0.1.84，D63）
+
+菜单栏包含「码札 / 文件 / 编辑 / 视图 / 窗口」：应用级命令（关于、服务、隐藏、退出）、文件命令（新建/打开/保存/另存/导出/关闭/移动）、编辑命令（撤销/重做/剪切/复制/粘贴/全选/查找）、视图命令（命令面板、文件树/大纲、主题、字体/字号、重置外观）与窗口命令（最小化/缩放/全屏）。菜单项与快捷键均由 GPUI 注册，应用不在前台时 macOS 会禁用菜单项。
+
+常用快捷键：
+
+| 操作 | 快捷键 |
+|------|--------|
+| 新建 / 打开 / 保存 / 另存为 | `Cmd+T` / `Cmd+O` / `Cmd+S` / `Cmd+Shift+S` |
+| 导出 PDF / 命令面板 / 查找替换 | `Cmd+E` / `Cmd+P` / `Cmd+F` |
+| 关闭标签页 / 关闭全部 | `Cmd+W` / `Cmd+Shift+W` |
+| 撤销 / 重做 | `Cmd+Z` / `Cmd+Shift+Z` |
+| 剪切 / 复制 / 粘贴 / 全选 | `Cmd+X` / `Cmd+C` / `Cmd+V` / `Cmd+A` |
+| 循环主题 | `Cmd+Shift+L` |
+| 最小化 / 全屏 | `Cmd+M` / `Ctrl+Cmd+F` |
+| 隐藏 / 隐藏其他 / 退出 | `Cmd+H` / `Cmd+Option+H` / `Cmd+Q` |
+
+裸二进制（`cargo run`）的应用菜单标题显示可执行名 `mazha-desktop`；打包后的 `码札.app` 使用 `Info.plist` 中的显示名「码札」。当前未提供「帮助」菜单。
+
 ## 外观设置（0.1.83，D62）
 
 主题、正文字体/等宽字体与字号可运行时调整，退出时自动保存：

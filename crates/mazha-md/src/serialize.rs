@@ -383,7 +383,7 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
             // 脚注标记（`[^`、`]`、`]:`）原样回填，与标签/正文拼回完整语法
             // （与图片 Widget 同处理：都直接抄源文本）
             (SpanKind::Marker, SpanRole::FootnoteMarker)
-            | (SpanKind::Widget, SpanRole::ImageMarker) => {
+            | (SpanKind::Widget, SpanRole::ImageMarker | SpanRole::MediaMarker) => {
                 out.push_str(&slice(source, &sp.range));
             }
             (SpanKind::Marker, SpanRole::InlineCode) => out.push('`'),

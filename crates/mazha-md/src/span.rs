@@ -39,6 +39,8 @@ pub enum SpanRole {
     LinkDest,
     /// 图片 `![` `](` `)` 标记。
     ImageMarker,
+    /// HTML 媒体元素（`<video>` / `<audio>`）整体占位（D64）。
+    MediaMarker,
     /// 标题 `#` 前缀。
     HeadingMarker,
     /// 引用 `>` 前缀。

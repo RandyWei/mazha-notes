@@ -28,6 +28,9 @@ base64 = "0.22"
 # 外观设置持久化（settings.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 视频帧：CVPixelBuffer → image::Frame → GPUI RenderImage
+image = { version = "0.25", default-features = false }
+smallvec = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 中文斜体合成倾斜：取 CoreText 字形轮廓 → 剪切 → 自绘（见 `src/oblique.rs`）
@@ -37,5 +40,31 @@ core-foundation = "0.10"
 foreign-types = "0.5"
 # Dock 图标：把 assets/appicon.png 解码为 NSImage 后设置到 NSApplication
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", features = ["NSData"] }
+objc2-foundation = { version = "0.3.2", features = [
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }
+# 音视频播放与取帧：AVPlayer + AVPlayerItemVideoOutput → CVPixelBuffer
+objc2-av-foundation = { version = "0.3.2", features = [
+    "alloc",
+    "AVPlayer",
+    "AVPlayerItem",
+    "AVPlayerItemOutput",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["alloc", "std"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "alloc",
+    "bitflags",
+    "CVBase",
+    "CVPixelBuffer",
+    "CVReturn",
+    "std",
+] }

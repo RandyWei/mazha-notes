@@ -22,7 +22,9 @@ use docx::formatting::{
     BorderStyle, Borders, BottomBorder, CharacterProperty, JustificationVal, LeftBorder,
     ParagraphProperty, TableBorders, TopBorder, Underline,
 };
-use mazha_md::{Align, Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
+use mazha_md::{
+    Align, Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse, parse_media_element,
+};
 use std::io::Cursor;
 use std::ops::Range;
 
@@ -450,6 +452,17 @@ fn inline_content(
                 let placeholder = image_placeholder(&source[sp.range.clone()]);
                 push_text(&mut out, &placeholder, base, &style, false);
             }
+            // 音视频不内嵌，输出与编辑器占位一致的文字标签。
+            (SpanKind::Widget, SpanRole::MediaMarker) => {
+                let placeholder = parse_media_element(&source[sp.range.clone()]).map_or_else(
+                    || "[媒体]".to_string(),
+                    |m| match m.title {
+                        Some(title) => format!("[{}: {title}]", m.kind.label()),
+                        None => format!("[{}]", m.kind.label()),
+                    },
+                );
+                push_text(&mut out, &placeholder, base, &style, false);
+            }
             (SpanKind::Marker, SpanRole::Strong) => style.bold = !style.bold,
             (SpanKind::Marker, SpanRole::Emphasis) => style.italic = !style.italic,
             (SpanKind::Marker, SpanRole::Strikethrough) => style.strike = !style.strike,
@@ -718,6 +731,15 @@ mod tests {
             panic!("应为段落");
         };
         assert_eq!(paragraph_text(p), "[图片: 图]");
+    }
+
+    #[test]
+    fn media_placeholder_text() {
+        let out = render("<audio src=\"a.mp3\" title=\"访谈\"></audio>\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "[音频: 访谈]");
     }
 
     #[test]

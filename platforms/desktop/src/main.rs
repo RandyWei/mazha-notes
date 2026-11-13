@@ -33,6 +33,7 @@
 use base64::Engine as _;
 use rfd::AsyncFileDialog;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
@@ -53,9 +54,10 @@ use mazha_core::{
     edit_table, find_all, replace_all_edit, table_cells,
 };
 use mazha_export::to_pdf;
-use mazha_md::{SpanKind, SpanRole, parse_inline};
+use mazha_md::{MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
+mod media;
 mod oblique;
 mod settings;
 
@@ -483,6 +485,40 @@ struct ImagePreview {
     size: Size<Pixels>,
 }
 
+/// 独占行音视频的渲染态几何：卡片矩形、控制条文字与进度条命中区。
+#[derive(Clone)]
+struct MediaPreview {
+    /// 播放状态键（`kind:src`）。
+    key: String,
+    /// 媒体类型。
+    kind: MediaKind,
+    /// 媒体地址（首次点击时创建播放器）。
+    src: String,
+    /// 视频帧/音频卡片矩形（窗口坐标）。
+    rect: Bounds<Pixels>,
+    /// 底部进度条矩形（窗口坐标；点击按横向比例 seek）。
+    progress: Bounds<Pixels>,
+    /// 控制条文字（标题/播放态/时间），prepaint 阶段 shape 好。
+    label: Box<ShapedLine>,
+    /// 视频封面（未取到首帧时显示）。
+    poster: Option<Arc<RenderImage>>,
+    /// 当前播放位置与总时长（秒；用于进度条比例）。
+    position: f64,
+    duration: f64,
+}
+
+/// 媒体播放器及轮询任务（每个 `kind:src` 一个，首次点击时懒创建）。
+struct MediaPlayback {
+    /// `None` 表示创建失败，错误见 [`MediaPlayback::error`]。
+    player: Option<media::MediaPlayer>,
+    /// 媒体类型（决定轮询间隔）。
+    kind: MediaKind,
+    /// 播放中的取帧/进度轮询；暂停时 drop 即取消。
+    task: Option<Task<()>>,
+    /// 打开失败原因。
+    error: Option<String>,
+}
+
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
 #[derive(Clone)]
 struct BlockGeom {
@@ -543,6 +579,8 @@ struct BlockGeom {
     raw_src: Option<SharedString>,
     /// 图片独占行在渲染态下的真实图片（已加载并适配宽度）。
     image: Option<ImagePreview>,
+    /// 音视频独占行在渲染态下的卡片/播放控件。
+    media: Option<MediaPreview>,
     /// 表格行的网格几何（`None` = 非表格行，或该表放不下/含合成斜体而回退流式排版）。
     table: Option<TableRowGeom>,
 }
@@ -1340,7 +1378,7 @@ struct PaletteItem {
 }
 
 /// 命令面板可执行命令（按标签分派到 `DocView` 方法）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 enum PaletteAction {
     NewTab,
@@ -1362,6 +1400,38 @@ enum PaletteAction {
     MonoFontSizeUp,
     MonoFontSizeDown,
     ResetAppearance,
+}
+
+/// 菜单命令：复用命令面板动作，并补充编辑、应用、窗口级操作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuCommand {
+    Palette(PaletteAction),
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    OpenPalette,
+    CycleTheme,
+    Quit,
+    Hide,
+    HideOthers,
+    ShowAll,
+    About,
+    Minimize,
+    Zoom,
+    ToggleFullscreen,
+}
+
+#[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
+#[action(namespace = mazha_doc, no_json)]
+struct MenuAction {
+    command: MenuCommand,
+}
+
+fn menu_action(command: MenuCommand) -> MenuAction {
+    MenuAction { command }
 }
 
 #[allow(dead_code)]
@@ -1453,6 +1523,173 @@ fn apply_theme_preference(preference: ThemePreference, window: &mut Window, cx: 
     }
 }
 
+fn menu_item(name: &str, command: MenuCommand) -> MenuItem {
+    MenuItem::action(name, menu_action(command))
+}
+
+fn menu_item_checked(name: &str, command: MenuCommand, checked: bool) -> MenuItem {
+    menu_item(name, command).checked(checked)
+}
+
+fn app_menus(settings: &Settings) -> Vec<Menu> {
+    use MenuCommand::Palette;
+    use PaletteAction::*;
+    let theme = |preference: ThemePreference| {
+        let label = match preference {
+            ThemePreference::System => "跟随系统",
+            ThemePreference::Light => "浅色",
+            ThemePreference::Dark => "深色",
+        };
+        menu_item_checked(
+            label,
+            Palette(SetTheme(preference)),
+            settings.theme == preference,
+        )
+    };
+    vec![
+        Menu::new("码札").items([
+            menu_item("关于码札", MenuCommand::About),
+            MenuItem::separator(),
+            MenuItem::os_submenu("服务", SystemMenuType::Services),
+            MenuItem::separator(),
+            menu_item("隐藏码札", MenuCommand::Hide),
+            menu_item("隐藏其他", MenuCommand::HideOthers),
+            menu_item("全部显示", MenuCommand::ShowAll),
+            MenuItem::separator(),
+            menu_item("退出码札", MenuCommand::Quit),
+        ]),
+        Menu::new("文件").items([
+            menu_item("新建标签页", Palette(NewTab)),
+            menu_item("打开…", Palette(OpenFile)),
+            MenuItem::separator(),
+            menu_item("保存", Palette(Save)),
+            menu_item("另存为…", Palette(SaveAs)),
+            menu_item("导出 PDF…", Palette(ExportPdf)),
+            MenuItem::separator(),
+            menu_item("关闭标签页", Palette(CloseTab)),
+            menu_item("关闭全部标签页", Palette(CloseAllTabs)),
+            MenuItem::separator(),
+            menu_item("移动当前文件…", Palette(MoveCurrentFile)),
+        ]),
+        Menu::new("编辑").items([
+            menu_item("撤销", MenuCommand::Undo),
+            menu_item("重做", MenuCommand::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action(
+                "剪切",
+                menu_action(MenuCommand::Cut),
+                gpui_kit::OsAction::Cut,
+            ),
+            MenuItem::os_action(
+                "复制",
+                menu_action(MenuCommand::Copy),
+                gpui_kit::OsAction::Copy,
+            ),
+            MenuItem::os_action(
+                "粘贴",
+                menu_action(MenuCommand::Paste),
+                gpui_kit::OsAction::Paste,
+            ),
+            MenuItem::os_action(
+                "全选",
+                menu_action(MenuCommand::SelectAll),
+                gpui_kit::OsAction::SelectAll,
+            ),
+            MenuItem::separator(),
+            menu_item("查找/替换…", Palette(Find)),
+        ]),
+        Menu::new("视图").items([
+            menu_item("命令面板…", MenuCommand::OpenPalette),
+            MenuItem::separator(),
+            menu_item("切换文件树", Palette(ToggleTree)),
+            menu_item("切换大纲", Palette(ToggleOutline)),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("主题").items([
+                theme(ThemePreference::System),
+                theme(ThemePreference::Light),
+                theme(ThemePreference::Dark),
+                MenuItem::separator(),
+                menu_item("循环主题", MenuCommand::CycleTheme),
+            ])),
+            MenuItem::separator(),
+            menu_item("切换正文字体", Palette(CycleUiFont)),
+            menu_item("切换等宽字体", Palette(CycleMonoFont)),
+            MenuItem::separator(),
+            menu_item("增大正文字号", Palette(FontSizeUp)),
+            menu_item("减小正文字号", Palette(FontSizeDown)),
+            menu_item("增大等宽字号", Palette(MonoFontSizeUp)),
+            menu_item("减小等宽字号", Palette(MonoFontSizeDown)),
+            MenuItem::separator(),
+            menu_item("重置外观", Palette(ResetAppearance)),
+        ]),
+        Menu::new("窗口").items([
+            menu_item("最小化", MenuCommand::Minimize),
+            menu_item("缩放", MenuCommand::Zoom),
+            MenuItem::separator(),
+            menu_item("进入全屏", MenuCommand::ToggleFullscreen),
+        ]),
+    ]
+}
+
+fn menu_key_bindings() -> Vec<KeyBinding> {
+    use MenuCommand::Palette;
+    use PaletteAction::*;
+    let doc = Some("mazha-doc");
+    vec![
+        KeyBinding::new("secondary-q", menu_action(MenuCommand::Quit), None),
+        KeyBinding::new("secondary-h", menu_action(MenuCommand::Hide), None),
+        KeyBinding::new(
+            "secondary-alt-h",
+            menu_action(MenuCommand::HideOthers),
+            None,
+        ),
+        KeyBinding::new("secondary-t", menu_action(Palette(NewTab)), doc),
+        KeyBinding::new("secondary-o", menu_action(Palette(OpenFile)), doc),
+        KeyBinding::new("secondary-s", menu_action(Palette(Save)), doc),
+        KeyBinding::new("secondary-shift-s", menu_action(Palette(SaveAs)), doc),
+        KeyBinding::new("secondary-e", menu_action(Palette(ExportPdf)), doc),
+        KeyBinding::new("secondary-w", menu_action(Palette(CloseTab)), doc),
+        KeyBinding::new("secondary-shift-w", menu_action(Palette(CloseAllTabs)), doc),
+        KeyBinding::new("secondary-z", menu_action(MenuCommand::Undo), doc),
+        KeyBinding::new("secondary-shift-z", menu_action(MenuCommand::Redo), doc),
+        KeyBinding::new("secondary-x", menu_action(MenuCommand::Cut), doc),
+        KeyBinding::new("secondary-c", menu_action(MenuCommand::Copy), doc),
+        KeyBinding::new("secondary-v", menu_action(MenuCommand::Paste), doc),
+        KeyBinding::new("secondary-a", menu_action(MenuCommand::SelectAll), doc),
+        KeyBinding::new("secondary-f", menu_action(Palette(Find)), doc),
+        KeyBinding::new("secondary-p", menu_action(MenuCommand::OpenPalette), doc),
+        KeyBinding::new(
+            "secondary-shift-o",
+            menu_action(Palette(ToggleOutline)),
+            doc,
+        ),
+        KeyBinding::new(
+            "secondary-shift-l",
+            menu_action(MenuCommand::CycleTheme),
+            doc,
+        ),
+        KeyBinding::new("secondary-=", menu_action(Palette(FontSizeUp)), doc),
+        KeyBinding::new("secondary--", menu_action(Palette(FontSizeDown)), doc),
+        KeyBinding::new("secondary-alt-=", menu_action(Palette(MonoFontSizeUp)), doc),
+        KeyBinding::new(
+            "secondary-alt--",
+            menu_action(Palette(MonoFontSizeDown)),
+            doc,
+        ),
+        KeyBinding::new(
+            "secondary-alt-0",
+            menu_action(Palette(ResetAppearance)),
+            doc,
+        ),
+        KeyBinding::new("secondary-m", menu_action(MenuCommand::Minimize), None),
+        KeyBinding::new(
+            "ctrl-secondary-f",
+            menu_action(MenuCommand::ToggleFullscreen),
+            None,
+        ),
+    ]
+}
+
 /// 主窗口内容：文档视图（投影渲染 + 多光标/选区）。
 struct DocView {
     #[allow(dead_code)]
@@ -1536,6 +1773,10 @@ struct DocView {
     cmd_palette: PaletteState,
     /// 正在重命名的文件树条目：`(原路径, 编辑中的新名)`；`None` 表示无。
     renaming: Option<(PathBuf, String)>,
+    /// 是否有原生文件对话框正在显示。
+    dialog_open: bool,
+    /// 音视频播放状态；键为 `kind:src`，仅保留当前文档仍引用的媒体。
+    media: HashMap<String, MediaPlayback>,
 }
 
 impl DocView {
@@ -1646,6 +1887,8 @@ impl DocView {
             saved_text,
             cmd_palette: PaletteState::default(),
             renaming: None,
+            dialog_open: false,
+            media: HashMap::new(),
         }
     }
 
@@ -1678,6 +1921,11 @@ impl DocView {
         }
     }
 
+    fn begin_dialog(&mut self, cx: &mut Context<Self>) {
+        self.dialog_open = true;
+        cx.notify();
+    }
+
     fn set_theme_preference(
         &mut self,
         preference: ThemePreference,
@@ -1691,6 +1939,7 @@ impl DocView {
         self.persist_settings();
         apply_theme_preference(preference, window, cx);
         self.refresh_appearance(cx);
+        cx.set_menus(app_menus(&self.settings));
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1729,6 +1978,7 @@ impl DocView {
         self.persist_settings();
         apply_theme_preference(ThemePreference::System, window, cx);
         self.refresh_appearance(cx);
+        cx.set_menus(app_menus(&self.settings));
     }
 
     /// 开始/重启光标闪烁：立即显示，并每 500ms 翻转一次可见性。
@@ -2835,6 +3085,139 @@ impl DocView {
         Some((lo_byte, hi_byte))
     }
 
+    /// 命中独占行媒体：返回 `(key, seek 比例)`；点进度条时带比例，其余为播放/暂停。
+    fn media_hit(&self, position: Point<Pixels>) -> Option<(String, Option<f32>)> {
+        let layout = self.layout.as_ref()?;
+        for block in &layout.blocks {
+            let Some(media) = &block.media else {
+                continue;
+            };
+            if media.kind == MediaKind::Video
+                && media.duration > 0.0
+                && media.progress.contains(&position)
+            {
+                let fraction = ((position.x - media.progress.origin.x)
+                    / media.progress.size.width.max(px(1.)))
+                .clamp(0.0, 1.0);
+                return Some((media.key.clone(), Some(fraction)));
+            }
+            if media.rect.contains(&position) {
+                return Some((media.key.clone(), None));
+            }
+        }
+        None
+    }
+
+    /// 点击媒体：首次点击懒创建播放器并播放；再次点击播放/暂停；点进度条 seek。
+    ///
+    /// 命中媒体时返回 `true`，调用方应停止后续“放置光标”逻辑，避免点播放器时
+    /// 光标跳到源码行。
+    fn toggle_media_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some((key, seek)) = self.media_hit(position) else {
+            return false;
+        };
+        let Some((kind, src)) = self.layout.as_ref().and_then(|layout| {
+            layout.blocks.iter().find_map(|b| {
+                b.media
+                    .as_ref()
+                    .filter(|m| m.key == key)
+                    .map(|m| (m.kind, m.src.clone()))
+            })
+        }) else {
+            return false;
+        };
+        if let Some(fraction) = seek {
+            let sought =
+                if let Some(player) = self.media.get_mut(&key).and_then(|p| p.player.as_mut()) {
+                    player.seek_fraction(fraction);
+                    true
+                } else {
+                    false
+                };
+            // 暂停时也在 seek 后轮询一次，让视频输出拿到目标位置的新帧；播放中则
+            // 替换为新的持续轮询任务。
+            if sought {
+                self.start_media_poll(key, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if !self.media.contains_key(&key) {
+            let playback = match media::MediaPlayer::open(kind, &src, self.path.as_deref()) {
+                Ok(player) => MediaPlayback {
+                    player: Some(player),
+                    kind,
+                    task: None,
+                    error: None,
+                },
+                Err(error) => MediaPlayback {
+                    player: None,
+                    kind,
+                    task: None,
+                    error: Some(error),
+                },
+            };
+            self.media.insert(key.clone(), playback);
+        }
+        let mut start = false;
+        if let Some(playback) = self.media.get_mut(&key) {
+            if let Some(player) = playback.player.as_mut() {
+                player.toggle();
+                start = player.playing();
+            }
+            if !start {
+                // drop 轮询任务即取消循环。
+                playback.task.take();
+            }
+        }
+        if start {
+            self.start_media_poll(key, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// 启动媒体轮询：视频约 33ms 取帧，音频约 100ms 更新进度；暂停/出错后退出。
+    fn start_media_poll(&mut self, key: String, cx: &mut Context<Self>) {
+        let interval = match self.media.get(&key).map(|p| p.kind) {
+            Some(MediaKind::Video) => 33,
+            Some(MediaKind::Audio) => 100,
+            None => return,
+        };
+        let poll_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let mut idle_polls = 0u8;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(interval))
+                    .await;
+                let alive = this.update(cx, |view, cx| {
+                    let Some(playback) = view.media.get_mut(&poll_key) else {
+                        return false;
+                    };
+                    let Some(player) = playback.player.as_mut() else {
+                        return false;
+                    };
+                    let changed = player.poll();
+                    if changed {
+                        cx.notify();
+                    }
+                    player.playing()
+                });
+                match alive {
+                    Ok(true) => idle_polls = 0,
+                    // 暂停 seek 后 AVPlayerItemVideoOutput 可能需要数帧才给出目标画面；
+                    // 短暂续轮询，避免只查一次就留下旧帧。
+                    Ok(false) if idle_polls < 4 => idle_polls += 1,
+                    _ => break,
+                }
+            }
+        });
+        if let Some(playback) = self.media.get_mut(&key) {
+            playback.task = Some(task);
+        }
+    }
+
     /// 点击任务复选框：命中则把源文本里的 `[ ]` ↔ `[x]`（`[X]` 归一为 `[ ]`），返回是否命中。
     ///
     /// 复选框矩形与其源字节区间来自 prepaint 记录的 [`DocLayout::task_boxes`]；
@@ -2956,14 +3339,19 @@ impl DocView {
     /// 异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框嵌套泵
     /// runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。
     fn export_pdf(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_dialog(cx);
         let markdown = self.doc.text().to_string();
-        cx.spawn(async move |_this, _cx| {
+        cx.spawn(async move |this, cx| {
             let picked = AsyncFileDialog::new()
                 .set_title("导出 PDF")
                 .add_filter("PDF 文件", &["pdf"])
                 .set_file_name("document.pdf")
                 .save_file()
                 .await;
+            let _ = this.update(cx, |view, cx| {
+                view.dialog_open = false;
+                cx.notify();
+            });
             let Some(handle) = picked else { return };
             let path = handle.path().to_path_buf();
             match to_pdf(&markdown) {
@@ -3121,6 +3509,111 @@ impl DocView {
         }
     }
 
+    fn run_menu_command(
+        &mut self,
+        command: MenuCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            MenuCommand::Quit => {
+                cx.quit();
+                return;
+            }
+            MenuCommand::Hide => {
+                cx.hide();
+                return;
+            }
+            MenuCommand::HideOthers => {
+                cx.hide_other_apps();
+                return;
+            }
+            MenuCommand::ShowAll => {
+                cx.unhide_other_apps();
+                return;
+            }
+            MenuCommand::Minimize => {
+                window.minimize_window();
+                return;
+            }
+            MenuCommand::Zoom => {
+                window.zoom_window();
+                return;
+            }
+            MenuCommand::ToggleFullscreen => {
+                window.toggle_fullscreen();
+                return;
+            }
+            MenuCommand::About => {
+                self.begin_dialog(cx);
+                let dialog = rfd::AsyncMessageDialog::new()
+                    .set_title("关于码札")
+                    .set_description(
+                        "码札 Mazha\n纯 Rust 构建的 Markdown 编辑器\nAGPL-3.0-or-later",
+                    );
+                cx.spawn(async move |this, cx| {
+                    let _ = dialog.show().await;
+                    let _ = this.update(cx, |view, cx| {
+                        view.dialog_open = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+                return;
+            }
+            _ => {}
+        }
+
+        if self.dialog_open || self.renaming.is_some() {
+            return;
+        }
+        if self.cmd_palette.open {
+            if matches!(command, MenuCommand::OpenPalette) {
+                self.close_palette(cx);
+            }
+            return;
+        }
+        if self.find.open {
+            if matches!(command, MenuCommand::Palette(PaletteAction::Find)) {
+                self.close_find(cx);
+            }
+            return;
+        }
+
+        match command {
+            MenuCommand::Palette(action) => self.run_palette_action(action, window, cx),
+            MenuCommand::Undo => {
+                self.doc.undo();
+                self.after_doc_mutation(cx);
+            }
+            MenuCommand::Redo => {
+                self.doc.redo();
+                self.after_doc_mutation(cx);
+            }
+            MenuCommand::Cut => self.cut_selection(cx),
+            MenuCommand::Copy => self.copy_selection(cx),
+            MenuCommand::Paste => self.paste(cx),
+            MenuCommand::SelectAll => {
+                let len = self.doc.len();
+                self.cursors = vec![Cursor::new(len)];
+                self.cursors[0].anchor = Some(0);
+                self.primary = 0;
+                self.selecting = false;
+                cx.notify();
+            }
+            MenuCommand::OpenPalette => self.open_palette(cx),
+            MenuCommand::CycleTheme => self.cycle_theme(window, cx),
+            MenuCommand::Quit
+            | MenuCommand::Hide
+            | MenuCommand::HideOthers
+            | MenuCommand::ShowAll
+            | MenuCommand::About
+            | MenuCommand::Minimize
+            | MenuCommand::Zoom
+            | MenuCommand::ToggleFullscreen => unreachable!(),
+        }
+    }
+
     /// 打开 Markdown 文件对话框。
     ///
     /// **关键约束（D41）**：绝不能在 gpui 回调里用 rfd 的**同步** `FileDialog`。macOS 同步
@@ -3132,16 +3625,20 @@ impl DocView {
     /// 正解：用 rfd 的**异步** `AsyncFileDialog`（macOS 走 `beginSheetModalForWindow`，不阻塞、
     /// 不嵌套泵 runloop），在 gpui 的 `cx.spawn` 里 `await`；完成后经弱引用 `update` 回写结果。
     fn open_file_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_dialog(cx);
         cx.spawn(async move |this, cx| {
             let picked = AsyncFileDialog::new()
                 .set_title("打开 Markdown")
                 .add_filter("Markdown", &["md", "markdown", "txt"])
                 .pick_file()
                 .await;
-            if let Some(handle) = picked {
-                let path = handle.path().to_path_buf();
-                let _ = this.update(cx, |view, cx| view.open_path(path, cx));
-            }
+            let _ = this.update(cx, |view, cx| {
+                view.dialog_open = false;
+                if let Some(handle) = picked {
+                    view.open_path(handle.path().to_path_buf(), cx);
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -3211,6 +3708,7 @@ impl DocView {
         self.highlighter = None;
         self.find = FindState::default();
         self.saved_text = saved_text;
+        self.media.clear();
         self.scroll = gpui::ScrollHandle::new();
         self.content_height = px(0.);
         cx.notify();
@@ -3430,15 +3928,19 @@ impl DocView {
     fn move_current_file_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let cur = self.path.clone();
         let Some(cur) = cur else { return };
+        self.begin_dialog(cx);
         cx.spawn(async move |this, cx| {
             let picked = AsyncFileDialog::new()
                 .set_title("移动到目录")
                 .pick_folder()
                 .await;
-            if let Some(handle) = picked {
-                let dir = handle.path().to_path_buf();
-                let _ = this.update(cx, |view, cx| view.move_file(cur, dir, cx));
-            }
+            let _ = this.update(cx, |view, cx| {
+                view.dialog_open = false;
+                if let Some(handle) = picked {
+                    view.move_file(cur, handle.path().to_path_buf(), cx);
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -3480,6 +3982,7 @@ impl DocView {
     /// 另存为：异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框
     /// 嵌套泵 runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。
     fn save_as(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_dialog(cx);
         let text = self.doc.text().to_string();
         cx.spawn(async move |this, cx| {
             let picked = AsyncFileDialog::new()
@@ -3488,6 +3991,10 @@ impl DocView {
                 .set_file_name("document.md")
                 .save_file()
                 .await;
+            let _ = this.update(cx, |view, cx| {
+                view.dialog_open = false;
+                cx.notify();
+            });
             let Some(handle) = picked else { return };
             let path = handle.path().to_path_buf();
             if let Err(e) = std::fs::write(&path, text.as_bytes()) {
@@ -3942,6 +4449,9 @@ impl Render for DocView {
             .flex_col()
             .bg(palette.background)
             .text_color(palette.foreground)
+            .on_action(cx.listener(|view, action: &MenuAction, window, cx| {
+                view.run_menu_command(action.command, window, cx);
+            }))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _w, cx| {
                 if !view.sidebar_resizing {
                     return;
@@ -4003,6 +4513,13 @@ impl Render for DocView {
                                         && let Some(url) = view.link_at(event.position)
                                     {
                                         cx.open_url(&url);
+                                        return;
+                                    }
+                                    // 点音视频卡片：播放/暂停或点进度条 seek，不移动光标。
+                                    if !event.modifiers.shift
+                                        && !event.modifiers.alt
+                                        && view.toggle_media_at(event.position, cx)
+                                    {
                                         return;
                                     }
                                     // 点在任务复选框上：切换 `[ ]` ↔ `[x]`（Shift/Alt 点击不切换，
@@ -5139,7 +5656,63 @@ fn standalone_image_dest(line: &ProjectedLine) -> Option<&String> {
     }
     match &line.widgets[0].kind {
         WidgetKind::Image { dest, .. } => Some(dest),
+        WidgetKind::Media { .. } => None,
     }
+}
+
+/// 独占行音视频：命中唯一一个 Media Widget，且本行没有其它可见文本/表格/代码。
+///
+/// 行内媒体（前面有文字）不生成卡片，只显示图片式的占位 chip；光标进入独占行时
+/// 与图片一致切回源码编辑。
+fn standalone_media(line: &ProjectedLine) -> Option<MediaElement> {
+    if !line.runs.is_empty()
+        || line.widgets.len() != 1
+        || line.table_cells.is_some()
+        || line.block.code_block
+    {
+        return None;
+    }
+    match &line.widgets[0].kind {
+        WidgetKind::Media {
+            kind,
+            src,
+            poster,
+            title,
+        } => Some(MediaElement {
+            kind: *kind,
+            src: src.clone(),
+            poster: poster.clone(),
+            title: title.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// 媒体播放状态键：同类型同地址共享一个播放器（同一文档内重复引用时同步播放）。
+fn media_key(kind: MediaKind, src: &str) -> String {
+    format!("{}:{}", kind.tag(), src.trim())
+}
+
+/// 秒数格式化为 `m:ss` / `h:mm:ss`；非有限值显示 `--:--`。
+fn fmt_time(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "--:--".to_string();
+    }
+    let total = seconds.round() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// 视频尺寸适配：不超过正文可用宽度，也不放大小尺寸源。
+fn fit_video_size(natural: Size<Pixels>, max_width: Pixels) -> Size<Pixels> {
+    let width = natural.width.max(px(1.));
+    let height = natural.height.max(px(1.));
+    let scale = (max_width.max(px(1.)) / width).min(1.);
+    size(width * scale, height * scale)
 }
 
 /// 把图片地址解析为 GPUI 资源：远程 URL 直接用 `Resource::Uri`，其余走本地路径。
@@ -5397,6 +5970,14 @@ const LINE_HEIGHT: Pixels = px(24.);
 
 /// 图片与上下相邻内容的呼吸间距。
 const IMAGE_VERTICAL_PAD: Pixels = px(8.);
+/// 媒体卡片与上下文字之间的呼吸间距。
+const MEDIA_VERTICAL_PAD: Pixels = px(8.);
+/// 媒体控制条高度（视频底栏/音频卡片底栏）。
+const MEDIA_CONTROL_HEIGHT: Pixels = px(32.);
+/// 音频播放按钮固定宽高。
+const AUDIO_BUTTON_SIZE: Pixels = px(50.);
+/// 视频未取帧时的占位宽高比。
+const VIDEO_PLACEHOLDER_RATIO: f32 = 9.0 / 16.0;
 
 /// 图片圆角（避免直角贴住引用底色/面板）。
 const IMAGE_CORNER_RADIUS: Pixels = px(6.);
@@ -5540,6 +6121,18 @@ impl Element for DocElement {
                     .collect();
                 let doc_path = view.path.clone();
                 let projection = view.doc.projection();
+                // 删除/改写媒体标签后，旧播放器不能在后台继续播放：按当前投影引用
+                // 的媒体键清理。切换标签时则整体清空（见 `activate_tab`）。
+                let active_media: Vec<String> = projection
+                    .lines
+                    .iter()
+                    .flat_map(|l| l.widgets.iter())
+                    .filter_map(|w| match &w.kind {
+                        WidgetKind::Media { kind, src, .. } => Some(media_key(*kind, src)),
+                        _ => None,
+                    })
+                    .collect();
+                view.media.retain(|key, _| active_media.contains(key));
                 // 各光标所在逻辑行：用于判定块级 widget 是否处于编辑态（SPEC §11.5）
                 let caret_lines: Vec<usize> = caret_sources
                     .iter()
@@ -5688,8 +6281,10 @@ impl Element for DocElement {
                         .find(|(i, _)| *i == idx)
                         .map(|(_, src)| src.clone().into())
                         .or_else(|| {
-                            (caret_pos.line == idx && standalone_image_dest(line).is_some())
-                                .then(|| caret_line_text.clone().into())
+                            (caret_pos.line == idx
+                                && (standalone_image_dest(line).is_some()
+                                    || standalone_media(line).is_some()))
+                            .then(|| caret_line_text.clone().into())
                         });
                     // 展开态显示文本 = 整行源码（含标记），光标列按行内字节直接换算
                     let caret_col = if let Some(src) = &raw_src {
@@ -5763,6 +6358,114 @@ impl Element for DocElement {
                     } else {
                         None
                     };
+                    // 独占行音视频：渲染态显示播放卡片；光标进入该行时显示源码。
+                    let media_preview = if raw_src.is_none()
+                        && caret_pos.line != idx
+                        && let Some(media) = standalone_media(line)
+                    {
+                        let key = media_key(media.kind, &media.src);
+                        let playback = view.media.get(&key);
+                        let player = playback.and_then(|p| p.player.as_ref());
+                        let error = playback
+                            .and_then(|p| p.error.as_deref())
+                            .or_else(|| player.and_then(|p| p.error()));
+                        let playing = player.is_some_and(|p| p.playing());
+                        let position = player.map_or(0.0, |p| p.position());
+                        let duration = player.map_or(0.0, |p| p.duration());
+                        // 视频优先用首帧自然尺寸；未取到帧时再尝试海报，最后回退 16:9。
+                        let frame_size = player.and_then(|p| p.frame_size());
+                        let poster = if media.kind == MediaKind::Video && frame_size.is_none() {
+                            media
+                                .poster
+                                .as_deref()
+                                .and_then(|p| load_image(p, doc_path.as_deref(), window, cx))
+                        } else {
+                            None
+                        };
+                        let card_size = match media.kind {
+                            MediaKind::Audio => size(AUDIO_BUTTON_SIZE, AUDIO_BUTTON_SIZE),
+                            MediaKind::Video => {
+                                if let Some(natural) = frame_size {
+                                    fit_video_size(natural, image_max_width)
+                                } else if let Some(poster) = &poster {
+                                    let natural = poster.size(0);
+                                    fit_video_size(
+                                        size(
+                                            px(natural.width.0.max(1) as f32),
+                                            px(natural.height.0.max(1) as f32),
+                                        ),
+                                        image_max_width,
+                                    )
+                                } else {
+                                    size(image_max_width, image_max_width * VIDEO_PLACEHOLDER_RATIO)
+                                }
+                            }
+                        };
+                        let rect = Bounds::new(
+                            point(
+                                bounds.origin.x + indent,
+                                bounds.origin.y + top_acc + MEDIA_VERTICAL_PAD,
+                            ),
+                            card_size,
+                        );
+                        let progress = Bounds::new(
+                            point(rect.origin.x + px(8.), rect.bottom() - px(7.)),
+                            size((rect.size.width - px(16.)).max(px(1.)), px(3.)),
+                        );
+                        let state = if error.is_some() {
+                            "加载失败"
+                        } else if playing {
+                            "暂停"
+                        } else {
+                            "播放"
+                        };
+                        let label_text = match media.kind {
+                            MediaKind::Audio if error.is_some() => "!".to_string(),
+                            MediaKind::Audio if playing => "Ⅱ".to_string(),
+                            MediaKind::Audio => "▶".to_string(),
+                            MediaKind::Video if duration > 0.0 => format!(
+                                "{}  ·  {state}  {} / {}",
+                                media.title.as_deref().unwrap_or(media.kind.label()),
+                                fmt_time(position),
+                                fmt_time(duration)
+                            ),
+                            MediaKind::Video => format!(
+                                "{}  ·  {state}",
+                                media.title.as_deref().unwrap_or(media.kind.label())
+                            ),
+                        };
+                        let run = gpui::TextRun {
+                            len: label_text.len(),
+                            font: base_font.clone(),
+                            color: palette.foreground,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let label = window.text_system().shape_line(
+                            label_text.into(),
+                            if media.kind == MediaKind::Audio {
+                                px(20.)
+                            } else {
+                                px(12.)
+                            },
+                            &[run],
+                            None,
+                        );
+                        Some(MediaPreview {
+                            key,
+                            kind: media.kind,
+                            src: media.src,
+                            rect,
+                            progress,
+                            label: Box::new(label),
+                            poster,
+                            position,
+                            duration,
+                        })
+                    } else {
+                        None
+                    };
                     // 网格表格行高由单元格换行后的实际视觉行数决定。
                     let mut line_px = if let Some(row) = &table_row {
                         row.height
@@ -5772,6 +6475,9 @@ impl Element for DocElement {
                     // 独占图片行：行高跟随图片（含上下呼吸间距），命中测试/滚动同步生效。
                     if let Some(image) = &image_preview {
                         line_px = image.size.height + IMAGE_VERTICAL_PAD * 2.;
+                    }
+                    if let Some(media) = &media_preview {
+                        line_px = media.rect.size.height + MEDIA_VERTICAL_PAD * 2.;
                     }
                     // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
                     // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
@@ -5874,7 +6580,7 @@ impl Element for DocElement {
                     // 行内图片占位：`![alt](url)` 整段被投影隐藏，画个小标签补上可见性。
                     // 独占行已真实渲染（或正在编辑原文）时不再叠占位标签。
                     let mut image_chips = Vec::new();
-                    if raw_src.is_none() && image_preview.is_none() {
+                    if raw_src.is_none() && image_preview.is_none() && media_preview.is_none() {
                         for w in &line.widgets {
                             // 展开态显示文本与源逐字节对齐；投影态用投影给的显示列
                             let byte = prefix_bytes
@@ -5968,6 +6674,7 @@ impl Element for DocElement {
                         font_size,
                         raw_src,
                         image: image_preview,
+                        media: media_preview,
                         table: table_row,
                     });
                 }
@@ -6285,6 +6992,119 @@ impl Element for DocElement {
                 paint_rect_border(window, rect, palette.border, px(1.));
             }
 
+            // 独占行音视频：视频帧/海报/占位卡片 + 底部控制条与进度。
+            if let Some(media) = &block.media {
+                let rect = media.rect;
+                let player = self
+                    .view
+                    .read(cx)
+                    .media
+                    .get(&media.key)
+                    .and_then(|p| p.player.as_ref());
+                let frame = player.and_then(|p| p.frame().cloned());
+                let bar = bounds(
+                    point(rect.origin.x, rect.bottom() - MEDIA_CONTROL_HEIGHT),
+                    size(rect.size.width, MEDIA_CONTROL_HEIGHT),
+                );
+                match media.kind {
+                    MediaKind::Video => {
+                        window.paint_quad(fill(rect, palette.code_block_bg));
+                        if let Some(frame) = frame {
+                            let _ = window.paint_image(
+                                rect,
+                                rect,
+                                Corners {
+                                    top_left: IMAGE_CORNER_RADIUS,
+                                    top_right: IMAGE_CORNER_RADIUS,
+                                    bottom_right: IMAGE_CORNER_RADIUS,
+                                    bottom_left: IMAGE_CORNER_RADIUS,
+                                },
+                                frame,
+                                0,
+                                false,
+                            );
+                        } else if let Some(poster) = &media.poster {
+                            let _ = window.paint_image(
+                                rect,
+                                rect,
+                                Corners {
+                                    top_left: IMAGE_CORNER_RADIUS,
+                                    top_right: IMAGE_CORNER_RADIUS,
+                                    bottom_right: IMAGE_CORNER_RADIUS,
+                                    bottom_left: IMAGE_CORNER_RADIUS,
+                                },
+                                poster.clone(),
+                                0,
+                                false,
+                            );
+                        }
+                        // 控制条压在视频底部：半透明底保证文字在亮画面上可读。
+                        window.paint_quad(fill(
+                            bar,
+                            Hsla {
+                                a: 0.72,
+                                ..palette.background
+                            },
+                        ));
+                        let label_y = bar.origin.y + (bar.size.height - px(16.)) / 2.;
+                        let _ = media.label.paint(
+                            point(rect.origin.x + px(8.), label_y),
+                            px(20.),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    MediaKind::Audio => {
+                        let playing = player.is_some_and(|p| p.playing());
+                        let background = if playing {
+                            Hsla {
+                                a: 0.18,
+                                ..palette.accent
+                            }
+                        } else {
+                            palette.subtle
+                        };
+                        window.paint_quad(
+                            fill(rect, background)
+                                .corner_radii(AUDIO_BUTTON_SIZE / 2.)
+                                .border_widths(px(1.))
+                                .border_color(palette.border),
+                        );
+                        let label_x = rect.origin.x + (rect.size.width - media.label.width()) / 2.;
+                        let _ = media.label.paint(
+                            point(label_x, rect.origin.y + px(13.)),
+                            px(24.),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                if media.kind == MediaKind::Video {
+                    // 视频进度条：底轨 + 已播放比例；点击命中区在 `media.progress`。
+                    window.paint_quad(fill(media.progress, palette.border));
+                    let fraction = if media.duration > 0.0 {
+                        (media.position / media.duration).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    };
+                    let filled = media.progress.size.width * fraction;
+                    if filled > px(0.) {
+                        window.paint_quad(fill(
+                            bounds(
+                                media.progress.origin,
+                                size(filled, media.progress.size.height),
+                            ),
+                            palette.accent,
+                        ));
+                    }
+                    paint_rect_border(window, rect, palette.border, px(1.));
+                }
+            }
+
             // 选区高亮：`selection` 是本块的显示列区间；按视觉行拆成多段矩形
             if let Some(cols) = &block.selection {
                 let b0 = block.byte_of_col(cols.start);
@@ -6575,6 +7395,8 @@ fn main() {
                 KeyBinding::new("tab", InsertTab, Some("mazha-doc")),
                 KeyBinding::new("shift-tab", Outdent, Some("mazha-doc")),
             ]);
+            cx.bind_keys(menu_key_bindings());
+            cx.set_menus(app_menus(&settings));
             let path = path.clone();
             let settings = settings.clone();
             gpui_kit::open_window(options, cx, move |window, cx| {
@@ -6594,14 +7416,43 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
         BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
-        QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, block_line_px_with_mono,
-        char_col_to_byte, code_block_wrap_width, horizontal_step, inline_links, inline_reveals,
-        nearest_cell, oblique, quote_block_wrap_width, reveal_inline, table_arrow_step,
-        table_entry_snap,
+        QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
+        block_line_px_with_mono, char_col_to_byte, code_block_wrap_width, horizontal_step,
+        inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
+        table_arrow_step, table_entry_snap,
     };
     use super::{decode_data_image, image_resource, px, size};
-    use gpui_kit::{ImageFormat, Resource};
+    use gpui_kit::{ImageFormat, MenuItem, Resource};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn app_menus_include_standard_groups_and_theme_checks() {
+        let menus = app_menus(&Settings::default());
+        let names: Vec<_> = menus.iter().map(|menu| menu.name.as_ref()).collect();
+        assert_eq!(names, ["码札", "文件", "编辑", "视图", "窗口"]);
+
+        let theme_menu = menus[3]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                MenuItem::Submenu(menu) if menu.name == "主题" => Some(menu),
+                _ => None,
+            })
+            .expect("视图菜单应包含主题子菜单");
+        match &theme_menu.items[0] {
+            MenuItem::Action {
+                name,
+                checked,
+                disabled,
+                ..
+            } => {
+                assert_eq!(name.as_ref(), "跟随系统");
+                assert!(*checked);
+                assert!(!*disabled);
+            }
+            _ => panic!("主题子菜单首项应为跟随系统"),
+        }
+    }
 
     /// 行高取正文与等宽字号的较大者；代码块只按自身等宽字号计算。
     #[test]
@@ -6859,6 +7710,39 @@ mod tests {
 
         let p = mazha_core::build_projection("![一](a.png) ![二](b.png)");
         assert!(super::standalone_image_dest(&p.lines[0]).is_none());
+    }
+
+    /// 独占行媒体生成播放卡片；与正文混排或同一行多个媒体时只显示行内占位。
+    #[test]
+    fn standalone_media_line_detection() {
+        let p = mazha_core::build_projection("<video src=\"a.mp4\"></video>");
+        let media = super::standalone_media(&p.lines[0]).expect("应识别独占视频");
+        assert_eq!(media.kind, mazha_md::MediaKind::Video);
+        assert_eq!(media.src, "a.mp4");
+
+        let p = mazha_core::build_projection("前 <audio src=\"a.mp3\"></audio> 后");
+        assert!(super::standalone_media(&p.lines[0]).is_none());
+
+        let p = mazha_core::build_projection(
+            "<audio src=\"a.mp3\"></audio> <audio src=\"b.mp3\"></audio>",
+        );
+        assert!(super::standalone_media(&p.lines[0]).is_none());
+    }
+
+    #[test]
+    fn media_time_and_size_helpers_are_stable() {
+        assert_eq!(super::AUDIO_BUTTON_SIZE, px(50.));
+        assert_eq!(super::fmt_time(0.0), "0:00");
+        assert_eq!(super::fmt_time(65.4), "1:05");
+        assert_eq!(super::fmt_time(3_661.0), "1:01:01");
+        assert_eq!(super::fmt_time(f64::NAN), "--:--");
+
+        let natural = size(px(640.), px(360.));
+        assert_eq!(super::fit_video_size(natural, px(800.)), natural);
+        assert_eq!(
+            super::fit_video_size(natural, px(320.)),
+            size(px(320.), px(180.))
+        );
     }
 
     /// 相对图片路径以文档目录为基准；远程/空地址不进入本地加载。

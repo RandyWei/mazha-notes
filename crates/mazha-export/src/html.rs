@@ -8,7 +8,9 @@
 //! MVP 取舍：列表一律紧凑渲染（列表项内的段落不加 `<p>`）；引用/列表可嵌套；
 //! 代码块用 `<pre><code class="language-x">`；图片解析 `![alt](dest)` 输出 `<img>`。
 
-use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
+use mazha_md::{
+    Block, BlockKind, MediaKind, SpanKind, SpanRole, SyntaxSpan, parse, parse_media_element,
+};
 use std::fmt::Write as _;
 use std::ops::Range;
 
@@ -328,6 +330,46 @@ fn render_item_body(source: &str, item: &Block, task: Option<bool>, out: &mut St
     out.push_str("</li>");
 }
 
+/// 输出可播放的 HTML/XHTML 媒体标签；XHTML 的布尔属性必须带值。
+fn render_media(source: &str, out: &mut String, xhtml: bool) {
+    let Some(media) = parse_media_element(source) else {
+        return;
+    };
+    let tag = media.kind.tag();
+    let controls = if xhtml {
+        " controls=\"controls\""
+    } else {
+        " controls"
+    };
+    let _ = write!(out, "<{tag}{controls} src=\"{}\"", escape_attr(&media.src));
+    if media.kind == MediaKind::Video
+        && let Some(poster) = media.poster.as_deref()
+    {
+        let _ = write!(out, " poster=\"{}\"", escape_attr(poster));
+    }
+    if let Some(title) = media.title.as_deref() {
+        let _ = write!(out, " title=\"{}\"", escape_attr(title));
+    }
+    let _ = write!(out, "></{tag}>");
+}
+
+/// 输出图片或媒体 Widget。
+fn render_widget(source: &str, role: SpanRole, out: &mut String, xhtml: bool) {
+    if role == SpanRole::ImageMarker
+        && let Some((alt, dest)) = parse_image(source)
+    {
+        let _ = write!(
+            out,
+            "<img src=\"{}\" alt=\"{}\"{}>",
+            escape_attr(&dest),
+            escape_attr(&alt),
+            if xhtml { "/" } else { "" }
+        );
+    } else if role == SpanRole::MediaMarker {
+        render_media(source, out, xhtml);
+    }
+}
+
 /// 渲染行内片段序列。
 fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bool) {
     let mut state = InlineState::default();
@@ -366,23 +408,11 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bo
             i += 1;
             continue;
         }
-        // Widget（图片占位）
         if sp.kind == SpanKind::Widget {
-            if sp.role == SpanRole::ImageMarker
-                && let Some((alt, dest)) = parse_image(&source[sp.range.clone()])
-            {
-                let _ = write!(
-                    out,
-                    "<img src=\"{}\" alt=\"{}\"{}>",
-                    escape_attr(&dest),
-                    escape_attr(&alt),
-                    if xhtml { "/" } else { "" }
-                );
-            }
+            render_widget(&source[sp.range.clone()], sp.role, out, xhtml);
             i += 1;
             continue;
         }
-        // 语法标记：按角色决定开合标签 / 链接 / 隐藏
         match sp.role {
             SpanRole::Emphasis => state.toggle(out, "em"),
             SpanRole::Strong => state.toggle(out, "strong"),
@@ -588,6 +618,19 @@ mod tests {
         assert_eq!(
             to_html("![图](a.png)\n"),
             "<p><img src=\"a.png\" alt=\"图\"></p>"
+        );
+    }
+
+    #[test]
+    fn media_widget() {
+        let source = "<video poster=\"cover.png\" title=\"演示\"><source src=\"a.mp4\"></video>\n";
+        assert_eq!(
+            to_html(source),
+            "<p><video controls src=\"a.mp4\" poster=\"cover.png\" title=\"演示\"></video></p>"
+        );
+        assert_eq!(
+            to_xhtml_body("<audio src=\"a.mp3\"></audio>\n"),
+            "<p><audio controls=\"controls\" src=\"a.mp3\"></audio></p>"
         );
     }
 

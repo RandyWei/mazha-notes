@@ -585,6 +585,41 @@ fn parse_font_color(tag_inner: &str) -> Option<(u8, u8, u8)> {
     None
 }
 
+/// 判断标签文本是否以 `video` / `audio` 标签名开头（含结束标签）。
+fn is_media_tag(tag: &str) -> bool {
+    let raw_name = tag.strip_prefix('/').unwrap_or(tag).trim_start();
+    let name_end = raw_name
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || *ch == '/')
+        .map_or(raw_name.len(), |(offset, _)| offset);
+    raw_name[..name_end].eq_ignore_ascii_case("video")
+        || raw_name[..name_end].eq_ignore_ascii_case("audio")
+}
+
+/// 把 HTML 行内标签的语义映射到内部 span 角色与自定义颜色。
+fn apply_html_style(spans: &mut [SyntaxSpan], name: &str, custom_color: Option<(u8, u8, u8)>) {
+    let role = match name {
+        "b" | "strong" => Some(SpanRole::Strong),
+        "i" | "em" => Some(SpanRole::Emphasis),
+        "s" | "del" | "strike" => Some(SpanRole::Strikethrough),
+        "code" => Some(SpanRole::InlineCode),
+        _ => None,
+    };
+    for span in spans {
+        if span.kind != SpanKind::Text {
+            continue;
+        }
+        if span.role == SpanRole::Normal
+            && let Some(role) = role
+        {
+            span.role = role;
+        }
+        if let Some(color) = custom_color {
+            span.color = Some(color);
+        }
+    }
+}
+
 fn html_tag_inline(
     source: &str,
     s: &str,
@@ -594,6 +629,18 @@ fn html_tag_inline(
     let bytes = s.as_bytes();
     if bytes.get(i) != Some(&b'<') {
         return None;
+    }
+    // `<video>` / `<audio>` 整体作为媒体占位；普通 HTML 标签仍走下面的剥壳逻辑。
+    if let Some((consumed, _)) = crate::media::parse_media_element_at(s, i) {
+        return Some((
+            consumed,
+            vec![SyntaxSpan {
+                range: base + i..base + i + consumed,
+                kind: SpanKind::Widget,
+                role: SpanRole::MediaMarker,
+                color: None,
+            }],
+        ));
     }
     // 查找 '>'
     let mut gt = None;
@@ -609,6 +656,11 @@ fn html_tag_inline(
     let tag_inner = &s[i + 1..gt];
     let tag_trim = tag_inner.trim();
     if tag_trim.is_empty() {
+        return None;
+    }
+    // 合法完整媒体已在上方整体接管；其余 video/audio 标签必须逐字显示，不能再由
+    // 通用 HTML 分支只隐藏开标签或闭标签，造成残缺文本与错误偏移。
+    if is_media_tag(tag_trim) {
         return None;
     }
     // 自闭合或注释等：直接剥离
@@ -661,44 +713,7 @@ fn html_tag_inline(
         let inner_spans = parse_inline(source, rest_abs..end_abs);
         // 根据标签应用简单样式映射
         let mut mapped: Vec<SyntaxSpan> = inner_spans;
-        match name.as_str() {
-            "b" | "strong" => {
-                for sp in &mut mapped {
-                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
-                        sp.role = SpanRole::Strong;
-                    }
-                }
-            }
-            "i" | "em" => {
-                for sp in &mut mapped {
-                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
-                        sp.role = SpanRole::Emphasis;
-                    }
-                }
-            }
-            "s" | "del" | "strike" => {
-                for sp in &mut mapped {
-                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
-                        sp.role = SpanRole::Strikethrough;
-                    }
-                }
-            }
-            "code" => {
-                for sp in &mut mapped {
-                    if sp.kind == crate::span::SpanKind::Text && sp.role == SpanRole::Normal {
-                        sp.role = SpanRole::InlineCode;
-                    }
-                }
-            }
-            _ => {}
-        }
-        if let Some(c) = custom_color {
-            for sp in &mut mapped {
-                if sp.kind == crate::span::SpanKind::Text {
-                    sp.color = Some(c);
-                }
-            }
-        }
+        apply_html_style(&mut mapped, &name, custom_color);
         spans.extend(mapped);
     }
     let total = (end_abs + end_tag.len()) - base - i;
@@ -1142,6 +1157,39 @@ mod tests {
         let src = "a<br>b";
         let spans = parse(src);
         assert_eq!(crate::span::visible_runs(&spans), vec![0..1, 5..6]);
+    }
+
+    #[test]
+    fn media_tag_is_widget() {
+        let src = r#"a <video src="x.mp4"></video> b"#;
+        let spans = parse(src);
+        assert_eq!(spans.len(), 3, "{spans:?}");
+        assert_eq!(spans[0], SyntaxSpan::text(0..2, SpanRole::Normal));
+        assert_eq!(spans[1].kind, SpanKind::Widget);
+        assert_eq!(spans[1].role, SpanRole::MediaMarker);
+        assert_eq!(
+            &src[spans[1].range.clone()],
+            "<video src=\"x.mp4\"></video>"
+        );
+        assert_eq!(
+            crate::span::visible_runs(&spans),
+            vec![0..2, spans[2].range.clone()]
+        );
+    }
+
+    #[test]
+    fn media_without_src_stays_literal() {
+        let src = "<video controls></video>";
+        let spans = parse(src);
+        assert_eq!(crate::span::visible_runs(&spans), vec![0..src.len()]);
+    }
+
+    #[test]
+    fn media_multiline_stays_literal() {
+        let src = "<video src=\"a.mp4\">\ntext</video>";
+        let line_end = src.find('\n').unwrap();
+        let spans = parse_inline(src, 0..line_end);
+        assert_eq!(crate::span::visible_runs(&spans), vec![0..line_end]);
     }
 
     #[test]

@@ -11,7 +11,10 @@
 
 use crate::offset_map::{DisplayPos, OffsetMap};
 use crate::selection::Selection;
-use mazha_md::{Align, Block, BlockKind, SpanKind, SpanRole, SyntaxSpan};
+use mazha_md::{
+    Align, Block, BlockKind, MediaElement, MediaKind, SpanKind, SpanRole, SyntaxSpan,
+    parse_media_element,
+};
 use std::ops::Range;
 
 /// 整篇文档的渲染投影。
@@ -497,6 +500,17 @@ pub enum WidgetKind {
         /// 图片地址（源文本中的原样目标；可为相对路径/绝对路径/URL）。
         dest: String,
     },
+    /// HTML 媒体元素（`<video>` / `<audio>`，D64）。
+    Media {
+        /// 媒体类型。
+        kind: MediaKind,
+        /// 媒体地址（源文本中的原样目标）。
+        src: String,
+        /// 视频封面地址。
+        poster: Option<String>,
+        /// 标题。
+        title: Option<String>,
+    },
 }
 
 impl WidgetKind {
@@ -510,6 +524,23 @@ impl WidgetKind {
                     format!("[图片: {alt}]")
                 }
             }
+            WidgetKind::Media {
+                kind,
+                title: Some(title),
+                ..
+            } => format!("[{}: {title}]", kind.label()),
+            WidgetKind::Media { kind, .. } => format!("[{}]", kind.label()),
+        }
+    }
+}
+
+impl From<MediaElement> for WidgetKind {
+    fn from(element: MediaElement) -> Self {
+        Self::Media {
+            kind: element.kind,
+            src: element.src,
+            poster: element.poster,
+            title: element.title,
         }
     }
 }
@@ -972,7 +1003,9 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
 /// 从被隐藏的 Widget 源范围里提取占位信息。
 fn extract_widget(source: &str, range: &Range<usize>) -> WidgetKind {
     let s = source.get(range.clone()).unwrap_or_default();
-    if let Some((alt, dest)) = parse_image_source(s) {
+    if let Some(element) = parse_media_element(s) {
+        WidgetKind::from(element)
+    } else if let Some((alt, dest)) = parse_image_source(s) {
         WidgetKind::Image { alt, dest }
     } else {
         // 防御：解析器把未知隐藏片段也标成 Widget 时的兜底。
@@ -1106,6 +1139,44 @@ mod tests {
         // 围栏行本身没有可见文本
         assert_eq!(p.lines[0].display_text(), "");
         assert_eq!(p.lines[2].display_text(), "");
+    }
+
+    #[test]
+    fn media_becomes_widget() {
+        let l = one(r#"<video src="a.mp4" title="演示"></video>"#);
+        assert_eq!(l.display_text(), "");
+        assert_eq!(l.widgets.len(), 1);
+        assert_eq!(l.widgets[0].display_col, 0);
+        assert_eq!(
+            l.widgets[0].kind,
+            WidgetKind::Media {
+                kind: MediaKind::Video,
+                src: "a.mp4".to_string(),
+                poster: None,
+                title: Some("演示".to_string()),
+            }
+        );
+        assert_eq!(l.widgets[0].kind.placeholder(), "[视频: 演示]");
+        assert_eq!(l.offset_map.display_len(), 0);
+    }
+
+    #[test]
+    fn audio_inline_stays_widget() {
+        let l = one("前 <audio src=\"a.mp3\"></audio> 后");
+        assert_eq!(l.display_text(), "前  后");
+        assert_eq!(l.widgets.len(), 1);
+        assert!(matches!(
+            l.widgets[0].kind,
+            WidgetKind::Media {
+                kind: MediaKind::Audio,
+                ..
+            }
+        ));
+        assert!(
+            !l.widgets
+                .iter()
+                .any(|w| matches!(w.kind, WidgetKind::Image { .. }))
+        );
     }
 
     #[test]
