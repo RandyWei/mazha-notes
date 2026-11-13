@@ -18,6 +18,8 @@ pub struct MediaPlayer {
     frame: Option<Arc<RenderImage>>,
     frame_size: Option<Size<Pixels>>,
     error: Option<String>,
+    loading: bool,
+    started: bool,
     #[cfg(target_os = "macos")]
     inner: Option<MacPlayer>,
 }
@@ -37,6 +39,8 @@ impl MediaPlayer {
                 frame: None,
                 frame_size: None,
                 error: None,
+                loading: true,
+                started: false,
                 inner: Some(inner),
             })
         }
@@ -77,6 +81,11 @@ impl MediaPlayer {
         self.error.as_deref()
     }
 
+    /// 是否正在等待媒体加载或网络缓冲。
+    pub fn loading(&self) -> bool {
+        self.loading
+    }
+
     /// 播放/暂停；播放结束后再次播放会回到开头。
     pub fn toggle(&mut self) {
         #[cfg(target_os = "macos")]
@@ -91,9 +100,11 @@ impl MediaPlayer {
                 }
             }
             self.playing = false;
+            self.loading = false;
+            self.started = false;
             return;
         }
-        if self.duration > 0.0 && self.position >= self.duration - 0.05 {
+        if self.duration > 0.0 && self.position >= self.duration - 0.5 {
             self.seek_fraction(0.0);
         }
         #[cfg(target_os = "macos")]
@@ -103,6 +114,8 @@ impl MediaPlayer {
             }
         }
         self.playing = true;
+        self.loading = true;
+        self.started = false;
     }
 
     /// 按进度（0..=1）跳转。
@@ -133,6 +146,8 @@ impl MediaPlayer {
             if status == AVPlayerItemStatus::Failed {
                 self.error = Some("媒体加载失败".to_string());
                 self.playing = false;
+                self.loading = false;
+                self.started = false;
                 return true;
             }
             if status != AVPlayerItemStatus::Unknown {
@@ -146,6 +161,19 @@ impl MediaPlayer {
             if (position - self.position).abs() > 0.001 {
                 self.position = position;
                 changed = true;
+            }
+            let control_status = unsafe { inner.player.timeControlStatus() };
+            if control_status == AVPlayerTimeControlStatus::Playing {
+                if self.loading || !self.started {
+                    changed = true;
+                }
+                self.loading = false;
+                self.started = true;
+            } else if control_status == AVPlayerTimeControlStatus::WaitingToPlayAtSpecifiedRate {
+                if !self.loading {
+                    changed = true;
+                }
+                self.loading = self.playing;
             }
             if let Some(output) = inner.output.as_ref() {
                 let time = unsafe { inner.player.currentTime() };
@@ -162,16 +190,32 @@ impl MediaPlayer {
                     }
                 }
             }
-            if self.playing && self.duration > 0.0 && self.position >= self.duration - 0.05 {
+            let reached_duration = self.duration > 0.0 && self.position >= self.duration - 0.05;
+            let player_paused = control_status == AVPlayerTimeControlStatus::Paused;
+            if playback_ended(self.playing, self.started, reached_duration, player_paused) {
                 unsafe {
                     inner.player.pause();
+                    inner.player.seekToTime(CMTime::with_seconds(0.0, 600));
                 }
                 self.playing = false;
+                self.loading = false;
+                self.started = false;
+                self.position = 0.0;
                 changed = true;
             }
         }
         changed
     }
+}
+
+/// 播放结束判定：接近总时长，或已真正播放后 AVPlayer 自行回到 Paused。
+fn playback_ended(
+    playing: bool,
+    started: bool,
+    reached_duration: bool,
+    player_paused: bool,
+) -> bool {
+    playing && (reached_duration || started && player_paused)
 }
 
 /// 常规时长读数：非有限/负值归 0。
@@ -296,10 +340,29 @@ fn pixel_buffer_frame(buffer: &CVPixelBuffer) -> Option<(Arc<RenderImage>, Size<
 #[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
-use objc2_av_foundation::{AVPlayer, AVPlayerItem, AVPlayerItemStatus, AVPlayerItemVideoOutput};
+use objc2_av_foundation::{
+    AVPlayer, AVPlayerItem, AVPlayerItemStatus, AVPlayerItemVideoOutput, AVPlayerTimeControlStatus,
+};
 #[cfg(target_os = "macos")]
 use objc2_core_media::CMTime;
 #[cfg(target_os = "macos")]
 use objc2_core_video::CVPixelBuffer;
 #[cfg(target_os = "macos")]
 use objc2_foundation::NSURL;
+
+#[cfg(test)]
+mod tests {
+    use super::playback_ended;
+
+    #[test]
+    fn playback_end_requires_active_playback() {
+        assert!(playback_ended(true, true, false, true));
+        assert!(playback_ended(true, false, true, false));
+        assert!(!playback_ended(false, true, true, true));
+    }
+
+    #[test]
+    fn initial_buffering_pause_is_not_end() {
+        assert!(!playback_ended(true, false, false, true));
+    }
+}

@@ -6,7 +6,7 @@
 - 最近更新：2026-11-13
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39 + 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.85**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.86**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -53,7 +53,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | `mazha-export` | 124 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
 | 合计 | **521**（其余含 store 与占位 crate 测试） |
-| `platforms/desktop`（独立 workspace） | 34（不计入上面的 521） |
+| `platforms/desktop`（独立 workspace） | 36（不计入上面的 521） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -80,7 +80,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - **D61**：**macOS `.app` 正式打包**——`macos/Info.plist` + `scripts/bundle-macos.sh`：从 PNG 生成全套 `.icns`，写入 Bundle ID/显示名/版本，复制 release 二进制，默认 ad-hoc 签名、可切 Developer ID，输出 `码札.app` 与 zip；`notarize-macos.sh` 负责 Developer ID 公证 + 装订 + Gatekeeper 校验（需外部 Apple 凭据）。
 - **D62**：**桌面外观设置**——`settings.rs` 用 serde 持久化主题（`system/light/dark`）、正文字体/等宽字体、正文字号/等宽字号；启动时应用主题，`System` 订阅窗口 appearance；正文布局改用 `DocView.font_size`，行高取正文与等宽较大者避免行内代码压行；命令面板与快捷键（`Cmd+=`/`Cmd+-`、`Cmd+Option+=`/`Cmd+Option+-`、`Cmd+Shift+L`、`Cmd+Option+0`）调整，状态栏显示字号/主题；`MAZHA_SETTINGS_PATH` 可覆盖设置文件路径。
 - **D63**：**macOS 原生应用菜单**——通过 GPUI 注入「码札/文件/编辑/视图/窗口」，标准剪贴板命令走 `OsAction`，菜单与快捷键、主题勾选及异步对话框互锁统一。
-- **D64**：**HTML 音视频与 macOS 播放**——单行 `<video>`/`<audio>` → `MediaMarker`/`WidgetKind::Media`；桌面 AVPlayer 懒创建，视频取 32BGRA 帧交 GPUI 自绘并支持 seek，音频为固定 50×50 播放/暂停按钮；HTML/EPUB 保留标签，PDF/DOCX 占位。网络链接已实机验证，本地媒体仍需回归。
+- **D64**：**HTML 音视频与 macOS 播放**——单行 `<video>`/`<audio>` → `MediaMarker`/`WidgetKind::Media`；桌面 AVPlayer 懒创建，视频取 32BGRA 帧交 GPUI 自绘并支持 seek，音频为固定 50×50 播放/暂停按钮 + 当前/总时长 + 加载指示，结束时归零并可重复播放；HTML/EPUB 保留标签，PDF/DOCX 占位。网络链接已实机验证，本地媒体仍需回归。
 - **R8**（PDF 真实文档回归）/ **R10**（`platforms/*` 独立 workspace，须单独门禁 + 同步独立 `Cargo.lock`）：见 SPEC §13。
 
 ## 依赖方向（不可违反）
@@ -106,10 +106,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 126 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 127 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(desktop): 原生菜单与音视频播放（0.1.84–0.1.85，D63/D64）>
+<本次提交：fix(desktop): 音频加载反馈与结束重播（0.1.86，D64）>
+6a1c53d feat(desktop): 原生菜单与音视频播放（0.1.84–0.1.85，D63/D64）
 8513df6 feat(desktop): 外观设置——主题/字体/字号持久化（0.1.83，D62）
 063e3c4 feat(desktop): macOS .app 打包与正式图标（0.1.82，D61）
 16b993b feat(desktop): macOS Dock 应用图标（0.1.81，D60）

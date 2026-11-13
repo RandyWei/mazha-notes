@@ -500,6 +500,10 @@ struct MediaPreview {
     progress: Bounds<Pixels>,
     /// 控制条文字（标题/播放态/时间），prepaint 阶段 shape 好。
     label: Box<ShapedLine>,
+    /// 音频按钮右侧的“当前时间 / 总时长”；视频为 `None`。
+    duration_label: Option<Box<ShapedLine>>,
+    /// 是否正在等待首次加载或网络缓冲。
+    loading: bool,
     /// 视频封面（未取到首帧时显示）。
     poster: Option<Arc<RenderImage>>,
     /// 当前播放位置与总时长（秒；用于进度条比例）。
@@ -3199,7 +3203,7 @@ impl DocView {
                         return false;
                     };
                     let changed = player.poll();
-                    if changed {
+                    if changed || player.loading() {
                         cx.notify();
                     }
                     player.playing()
@@ -6370,6 +6374,7 @@ impl Element for DocElement {
                             .and_then(|p| p.error.as_deref())
                             .or_else(|| player.and_then(|p| p.error()));
                         let playing = player.is_some_and(|p| p.playing());
+                        let loading = player.is_some_and(|p| p.loading());
                         let position = player.map_or(0.0, |p| p.position());
                         let duration = player.map_or(0.0, |p| p.duration());
                         // 视频优先用首帧自然尺寸；未取到帧时再尝试海报，最后回退 16:9。
@@ -6452,6 +6457,27 @@ impl Element for DocElement {
                             &[run],
                             None,
                         );
+                        let duration_label = (media.kind == MediaKind::Audio).then(|| {
+                            let text = if duration > 0.0 {
+                                format!("{} / {}", fmt_time(position), fmt_time(duration))
+                            } else {
+                                "0:00 / --:--".to_string()
+                            };
+                            let run = gpui::TextRun {
+                                len: text.len(),
+                                font: base_font.clone(),
+                                color: palette.muted,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            Box::new(window.text_system().shape_line(
+                                text.into(),
+                                px(12.),
+                                &[run],
+                                None,
+                            ))
+                        });
                         Some(MediaPreview {
                             key,
                             kind: media.kind,
@@ -6459,6 +6485,8 @@ impl Element for DocElement {
                             rect,
                             progress,
                             label: Box::new(label),
+                            duration_label,
+                            loading,
                             poster,
                             position,
                             duration,
@@ -7081,6 +7109,46 @@ impl Element for DocElement {
                             window,
                             cx,
                         );
+                        if let Some(duration) = &media.duration_label {
+                            let _ = duration.paint(
+                                point(rect.right() + px(10.), rect.origin.y + px(13.)),
+                                px(24.),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
+                        if media.loading {
+                            // 四点循环表示 AVPlayer 首次加载/网络缓冲；100ms 轮询负责刷新。
+                            let phase = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| (d.as_millis() / 180 % 4) as usize);
+                            let center = point(
+                                rect.origin.x + rect.size.width / 2.,
+                                rect.origin.y + rect.size.height / 2.,
+                            );
+                            let dots = [
+                                point(center.x, rect.origin.y - px(3.)),
+                                point(rect.right() + px(3.), center.y),
+                                point(center.x, rect.bottom() + px(3.)),
+                                point(rect.origin.x - px(3.), center.y),
+                            ];
+                            for (index, dot) in dots.into_iter().enumerate() {
+                                let diameter = if index == phase { px(6.) } else { px(4.) };
+                                let dot_rect = bounds(
+                                    point(dot.x - diameter / 2., dot.y - diameter / 2.),
+                                    size(diameter, diameter),
+                                );
+                                let color = if index == phase {
+                                    palette.accent
+                                } else {
+                                    palette.border
+                                };
+                                window
+                                    .paint_quad(fill(dot_rect, color).corner_radii(diameter / 2.));
+                            }
+                        }
                     }
                 }
                 if media.kind == MediaKind::Video {
