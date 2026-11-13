@@ -3036,11 +3036,15 @@ impl DocView {
         changed
     }
 
-    /// 粘贴：读取系统剪贴板的纯文本，替换每个光标处的选区（无选区则插入）。
+    /// 粘贴：图片文件保留路径，内存图片转 data URI，其余按纯文本处理。
     ///
-    /// 按光标**位置倒序**处理，避免靠前插入使靠后光标偏移失效；剪贴板无文本或为空时不动。
+    /// 按光标**位置倒序**处理，避免靠前插入使靠后光标偏移失效；剪贴板无可用内容时不动。
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(text) = cx
+            .read_from_clipboard()
+            .as_ref()
+            .and_then(clipboard_markdown)
+        else {
             return;
         };
         if text.is_empty() {
@@ -6064,6 +6068,87 @@ fn image_resource(dest: &str, doc_path: Option<&Path>) -> Option<Resource> {
     resolve_image_path(dest, doc_path).map(|path| Resource::Path(path.into()))
 }
 
+/// 把 GPUI 剪贴板条目转换为可直接插入文档的 Markdown。
+///
+/// 图片文件路径优先于内存图片和文本；这样从文件管理器复制图片时保留文件引用，
+/// 截图等只有像素数据的内容才会内联为 base64 data URI。
+fn clipboard_markdown(item: &ClipboardItem) -> Option<String> {
+    let path_images = item
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) => Some(paths.0.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|path| is_image_path(path))
+        .map(|path| markdown_image_path(path))
+        .collect::<Vec<_>>();
+    if !path_images.is_empty() {
+        return Some(path_images.join("\n"));
+    }
+
+    item.entries()
+        .iter()
+        .find_map(|entry| match entry {
+            ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
+                let payload = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+                Some(format!(
+                    "![图片](data:{};base64,{payload})",
+                    image.format.mime_type()
+                ))
+            }
+            _ => None,
+        })
+        .or_else(|| item.text().filter(|text| !text.is_empty()))
+}
+
+/// 图片文件路径生成 Markdown 图片语法；尖括号允许路径保留空格。
+fn markdown_image_path(path: &Path) -> String {
+    let alt = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("图片")
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]");
+    // `<`/`>` 会破坏尖括号目标边界；百分号形式会由现有路径加载器还原。
+    let dest = path
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D");
+    format!("![{alt}](<{dest}>)")
+}
+
+/// 是否为桌面端可渲染的常见图片文件路径。
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "webp"
+                    | "gif"
+                    | "svg"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "ico"
+                    | "pbm"
+                    | "pgm"
+                    | "ppm"
+                    | "pnm"
+            )
+        })
+}
+
 /// 解码 `data:` 图片 URI，返回 GPUI 图片格式与原始字节。
 ///
 /// 支持 `data:image/png;base64,...` 与百分号编码的二进制形式；MIME 决定格式。
@@ -7939,12 +8024,16 @@ mod tests {
     use super::{
         BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
         QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
-        block_line_px_with_mono, char_col_to_byte, code_block_wrap_width, horizontal_step,
-        inline_links, inline_reveals, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
-        table_arrow_step, table_entry_snap,
+        block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
+        horizontal_step, inline_links, inline_reveals, is_image_path, markdown_image_path,
+        nearest_cell, oblique, quote_block_wrap_width, reveal_inline, table_arrow_step,
+        table_entry_snap,
     };
     use super::{decode_data_image, image_resource, px, size};
-    use gpui_kit::{ImageFormat, MenuItem, Resource};
+    use gpui_kit::{
+        ClipboardEntry, ClipboardItem, ExternalPaths, Image, ImageFormat, MenuItem, Resource,
+    };
+    use smallvec::smallvec;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -7974,6 +8063,65 @@ mod tests {
             }
             _ => panic!("主题子菜单首项应为跟随系统"),
         }
+    }
+
+    #[test]
+    fn clipboard_image_paths_are_inserted_as_markdown_paths() {
+        let item = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(smallvec![
+                PathBuf::from("/tmp/a photo.PNG"),
+                PathBuf::from("/tmp/readme.txt"),
+                PathBuf::from("/tmp/b]c.svg"),
+            ]))],
+        };
+        assert_eq!(
+            clipboard_markdown(&item).as_deref(),
+            Some("![a photo.PNG](</tmp/a photo.PNG>)\n![b\\]c.svg](</tmp/b]c.svg>)")
+        );
+        assert!(is_image_path(Path::new("cover.JpEg")));
+        assert!(!is_image_path(Path::new("cover.md")));
+    }
+
+    #[test]
+    fn clipboard_memory_image_becomes_base64_data_uri() {
+        let item = ClipboardItem {
+            entries: vec![ClipboardEntry::Image(Image {
+                format: ImageFormat::Png,
+                bytes: b"PNG".to_vec(),
+                id: 1,
+            })],
+        };
+        assert_eq!(
+            clipboard_markdown(&item).as_deref(),
+            Some("![图片](data:image/png;base64,UE5H)")
+        );
+    }
+
+    #[test]
+    fn clipboard_path_image_wins_and_non_image_falls_back_to_text() {
+        let with_image = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Image(Image {
+                    format: ImageFormat::Png,
+                    bytes: b"PNG".to_vec(),
+                    id: 1,
+                }),
+                ClipboardEntry::ExternalPaths(ExternalPaths(smallvec![PathBuf::from(
+                    "/tmp/a.png",
+                )])),
+            ],
+        };
+        assert_eq!(
+            clipboard_markdown(&with_image).as_deref(),
+            Some("![a.png](</tmp/a.png>)")
+        );
+
+        let text = ClipboardItem::new_string("普通文本".to_string());
+        assert_eq!(clipboard_markdown(&text).as_deref(), Some("普通文本"));
+        assert_eq!(
+            markdown_image_path(Path::new("/tmp/a>b%.png")),
+            "![a>b%.png](</tmp/a%3Eb%25.png>)"
+        );
     }
 
     /// 行高取正文与等宽字号的较大者；代码块只按自身等宽字号计算。

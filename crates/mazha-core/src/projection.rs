@@ -855,7 +855,11 @@ fn standalone_image(source: &str, block: &Block) -> Option<(String, String)> {
 /// 第一个空白分隔项；`<...>` 包裹时允许路径含空格。title 被忽略。
 fn parse_image_source(text: &str) -> Option<(String, String)> {
     let rest = text.strip_prefix("![")?;
-    let close = rest.find("](")?;
+    // 文件名等 alt 文本允许 `\]`；不能把被转义的右方括号误认成目标起点。
+    let close = rest
+        .match_indices("](")
+        .find(|(index, _)| !is_escaped(rest.as_bytes(), *index))?
+        .0;
     let alt = &rest[..close];
     let target = rest[close + 2..].strip_suffix(')')?.trim();
     if target.is_empty() {
@@ -867,6 +871,17 @@ fn parse_image_source(text: &str) -> Option<(String, String)> {
         target.split_whitespace().next()?
     };
     Some((alt.to_string(), dest.to_string()))
+}
+
+/// 字节位置前是否有奇数个连续反斜杠。
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let mut slash_count = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 /// 按竖线位置切分显示文本，返回各单元格的显示字节范围（已裁掉两端空白）。
@@ -1594,6 +1609,18 @@ mod tests {
             BlockWidgetKind::Image {
                 alt: "图".to_string(),
                 dest: "assets/my photo.png".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn image_alt_allows_escaped_closing_bracket() {
+        let p = build(r"![a\]b](</tmp/a b.png>)");
+        assert_eq!(
+            p.block_widgets()[0].kind,
+            BlockWidgetKind::Image {
+                alt: r"a\]b".to_string(),
+                dest: "/tmp/a b.png".to_string()
             }
         );
     }
