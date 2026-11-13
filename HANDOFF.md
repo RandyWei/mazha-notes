@@ -53,7 +53,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | `mazha-export` | 127 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
 | 合计 | **526**（其余含 store 与占位 crate 测试） |
-| `platforms/desktop`（独立 workspace） | 39（不计入上面的 526） |
+| `platforms/desktop`（独立 workspace） | 40（不计入上面的 526） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -81,7 +81,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - **D62**：**桌面外观设置**——`settings.rs` 用 serde 持久化主题（`system/light/dark`）、正文字体/等宽字体、正文字号/等宽字号；启动时应用主题，`System` 订阅窗口 appearance；正文布局改用 `DocView.font_size`，行高取正文与等宽较大者避免行内代码压行；命令面板与快捷键（`Cmd+=`/`Cmd+-`、`Cmd+Option+=`/`Cmd+Option+-`、`Cmd+Shift+L`、`Cmd+Option+0`）调整，状态栏显示字号/主题；`MAZHA_SETTINGS_PATH` 可覆盖设置文件路径。
 - **D63**：**macOS 原生应用菜单**——通过 GPUI 注入「码札/文件/编辑/视图/窗口」，标准剪贴板命令走 `OsAction`，菜单与快捷键、主题勾选及异步对话框互锁统一。
 - **D64**：**HTML 音视频与 macOS 播放**——单行 `<video>`/`<audio>` → `MediaMarker`/`WidgetKind::Media`；桌面 AVPlayer 懒创建，视频取 32BGRA 帧交 GPUI 自绘并支持 seek，音频为固定 50×50 播放/暂停按钮 + 当前/总时长 + 加载指示，结束时归零并可重复播放；HTML/EPUB 保留标签，PDF/DOCX 占位。网络链接已实机验证，本地媒体仍需回归。
-- **D66**：**表格强制换行与边框尺寸拖动**——表头规则保持 GFM；单元格 `Shift+Enter` 插入 `<br>` 并按零宽换行点分段排版；内部竖线调整相邻列、右外边框调整整表宽度、横边框调整行高、右下角双向调整，悬浮显示对应 resize 光标；尺寸只在当前文档会话保存、不写入 Markdown。自绘 resize hitbox 必须在 prepaint 注册，paint 仅设置光标样式（否则 macOS 回调会 abort）。
+- **D66**：**表格强制换行、列对齐与边框尺寸拖动**——表头规则保持 GFM；单元格 `Shift+Enter` 插入 `<br>` 并按零宽换行点分段排版；分隔行 `:---`/`:---:`/`---:` 控制换行后每个视觉行左/中/右对齐；内部竖线调整相邻列、右外边框调整整表宽度、横边框调整行高、右下角双向调整，悬浮显示对应 resize 光标；尺寸只在当前文档会话保存、不写入 Markdown。自绘 resize hitbox 必须在 prepaint 注册，paint 仅设置光标样式（否则 macOS 回调会 abort）。
 - **R8**（PDF 真实文档回归）/ **R10**（`platforms/*` 独立 workspace，须单独门禁 + 同步独立 `Cargo.lock`）：见 SPEC §13。
 
 ## 依赖方向（不可违反）
@@ -107,10 +107,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 128 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 129 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：feat(desktop): 表格换行与边框尺寸拖动（0.1.87，D66）>
+<本次提交：fix(desktop): 表格多行单元格继承列对齐（0.1.87，D66）>
+0a67ff5 feat(desktop): 表格换行与边框尺寸拖动（0.1.87，D66）
 7f6a4cb fix(desktop): 音频加载反馈与结束重播（0.1.86，D64）
 6a1c53d feat(desktop): 原生菜单与音视频播放（0.1.84–0.1.85，D63/D64）
 8513df6 feat(desktop): 外观设置——主题/字体/字号持久化（0.1.83，D62）

@@ -729,8 +729,12 @@ struct TableResizeState {
 struct TableCellGeom {
     /// 单元格在投影显示文本内的字节范围（不含竖线/两端空格）。
     display: Range<usize>,
-    /// 文本绘制 x（相对表格左缘，已含内边距；单行单元格含对齐偏移）。
+    /// 文本绘制 x（相对表格左缘，已含左内边距）。
     x: Pixels,
+    /// 单元格可排版内宽（不含左右 padding）。
+    inner_width: Pixels,
+    /// 分隔行声明的列对齐方式。
+    align: Align,
     /// 按 `<br>` 拆开的排版段；每段内部仍可按列宽软换行。
     parts: Vec<TableCellPart>,
 }
@@ -823,7 +827,9 @@ fn table_point_of_col(
         .shaped
         .position_for_index(local, row.line_height)
         .unwrap_or_else(|| point(Pixels::ZERO, Pixels::ZERO));
-    Some(point(cell.x + p.x, row.offset_y + part.y + p.y))
+    let visual_row = (p.y / row.line_height) as usize;
+    let align_x = wrapped_row_align_offset(&part.shaped, visual_row, cell.inner_width, cell.align);
+    Some(point(cell.x + align_x + p.x, row.offset_y + part.y + p.y))
 }
 
 /// 表格行：块内坐标 → 显示列。
@@ -849,9 +855,11 @@ fn table_col_of_point(
         .or_else(|| cell.parts.last())?;
     let max_y = row.line_height * part.rows.saturating_sub(1) as f32;
     let local_y = (cell_y - part.y).clamp(Pixels::ZERO, max_y);
+    let visual_row = (local_y / row.line_height) as usize;
+    let align_x = wrapped_row_align_offset(&part.shaped, visual_row, cell.inner_width, cell.align);
     let mut byte = part
         .shaped
-        .closest_index_for_position(point(local_x, local_y), row.line_height)
+        .closest_index_for_position(point(local_x - align_x, local_y), row.line_height)
         .unwrap_or_else(|ix| ix);
     while byte > 0 && !part.shaped.text.is_char_boundary(byte) {
         byte -= 1;
@@ -938,6 +946,42 @@ fn table_cell_parts(range: Range<usize>, breaks: &[usize]) -> Vec<Range<usize>> 
     }
     parts.push(start..range.end);
     parts
+}
+
+fn table_text_align(align: Align) -> TextAlign {
+    match align {
+        Align::Left => TextAlign::Left,
+        Align::Center => TextAlign::Center,
+        Align::Right => TextAlign::Right,
+    }
+}
+
+fn wrapped_row_width(line: &WrappedLine, visual_row: usize) -> Pixels {
+    let rows = row_byte_bounds(line);
+    let Some((&start, &end)) = rows.get(visual_row).zip(rows.get(visual_row + 1)) else {
+        return Pixels::ZERO;
+    };
+    let x0 = line.unwrapped_layout.x_for_index(start);
+    let x1 = line.unwrapped_layout.x_for_index(end);
+    (x1 - x0).max(Pixels::ZERO)
+}
+
+fn wrapped_row_align_offset(
+    line: &WrappedLine,
+    visual_row: usize,
+    inner_width: Pixels,
+    align: Align,
+) -> Pixels {
+    table_alignment_offset(wrapped_row_width(line, visual_row), inner_width, align)
+}
+
+fn table_alignment_offset(content_width: Pixels, inner_width: Pixels, align: Align) -> Pixels {
+    let extra = (inner_width - content_width).max(Pixels::ZERO);
+    match align {
+        Align::Left => Pixels::ZERO,
+        Align::Center => extra / 2.,
+        Align::Right => extra,
+    }
 }
 
 /// 调整相邻两列宽度，保持两列总宽不变并限制最小列宽。
@@ -1244,27 +1288,12 @@ fn build_table_grids(
                 }
                 let lines: usize = parts.iter().map(|part| part.rows).sum();
                 max_lines = max_lines.max(lines.max(1));
-                // 单行时保留原有的居中/右对齐；换行后的单元格统一左对齐，
-                // 避免每行的对齐偏移与光标/选区换算不一致。
-                let extra = if lines == 1 {
-                    let width = parts
-                        .first()
-                        .map_or(Pixels::ZERO, |part| part.shaped.width());
-                    (inner - width).max(Pixels::ZERO)
-                } else {
-                    Pixels::ZERO
-                };
                 let align = align.get(c).copied().unwrap_or(Align::Left);
-                let x = boundaries[c]
-                    + pad
-                    + match align {
-                        Align::Left => Pixels::ZERO,
-                        Align::Center => extra / 2.,
-                        Align::Right => extra,
-                    };
                 cells.push(TableCellGeom {
                     display: range.clone(),
-                    x,
+                    x: boundaries[c] + pad,
+                    inner_width: inner,
+                    align,
                     parts,
                 });
             }
@@ -7615,10 +7644,16 @@ impl Element for DocElement {
                                         )
                                         .unwrap_or(p0);
                                     let width = (p1.x - p0.x).max(Pixels::ZERO);
+                                    let align_x = wrapped_row_align_offset(
+                                        &part.shaped,
+                                        r,
+                                        cell.inner_width,
+                                        cell.align,
+                                    );
                                     window.paint_quad(fill(
                                         bounds(
                                             point(
-                                                text_x + cell.x + p0.x,
+                                                text_x + cell.x + align_x + p0.x,
                                                 row_top
                                                     + row.offset_y
                                                     + part.y
@@ -7716,11 +7751,15 @@ impl Element for DocElement {
             if let Some(row) = &block.table {
                 for cell in &row.cells {
                     for part in &cell.parts {
+                        let origin = point(text_x + cell.x, row_top + row.offset_y + part.y);
                         let _ = part.shaped.paint(
-                            point(text_x + cell.x, row_top + row.offset_y + part.y),
+                            origin,
                             row.line_height,
-                            TextAlign::Left,
-                            None,
+                            table_text_align(cell.align),
+                            Some(Bounds::new(
+                                origin,
+                                size(cell.inner_width, row.line_height * part.rows as f32),
+                            )),
                             window,
                             cx,
                         );
@@ -8069,6 +8108,22 @@ mod tests {
         assert_eq!(
             super::resized_table_row_height(px(80.), px(20.), px(48.)),
             px(100.)
+        );
+    }
+
+    #[test]
+    fn table_alignment_offsets_left_center_and_right() {
+        assert_eq!(
+            super::table_alignment_offset(px(40.), px(100.), mazha_core::Align::Left),
+            px(0.)
+        );
+        assert_eq!(
+            super::table_alignment_offset(px(40.), px(100.), mazha_core::Align::Center),
+            px(30.)
+        );
+        assert_eq!(
+            super::table_alignment_offset(px(40.), px(100.), mazha_core::Align::Right),
+            px(60.)
         );
     }
 
