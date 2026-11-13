@@ -688,9 +688,14 @@ fn html_tag_inline(
         "font" | "span" | "b" | "strong" | "i" | "em" | "u" | "s" | "del" | "strike" | "code"
         | "mark" => {}
         "br" => {
-            // `<br>` 是行内模型无法表达的真实换行：只隐藏标签本身、不插入字符
-            // （插入空格会改变源文本↔显示列映射）。跨行换行请直接回车。
-            return Some((gt + 1 - i, vec![]));
+            // `<br>` 保持零宽；核心投影记录其显示字节位置，表格网格据此强制分行。
+            return Some((
+                gt + 1 - i,
+                vec![SyntaxSpan::marker(
+                    base + i..base + gt + 1,
+                    SpanRole::HtmlBreak,
+                )],
+            ));
         }
         _ => return None,
     }
@@ -1153,10 +1158,11 @@ mod tests {
 
     #[test]
     fn html_br_hidden_without_inserting_text() {
-        // 行内模型不能真正换行：`<br>` 只隐藏标签，不能凭空插入空格
+        // `<br>` 是零宽强制换行标记，不凭空插入显示字符
         let src = "a<br>b";
         let spans = parse(src);
         assert_eq!(crate::span::visible_runs(&spans), vec![0..1, 5..6]);
+        assert!(spans.iter().any(|span| span.role == SpanRole::HtmlBreak));
     }
 
     #[test]

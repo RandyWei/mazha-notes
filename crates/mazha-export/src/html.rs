@@ -466,7 +466,9 @@ fn render_inline(source: &str, spans: &[SyntaxSpan], out: &mut String, xhtml: bo
                 _ => {}
             },
             SpanRole::SoftBreak => out.push('\n'),
-            SpanRole::HardBreak => out.push_str(if xhtml { "<br/>" } else { "<br>" }),
+            SpanRole::HardBreak | SpanRole::HtmlBreak => {
+                out.push_str(if xhtml { "<br/>" } else { "<br>" });
+            }
             // 其余标记（标题/引用/列表/围栏/转义/链接目标等）导出时隐藏
             _ => {}
         }
@@ -619,6 +621,12 @@ mod tests {
             to_html("![图](a.png)\n"),
             "<p><img src=\"a.png\" alt=\"图\"></p>"
         );
+    }
+
+    #[test]
+    fn html_break_exports_as_break() {
+        assert_eq!(to_html("a<br>b\n"), "<p>a<br>b</p>");
+        assert_eq!(to_xhtml_body("a<br>b\n"), "<p>a<br/>b</p>");
     }
 
     #[test]

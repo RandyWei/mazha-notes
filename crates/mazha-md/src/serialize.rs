@@ -382,7 +382,7 @@ fn spans_to_inline_md(source: &str, spans: &[SyntaxSpan]) -> String {
             (SpanKind::Marker, SpanRole::MathMarker) => out.push('$'),
             // 脚注标记（`[^`、`]`、`]:`）原样回填，与标签/正文拼回完整语法
             // （与图片 Widget 同处理：都直接抄源文本）
-            (SpanKind::Marker, SpanRole::FootnoteMarker)
+            (SpanKind::Marker, SpanRole::HtmlBreak | SpanRole::FootnoteMarker)
             | (SpanKind::Widget, SpanRole::ImageMarker | SpanRole::MediaMarker) => {
                 out.push_str(&slice(source, &sp.range));
             }
@@ -665,6 +665,12 @@ mod roundtrip {
     fn image_widget_survives_roundtrip() {
         let out = to_md("![图](a.png)\n");
         assert_eq!(out, "![图](a.png)\n");
+    }
+
+    #[test]
+    fn html_break_survives_roundtrip() {
+        let src = "| a<br>b | c |\n| --- | --- |\n";
+        assert_eq!(to_md(src), src);
     }
 
     #[test]

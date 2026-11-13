@@ -453,7 +453,7 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
                 out.push('\n');
                 i += 1;
             }
-            (SpanKind::Marker, SpanRole::HardBreak) => {
+            (SpanKind::Marker, SpanRole::HardBreak | SpanRole::HtmlBreak) => {
                 out.push_str("\\\n");
                 i += 1;
             }
@@ -671,6 +671,12 @@ mod tests {
     fn typst_image() {
         let t = to_typst("![图](img.png)\n");
         assert!(t.contains("#image(\"img.png\", alt: \"图\")"), "{t}");
+    }
+
+    #[test]
+    fn typst_html_break_is_line_break() {
+        let t = to_typst("a<br>b\n");
+        assert!(t.contains("a\\\nb"), "{t}");
     }
 
     #[test]

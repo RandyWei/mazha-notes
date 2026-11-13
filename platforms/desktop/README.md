@@ -69,6 +69,15 @@ HTML/EPUB 导出保留可播放的 `video/audio controls` 标签；DOCX 与 PDF 
 
 设置文件默认写到平台配置目录（macOS `~/Library/Application Support/Mazha/settings.json`，Linux `$XDG_CONFIG_HOME/mazha/settings.json`，Windows `%APPDATA%\Mazha\settings.json`）；设置 `MAZHA_SETTINGS_PATH=/path/to/settings.json` 可覆盖，便于测试或多套配置。
 
+## 表格编辑（0.1.87，D66）
+
+- 表头仍遵循标准 GFM：第一行是表头，第二行是分隔行；本版本不改变表头规则。
+- 单元格内按 `Shift+Enter` 会在 Markdown 中插入 `<br>` 并显示为强制换行；普通 Enter 保持原有行为，列宽不足时仍会自动软换行。
+- 鼠标按住表格内部竖向边框可调整左右相邻两列宽度；两列总宽保持不变，单列最小 48px。
+- 拖动右外边框可改变整表宽度；拖动横向边框可调整对应行高；拖动右下角可同时调整最后一列和最后一行。
+- 悬浮内部/右边框时显示水平拖动光标，悬浮横边框时显示垂直拖动光标，悬浮右下角时显示对角拖动光标。
+- 手动宽高只在当前文档会话有效，不写入 Markdown；切换文档或重新打开后恢复按内容自动计算。行高不能低于内容所需高度，表格宽度不能超过正文区域。
+
 ## 打包 macOS .app
 
 ```bash

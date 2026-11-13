@@ -6,7 +6,7 @@
 - 最近更新：2026-11-13
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39 + 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.86**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.87**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -48,12 +48,12 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 数量 |
 |-------|------|
-| `mazha-core` | 201 |
-| `mazha-md` | 167 |
-| `mazha-export` | 124 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
+| `mazha-core` | 202 |
+| `mazha-md` | 168 |
+| `mazha-export` | 127 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
-| 合计 | **521**（其余含 store 与占位 crate 测试） |
-| `platforms/desktop`（独立 workspace） | 36（不计入上面的 521） |
+| 合计 | **526**（其余含 store 与占位 crate 测试） |
+| `platforms/desktop`（独立 workspace） | 39（不计入上面的 526） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -72,7 +72,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - **D53**：图片**本地真实渲染**——核心保留 `dest`、独占行产出 `BlockWidgetKind::Image`；桌面用 GPUI `ImageAssetLoader` 按文档目录加载本地文件，等比缩宽不放大、光标进入显示原文；缺失/行内图片仍占位。
 - **D54**：**远程图片**——`http(s)://` 映射为 `Resource::Uri`，桌面启动安装 `reqwest` HTTP 客户端（GPUI 默认 `NullHttpClient`）；下载失败/不支持协议仍回退占位。
 - **D55**：**内联 data URI 与协议相对图片**——`data:image/...` 支持 base64/百分号编码，MIME 映射 `ImageFormat` 后复用 GPUI 解码缓存；`//host/path` 本地按 `https://` 加载；坏数据仍占位。
-- **D56**：**内联 HTML 标签最小解析**——`parse_inline` 隐藏白名单标签（`font/span/b/strong/i/em/u/s/del/strike/code/mark/br`），内部递归解析并映射强调角色；`<font>/<span>` 的 `color`/`style` 颜色经 `SyntaxSpan.color → TextRun.color` 透传到桌面前景色；结束标签只在当前行内区间查找，未闭合按原文显示；`<br>` 仅剥离（行内模型不换行）。
+- **D56**：**内联 HTML 标签最小解析**——`parse_inline` 隐藏白名单标签（`font/span/b/strong/i/em/u/s/del/strike/code/mark/br`），内部递归解析并映射强调角色；`<font>/<span>` 的 `color`/`style` 颜色经 `SyntaxSpan.color → TextRun.color` 透传到桌面前景色；结束标签只在当前行内区间查找，未闭合按原文显示；`<br>` 记录为零宽 `HtmlBreak`，供 D66 表格强制换行。
 - **D57**：**超宽表格列宽压缩 + 单元格软换行**——自然宽度超可用宽度时不再整表回退 `|` 流式，而是在 `[最小内宽, 自然宽]` 间线性压缩列宽，单元格 `shape_wrapped_line` 软换行；行高按最大视觉行数计算，命中/光标/选区逐视觉行换算；极窄或含中文合成斜体时仍回退流式。
 - **D58**：**标签切换统一装载 + 侧栏拖动缩放/文件名省略号**——所有切换入口统一走 `switch_tab`；`sync_current_tab` 用 move 把当前 `Document` 回写标签（保留撤销历史），`activate_tab` 装载目标文档并重建布局/滚动/查找态。侧栏宽度 160–420px 可拖动，长文件名用 `truncate()` 显示末尾省略号。
 - **D59**：**浅灰选中态 + 大纲跳转置顶 + 标签关闭按钮 + 底部状态栏**——新增 `Palette.selected_bg`（前景 alpha 0.12）只用于活动标签/侧栏当前项，文本选区保持蓝色；大纲跳转记录 `scroll_to_source_top`，prepaint 按目标视觉行顶边强制置顶并按内容总高 clamp；每个标签增加 `✕`（单标签隐藏），`close_tab(idx)` 支持关闭非当前标签；根布局改为「主内容行 + 24px 全宽状态栏」，文件信息/行数/光标数/快捷键移到底部。
@@ -81,6 +81,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - **D62**：**桌面外观设置**——`settings.rs` 用 serde 持久化主题（`system/light/dark`）、正文字体/等宽字体、正文字号/等宽字号；启动时应用主题，`System` 订阅窗口 appearance；正文布局改用 `DocView.font_size`，行高取正文与等宽较大者避免行内代码压行；命令面板与快捷键（`Cmd+=`/`Cmd+-`、`Cmd+Option+=`/`Cmd+Option+-`、`Cmd+Shift+L`、`Cmd+Option+0`）调整，状态栏显示字号/主题；`MAZHA_SETTINGS_PATH` 可覆盖设置文件路径。
 - **D63**：**macOS 原生应用菜单**——通过 GPUI 注入「码札/文件/编辑/视图/窗口」，标准剪贴板命令走 `OsAction`，菜单与快捷键、主题勾选及异步对话框互锁统一。
 - **D64**：**HTML 音视频与 macOS 播放**——单行 `<video>`/`<audio>` → `MediaMarker`/`WidgetKind::Media`；桌面 AVPlayer 懒创建，视频取 32BGRA 帧交 GPUI 自绘并支持 seek，音频为固定 50×50 播放/暂停按钮 + 当前/总时长 + 加载指示，结束时归零并可重复播放；HTML/EPUB 保留标签，PDF/DOCX 占位。网络链接已实机验证，本地媒体仍需回归。
+- **D66**：**表格强制换行与边框尺寸拖动**——表头规则保持 GFM；单元格 `Shift+Enter` 插入 `<br>` 并按零宽换行点分段排版；内部竖线调整相邻列、右外边框调整整表宽度、横边框调整行高、右下角双向调整，悬浮显示对应 resize 光标；尺寸只在当前文档会话保存、不写入 Markdown。自绘 resize hitbox 必须在 prepaint 注册，paint 仅设置光标样式（否则 macOS 回调会 abort）。
 - **R8**（PDF 真实文档回归）/ **R10**（`platforms/*` 独立 workspace，须单独门禁 + 同步独立 `Cargo.lock`）：见 SPEC §13。
 
 ## 依赖方向（不可违反）
@@ -106,10 +107,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 127 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 128 条；本次提交为最新一条，下次同步时补入哈希）
 
 ```
-<本次提交：fix(desktop): 音频加载反馈与结束重播（0.1.86，D64）>
+<本次提交：feat(desktop): 表格换行与边框尺寸拖动（0.1.87，D66）>
+7f6a4cb fix(desktop): 音频加载反馈与结束重播（0.1.86，D64）
 6a1c53d feat(desktop): 原生菜单与音视频播放（0.1.84–0.1.85，D63/D64）
 8513df6 feat(desktop): 外观设置——主题/字体/字号持久化（0.1.83，D62）
 063e3c4 feat(desktop): macOS .app 打包与正式图标（0.1.82，D61）

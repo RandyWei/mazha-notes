@@ -471,7 +471,9 @@ fn inline_content(
             (SpanKind::Marker, SpanRole::SoftBreak) => {
                 push_text(&mut out, " ", base, &style, false);
             }
-            (SpanKind::Marker, SpanRole::HardBreak) => out.push(line_break()),
+            (SpanKind::Marker, SpanRole::HardBreak | SpanRole::HtmlBreak) => {
+                out.push(line_break());
+            }
             (SpanKind::Marker, SpanRole::LinkMarker) => {
                 apply_link_marker(source, spans, i, &mut style, base, &mut out);
             }
@@ -731,6 +733,19 @@ mod tests {
             panic!("应为段落");
         };
         assert_eq!(paragraph_text(p), "[图片: 图]");
+    }
+
+    #[test]
+    fn html_break_becomes_docx_line_break() {
+        let out = render("a<br>b\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert!(p.content.iter().any(|content| matches!(
+            content,
+            ParagraphContent::Run(run)
+                if run.content.iter().any(|item| matches!(item, RunContent::Break(_)))
+        )));
     }
 
     #[test]

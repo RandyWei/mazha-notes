@@ -290,6 +290,8 @@ pub struct ProjectedLine {
     /// 范围是**显示文本内的字节区间**，供 UI 按内容重排列宽、画竖向网格线，
     /// 以及在单元格之间跳转；竖线本身仍保留在显示文本里（编辑时可被光标命中）。
     pub table_cells: Option<Vec<Range<usize>>>,
+    /// HTML `<br>` 在显示文本中的零宽字节位置；主要供表格单元格强制换行。
+    pub html_breaks: Vec<usize>,
     /// 内联占位（图片等）。
     pub widgets: Vec<Widget>,
     /// 显示位置 ↔ 源偏移 双向映射。
@@ -934,6 +936,7 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
     let mut visible: Vec<Range<usize>> = Vec::new();
     // 表格竖线在显示文本中的字节位置（仅 TablePipe 片段；转义竖线是普通文本）
     let mut pipes: Vec<usize> = Vec::new();
+    let mut html_breaks: Vec<usize> = Vec::new();
     let mut disp_bytes = 0usize;
     let mut disp_col = 0usize;
 
@@ -976,6 +979,8 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
                 display_col: disp_col,
                 kind: extract_widget(source, &span.range),
             });
+        } else if span.role == SpanRole::HtmlBreak {
+            html_breaks.push(disp_bytes);
         }
     }
 
@@ -995,6 +1000,7 @@ fn build_line(source: &str, line: &Line, block: BlockStyle, all: &[SyntaxSpan]) 
         block,
         runs,
         table_cells,
+        html_breaks,
         widgets,
         offset_map,
     }
@@ -1494,6 +1500,16 @@ mod tests {
         assert_eq!(cells.len(), 2, "显示文本: {text:?}");
         assert_eq!(&text[cells[0].clone()], "a | b");
         assert_eq!(&text[cells[1].clone()], "c");
+    }
+
+    #[test]
+    fn table_html_break_records_zero_width_position() {
+        let projection = build("| a<br>b | c |\n| --- | --- |");
+        let line = &projection.lines[0];
+        let cells = line.table_cells.as_ref().expect("表格单元格");
+        assert_eq!(line.html_breaks.len(), 1);
+        assert!(cells[0].contains(&line.html_breaks[0]));
+        assert_eq!(line.display_text(), "| ab | c |");
     }
 
     #[test]

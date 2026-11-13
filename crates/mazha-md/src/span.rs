@@ -41,6 +41,8 @@ pub enum SpanRole {
     ImageMarker,
     /// HTML 媒体元素（`<video>` / `<audio>`）整体占位（D64）。
     MediaMarker,
+    /// HTML `<br>` 强制换行标记：源码隐藏，表格网格可据此分行。
+    HtmlBreak,
     /// 标题 `#` 前缀。
     HeadingMarker,
     /// 引用 `>` 前缀。
