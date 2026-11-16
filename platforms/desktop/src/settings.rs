@@ -66,7 +66,7 @@ const MONO_FONT_CHOICES: &[(&str, &str)] = &[
     ("Cascadia Code", "Cascadia Code"),
 ];
 
-/// 持久化的外观设置；字段为 `None` 时沿用主题默认值。
+/// 持久化的外观与视图设置；字体/字号为 `None` 时沿用主题默认值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -79,6 +79,12 @@ pub struct Settings {
     pub font_size: Option<f32>,
     /// 等宽字号（px）；`None` = 主题默认。
     pub mono_font_size: Option<f32>,
+    /// 专注模式：淡化非当前块（D68）。
+    pub focus_mode: bool,
+    /// 打字机模式：保持光标行居中滚动（D68）。
+    pub typewriter_mode: bool,
+    /// 源码模式（代码模式）：按原始 Markdown 源码编辑/显示（D68）。
+    pub source_mode: bool,
 }
 
 impl Default for Settings {
@@ -89,6 +95,9 @@ impl Default for Settings {
             mono_font_family: None,
             font_size: None,
             mono_font_size: None,
+            focus_mode: false,
+            typewriter_mode: false,
+            source_mode: false,
         }
     }
 }
@@ -147,9 +156,15 @@ impl Settings {
         self.mono_font_family = next_font(MONO_FONT_CHOICES, self.mono_font_family.as_deref());
     }
 
-    /// 恢复默认外观（跟随系统 + 主题默认字体/字号）。
+    /// 恢复默认外观（跟随系统 + 主题默认字体/字号），保留视图模式开关。
     pub fn reset_appearance(&mut self) {
+        let focus_mode = self.focus_mode;
+        let typewriter_mode = self.typewriter_mode;
+        let source_mode = self.source_mode;
         *self = Self::default();
+        self.focus_mode = focus_mode;
+        self.typewriter_mode = typewriter_mode;
+        self.source_mode = source_mode;
     }
 }
 
@@ -282,6 +297,9 @@ mod tests {
             mono_font_family: Some("Menlo".into()),
             font_size: Some(18.0),
             mono_font_size: Some(14.0),
+            focus_mode: true,
+            typewriter_mode: true,
+            source_mode: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();
@@ -290,6 +308,29 @@ mod tests {
         assert_eq!(parsed.mono_font_family.as_deref(), Some("Menlo"));
         assert_eq!(parsed.font_size, Some(18.0));
         assert_eq!(parsed.mono_font_size, Some(14.0));
+        assert!(parsed.focus_mode);
+        assert!(parsed.typewriter_mode);
+        assert!(!parsed.source_mode);
+    }
+
+    #[test]
+    fn reset_appearance_preserves_view_modes() {
+        let mut settings = Settings {
+            theme: ThemePreference::Dark,
+            font_family: Some("Songti SC".into()),
+            font_size: Some(20.0),
+            focus_mode: true,
+            typewriter_mode: true,
+            source_mode: true,
+            ..Settings::default()
+        };
+        settings.reset_appearance();
+        assert_eq!(settings.theme, ThemePreference::System);
+        assert_eq!(settings.font_family, None);
+        assert_eq!(settings.font_size, None);
+        assert!(settings.focus_mode);
+        assert!(settings.typewriter_mode);
+        assert!(settings.source_mode);
     }
 
     #[test]

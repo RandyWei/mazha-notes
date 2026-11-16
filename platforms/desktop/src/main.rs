@@ -1584,6 +1584,9 @@ enum PaletteAction {
     Find,
     ToggleTree,
     ToggleOutline,
+    ToggleFocusMode,
+    ToggleTypewriterMode,
+    ToggleSourceMode,
     MoveCurrentFile,
     SetTheme(ThemePreference),
     CycleUiFont,
@@ -1797,6 +1800,14 @@ fn app_menus(settings: &Settings) -> Vec<Menu> {
             menu_item("切换文件树", Palette(ToggleTree)),
             menu_item("切换大纲", Palette(ToggleOutline)),
             MenuItem::separator(),
+            menu_item_checked("专注模式", Palette(ToggleFocusMode), settings.focus_mode),
+            menu_item_checked(
+                "打字机模式",
+                Palette(ToggleTypewriterMode),
+                settings.typewriter_mode,
+            ),
+            menu_item_checked("源码模式", Palette(ToggleSourceMode), settings.source_mode),
+            MenuItem::separator(),
             MenuItem::submenu(Menu::new("主题").items([
                 theme(ThemePreference::System),
                 theme(ThemePreference::Light),
@@ -1861,6 +1872,17 @@ fn menu_key_bindings() -> Vec<KeyBinding> {
             menu_action(MenuCommand::CycleTheme),
             doc,
         ),
+        KeyBinding::new(
+            "secondary-shift-j",
+            menu_action(Palette(ToggleFocusMode)),
+            doc,
+        ),
+        KeyBinding::new(
+            "secondary-shift-k",
+            menu_action(Palette(ToggleTypewriterMode)),
+            doc,
+        ),
+        KeyBinding::new("secondary-/", menu_action(Palette(ToggleSourceMode)), doc),
         KeyBinding::new("secondary-=", menu_action(Palette(FontSizeUp)), doc),
         KeyBinding::new("secondary--", menu_action(Palette(FontSizeDown)), doc),
         KeyBinding::new("secondary-alt-=", menu_action(Palette(MonoFontSizeUp)), doc),
@@ -2181,6 +2203,34 @@ impl DocView {
         apply_theme_preference(ThemePreference::System, window, cx);
         self.refresh_appearance(cx);
         cx.set_menus(app_menus(&self.settings));
+    }
+
+    /// 切换专注模式（D68）：淡化非当前块。
+    fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
+        self.settings.focus_mode = !self.settings.focus_mode;
+        self.persist_settings();
+        cx.set_menus(app_menus(&self.settings));
+        cx.notify();
+    }
+
+    /// 切换打字机模式（D68）：编辑/移动光标时尽量将光标行居中。
+    fn toggle_typewriter_mode(&mut self, cx: &mut Context<Self>) {
+        self.settings.typewriter_mode = !self.settings.typewriter_mode;
+        self.persist_settings();
+        cx.set_menus(app_menus(&self.settings));
+        self.caret_scroll_key = None;
+        cx.notify();
+    }
+
+    /// 切换源码模式（代码模式，D68）：按原始 Markdown 源码显示与编辑。
+    fn toggle_source_mode(&mut self, cx: &mut Context<Self>) {
+        self.settings.source_mode = !self.settings.source_mode;
+        self.persist_settings();
+        self.layout = None;
+        self.caret_scroll_key = None;
+        self.scroll_to_source_top = Some(self.cursors[self.primary].caret);
+        cx.set_menus(app_menus(&self.settings));
+        cx.notify();
     }
 
     /// 开始/重启光标闪烁：立即显示，并每 500ms 翻转一次可见性。
@@ -3794,6 +3844,33 @@ impl DocView {
             mk("查找/替换", "Cmd+F", Find),
             mk("切换文件树", "", ToggleTree),
             mk("切换大纲", "Cmd+Shift+O", ToggleOutline),
+            mk(
+                if self.settings.focus_mode {
+                    "专注模式：关闭"
+                } else {
+                    "专注模式：开启"
+                },
+                "Cmd+Shift+J",
+                ToggleFocusMode,
+            ),
+            mk(
+                if self.settings.typewriter_mode {
+                    "打字机模式：关闭"
+                } else {
+                    "打字机模式：开启"
+                },
+                "Cmd+Shift+K",
+                ToggleTypewriterMode,
+            ),
+            mk(
+                if self.settings.source_mode {
+                    "源码模式（代码模式）：关闭"
+                } else {
+                    "源码模式（代码模式）：开启"
+                },
+                "Cmd+/",
+                ToggleSourceMode,
+            ),
             mk("移动当前文件…", "", MoveCurrentFile),
             mk(
                 "主题：跟随系统",
@@ -3895,6 +3972,9 @@ impl DocView {
                 self.outline_open = !self.outline_open;
                 cx.notify();
             }
+            ToggleFocusMode => self.toggle_focus_mode(cx),
+            ToggleTypewriterMode => self.toggle_typewriter_mode(cx),
+            ToggleSourceMode => self.toggle_source_mode(cx),
             MoveCurrentFile => self.move_current_file_dialog(window, cx),
             SetTheme(preference) => self.set_theme_preference(preference, window, cx),
             CycleUiFont => self.cycle_ui_font(cx),
@@ -6526,7 +6606,16 @@ impl Element for DocElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         // 需要 &mut 投影缓存；先取快照所需的只读字段（caret_line_index 需 &mut，放到下面 update 里算）
-        let (palette, base_font, mono_font, base_size, mono_size, selection) = {
+        let (
+            palette,
+            base_font,
+            mono_font,
+            base_size,
+            mono_size,
+            selection,
+            focus_mode,
+            source_mode,
+        ) = {
             let snapshot = self.view.read(cx);
             (
                 snapshot.palette,
@@ -6535,6 +6624,8 @@ impl Element for DocElement {
                 snapshot.font_size,
                 snapshot.mono_font_size,
                 snapshot.all_selections(),
+                snapshot.settings.focus_mode,
+                snapshot.settings.source_mode,
             )
         };
         let indent_base = BASE;
@@ -6614,6 +6705,24 @@ impl Element for DocElement {
                     })
                     .collect();
                 let doc_path = view.path.clone();
+                // 源码模式（D68）：预取各行原始源码文本，避免在持有 projection 借用时再访问 doc。
+                let source_line_texts: Option<Vec<String>> = if source_mode {
+                    let ranges: Vec<std::ops::Range<usize>> = view
+                        .doc
+                        .projection()
+                        .lines
+                        .iter()
+                        .map(|l| l.source_range.clone())
+                        .collect();
+                    Some(
+                        ranges
+                            .into_iter()
+                            .map(|r| view.doc.slice(r).trim_end_matches(['\n', '\r']).to_string())
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
                 let projection = view.doc.projection();
                 // 删除/改写媒体标签后，旧播放器不能在后台继续播放：按当前投影引用
                 // 的媒体键清理。切换标签时则整体清空（见 `activate_tab`）。
@@ -6632,68 +6741,110 @@ impl Element for DocElement {
                     .iter()
                     .map(|&s| projection.line_of_source(s))
                     .collect();
+                // 专注模式（D68）：仅当前主光标所在块正常显示，其余行淡化。
+                let focus_range: Option<std::ops::Range<usize>> = if focus_mode {
+                    let line = projection.line_of_source(caret);
+                    if let Some(w) = projection.block_widget_on_line(line) {
+                        Some(w.line_range.clone())
+                    } else {
+                        Some(line..line + 1)
+                    }
+                } else {
+                    None
+                };
                 // 块级 widget 装饰：光标在其内=编辑态（不画装饰），否则=渲染态（画装饰）
-                let widgets: Vec<WidgetDecor> = projection
-                    .block_widgets()
-                    .iter()
-                    // 图片不走通用装饰面板：渲染态由逐行图片预览负责，编辑态显示整行源码。
-                    .filter_map(|w| {
-                        let editing = caret_lines.iter().any(|&l| w.line_range.contains(&l));
-                        let indent = projection
-                            .lines
-                            .get(w.line_range.start)
-                            .map_or(indent_base, |l| block_indent(l, indent_base));
-                        // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画（代码块/图表共用）
-                        let shape_label = |lang: &str| {
-                            let run = gpui::TextRun {
-                                len: lang.len(),
-                                font: mono_font.clone(),
-                                color: palette.muted,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
+                // 源码模式（D68）不绘制 WYSIWYG 块级装饰。
+                let widgets: Vec<WidgetDecor> = if source_mode {
+                    Vec::new()
+                } else {
+                    projection
+                        .block_widgets()
+                        .iter()
+                        // 图片不走通用装饰面板：渲染态由逐行图片预览负责，编辑态显示整行源码。
+                        .filter_map(|w| {
+                            let editing = caret_lines.iter().any(|&l| w.line_range.contains(&l));
+                            let indent = projection
+                                .lines
+                                .get(w.line_range.start)
+                                .map_or(indent_base, |l| block_indent(l, indent_base));
+                            // 语言标签：用等宽字体在 prepaint 里 shape 好，paint 直接画（代码块/图表共用）
+                            let shape_label = |lang: &str| {
+                                let run = gpui::TextRun {
+                                    len: lang.len(),
+                                    font: mono_font.clone(),
+                                    color: palette.muted,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                Box::new(window.text_system().shape_line(
+                                    lang.to_string().into(),
+                                    mono_size,
+                                    &[run],
+                                    None,
+                                ))
                             };
-                            Box::new(window.text_system().shape_line(
-                                lang.to_string().into(),
-                                mono_size,
-                                &[run],
-                                None,
-                            ))
-                        };
-                        let kind = match &w.kind {
-                            BlockWidgetKind::Code { lang, .. } => WidgetDecorKind::Code {
-                                label: lang.as_deref().map(shape_label),
-                            },
-                            // 图表块（mermaid 等）：同样画语言标签，便于用户知道该块的语言
-                            BlockWidgetKind::Chart { lang } => WidgetDecorKind::Chart {
-                                label: Some(shape_label(lang)),
-                            },
-                            BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
-                            BlockWidgetKind::Rule => WidgetDecorKind::Rule,
-                            BlockWidgetKind::Math => WidgetDecorKind::Math,
-                            BlockWidgetKind::Image { .. } => return None,
-                        };
-                        Some(WidgetDecor {
-                            kind,
-                            line_range: w.line_range.clone(),
-                            indent,
-                            editing,
+                            let kind = match &w.kind {
+                                BlockWidgetKind::Code { lang, .. } => WidgetDecorKind::Code {
+                                    label: lang.as_deref().map(shape_label),
+                                },
+                                // 图表块（mermaid 等）：同样画语言标签，便于用户知道该块的语言
+                                BlockWidgetKind::Chart { lang } => WidgetDecorKind::Chart {
+                                    label: Some(shape_label(lang)),
+                                },
+                                BlockWidgetKind::Table { .. } => WidgetDecorKind::Table,
+                                BlockWidgetKind::Rule => WidgetDecorKind::Rule,
+                                BlockWidgetKind::Math => WidgetDecorKind::Math,
+                                BlockWidgetKind::Image { .. } => return None,
+                            };
+                            Some(WidgetDecor {
+                                kind,
+                                line_range: w.line_range.clone(),
+                                indent,
+                                editing,
+                            })
                         })
-                    })
-                    .collect();
-                // 选区高亮：用核心的文档级映射把每个选区的源区间分解成"每行显示列区间"，
-                // 再按行归并（多光标可能同行重叠）。这样 paint 阶段无需再做源→显示换算。
+                        .collect()
+                };
+                // 选区高亮：WYSIWYG 按投影显示列；源码模式按原始源码字符列。
                 let mut sel_by_line: Vec<Option<Range<usize>>> = vec![None; projection.lines.len()];
-                for sel in &selection {
-                    for ldr in
-                        projection.selection_display_ranges(Selection::new(sel.start, sel.end))
-                    {
-                        match &mut sel_by_line[ldr.line] {
-                            Some(existing) => {
-                                existing.start = existing.start.min(ldr.cols.start);
-                                existing.end = existing.end.max(ldr.cols.end);
+                if source_mode {
+                    let srcs = source_line_texts.as_ref().unwrap();
+                    for (idx, line) in projection.lines.iter().enumerate() {
+                        let start = line.source_range.start;
+                        let end = line.source_range.end;
+                        let src = &srcs[idx];
+                        let mut agg: Option<Range<usize>> = None;
+                        for sel in &selection {
+                            let s = sel.start.clamp(start, end);
+                            let e = sel.end.clamp(start, end);
+                            if s >= e {
+                                continue;
                             }
-                            none => *none = Some(ldr.cols),
+                            let cs = src.get(..(s - start)).map_or(0, |t| t.chars().count());
+                            let ce = src.get(..(e - start)).map_or(cs, |t| t.chars().count());
+                            match &mut agg {
+                                Some(a) => {
+                                    a.start = a.start.min(cs);
+                                    a.end = a.end.max(ce);
+                                }
+                                None => agg = Some(cs..ce),
+                            }
+                        }
+                        sel_by_line[idx] = agg;
+                    }
+                } else {
+                    for sel in &selection {
+                        for ldr in
+                            projection.selection_display_ranges(Selection::new(sel.start, sel.end))
+                        {
+                            match &mut sel_by_line[ldr.line] {
+                                Some(existing) => {
+                                    existing.start = existing.start.min(ldr.cols.start);
+                                    existing.end = existing.end.max(ldr.cols.end);
+                                }
+                                none => *none = Some(ldr.cols),
+                            }
                         }
                     }
                 }
@@ -6732,21 +6883,26 @@ impl Element for DocElement {
                     }
                 }
                 // 表格网格：先整表测量列宽并形状化单元格（放不下则返回 None，走流式排版）
-                let table_rows = build_table_grids(
-                    window,
-                    projection,
-                    &TableGridCtx {
-                        content_width_total,
-                        indent_base,
-                        base_font: &base_font,
-                        mono_font: &mono_font,
-                        palette: &palette,
-                        base_size,
-                        mono_size,
-                    },
-                    &view.table_column_widths,
-                    &view.table_row_heights,
-                );
+                // 源码模式下禁用网格表格，按原始源码行显示。
+                let table_rows = if source_mode {
+                    vec![None; projection.lines.len()]
+                } else {
+                    build_table_grids(
+                        window,
+                        projection,
+                        &TableGridCtx {
+                            content_width_total,
+                            indent_base,
+                            base_font: &base_font,
+                            mono_font: &mono_font,
+                            palette: &palette,
+                            base_size,
+                            mono_size,
+                        },
+                        &view.table_column_widths,
+                        &view.table_row_heights,
+                    )
+                };
                 let mut v: Vec<BlockGeom> = Vec::with_capacity(projection.lines.len());
                 let mut row_starts: Vec<usize> = Vec::with_capacity(projection.lines.len() + 1);
                 // 每个全局视觉行的顶边（内容坐标）：标题/代码行高放大后不能再用"行号 × 统一行高"
@@ -6772,16 +6928,23 @@ impl Element for DocElement {
                     let is_revealed = revealed_line.is_some();
                     let line = revealed_line.as_ref().unwrap_or(line);
                     // 围栏行/独占图片行：光标进入时显示整行源码，并做 1:1 字节映射。
-                    let raw_src: Option<SharedString> = fence_texts
-                        .iter()
-                        .find(|(i, _)| *i == idx)
-                        .map(|(_, src)| src.clone().into())
-                        .or_else(|| {
-                            (caret_pos.line == idx
-                                && (standalone_image_dest(line).is_some()
-                                    || standalone_media(line).is_some()))
-                            .then(|| caret_line_text.clone().into())
-                        });
+                    // 源码模式（D68）：整行按原始 Markdown 源码显示与编辑。
+                    let raw_src: Option<SharedString> = if source_mode {
+                        source_line_texts
+                            .as_ref()
+                            .map(|srcs| srcs[idx].clone().into())
+                    } else {
+                        fence_texts
+                            .iter()
+                            .find(|(i, _)| *i == idx)
+                            .map(|(_, src)| src.clone().into())
+                            .or_else(|| {
+                                (caret_pos.line == idx
+                                    && (standalone_image_dest(line).is_some()
+                                        || standalone_media(line).is_some()))
+                                .then(|| caret_line_text.clone().into())
+                            })
+                    };
                     // 展开态显示文本 = 整行源码（含标记），光标列按行内字节直接换算
                     let caret_col = if let Some(src) = &raw_src {
                         if caret_pos.line == idx {
@@ -6805,25 +6968,43 @@ impl Element for DocElement {
                     };
                     // 本行若属于网格化表格，复用预排好的单元格几何
                     let table_row = table_rows.get(idx).cloned().flatten();
+                    let dim = focus_range.as_ref().is_some_and(|r| !r.contains(&idx));
                     let (text, runs, oblique_spans) = if let Some(src) = &raw_src {
-                        // 围栏源码：等宽 + 弱化色，不做语法高亮/斜体合成
+                        // 源码模式显示原文（等宽、正文色）；围栏编辑态沿用弱化色。
+                        let mut color = if source_mode {
+                            palette.foreground
+                        } else {
+                            palette.muted
+                        };
+                        if dim {
+                            color.a *= 0.28;
+                        }
                         let run = gpui::TextRun {
                             len: src.len(),
                             font: mono_font.clone(),
-                            color: palette.muted,
+                            color,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
                         };
                         (src.clone(), vec![run], Vec::new())
                     } else {
-                        build_line_runs(
+                        let mut built = build_line_runs(
                             line,
                             &base_font,
                             &mono_font,
                             &palette,
                             code_hl[idx].as_deref(),
-                        )
+                        );
+                        if dim {
+                            for run in &mut built.1 {
+                                run.color.a *= 0.28;
+                                if let Some(bg) = &mut run.background_color {
+                                    bg.a *= 0.28;
+                                }
+                            }
+                        }
+                        built
                     };
                     // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
                     // 围栏源码是整行原文，没有额外前缀
@@ -6833,8 +7014,15 @@ impl Element for DocElement {
                         text.len().saturating_sub(line.display_text().len())
                     };
                     // 逐块字号/行高：标题按级别放大，行高同步放大，避免字形压到相邻行
-                    let font_size = block_font_size(&line.block, base_size, mono_size);
-                    let indent = block_indent(line, indent_base);
+                    // 源码模式统一等宽字号与固定左边距，按原始源码行排版。
+                    let (font_size, indent) = if source_mode && raw_src.is_some() {
+                        (mono_size, indent_base)
+                    } else {
+                        (
+                            block_font_size(&line.block, base_size, mono_size),
+                            block_indent(line, indent_base),
+                        )
+                    };
                     // 图片只按正文可用宽度适配；不放大、不改宽高比（渲染态才加载）。
                     let image_max_width = (content_width_total - indent - BASE).max(px(48.));
                     let image_preview = if raw_src.is_none()
@@ -7387,17 +7575,24 @@ impl Element for DocElement {
                     let sc = v.scroll.clone();
                     let viewport_h = sc.bounds().size.height;
                     if viewport_h > Pixels::ZERO {
-                        const MARGIN: Pixels = px(8.);
                         let cur = sc.offset(); // y ∈ [-max_offset, 0]
-                        // 行完全落在上下留白内才不动；否则把它拉回留白内（最少滚动）
-                        let want = if top + cur.y > viewport_h - MARGIN - row_h {
-                            -(top + row_h + MARGIN - viewport_h)
-                        } else if top + cur.y < MARGIN {
-                            -(top - MARGIN)
+                        let max_scroll = (total_height - viewport_h).max(Pixels::ZERO);
+                        let want = if v.settings.typewriter_mode {
+                            // 打字机模式（D68）：尽量将当前光标行居中。
+                            let center = top + row_h / 2.;
+                            -(center - viewport_h / 2.)
                         } else {
-                            cur.y
+                            const MARGIN: Pixels = px(8.);
+                            // 行完全落在上下留白内才不动；否则把它拉回留白内（最少滚动）
+                            if top + cur.y > viewport_h - MARGIN - row_h {
+                                -(top + row_h + MARGIN - viewport_h)
+                            } else if top + cur.y < MARGIN {
+                                -(top - MARGIN)
+                            } else {
+                                cur.y
+                            }
                         };
-                        let want = want.clamp(-sc.max_offset().y, Pixels::ZERO);
+                        let want = want.clamp(-max_scroll, Pixels::ZERO);
                         if want != cur.y {
                             sc.set_offset(point(cur.x, want));
                             // set_offset 只改句柄、不触发重绘；不 notify 的话画面仍停在
