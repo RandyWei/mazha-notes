@@ -54,7 +54,7 @@ use mazha_core::{
     edit_table, find_all, replace_all_edit, table_cells,
 };
 use mazha_export::to_pdf;
-use mazha_md::{MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
+use mazha_md::{FootnoteIndex, MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, FileSystemProvider};
 mod media;
@@ -521,6 +521,32 @@ struct MediaPlayback {
     task: Option<Task<()>>,
     /// 打开失败原因。
     error: Option<String>,
+}
+
+/// 根据脚注索引与点击落点计算跳转目标（D69）。
+///
+/// - 点击引用标签（`entry.references` 覆盖 `src`）→ 定义块起点；
+/// - 点击定义块（`entry.definition` 覆盖 `src`）→ 首个引用标签起点；
+/// - 两处都不匹配或没有对应目标 → `None`（交给普通点击放光标）。
+///
+/// 纯函数，便于在没有 GPUI 布局的单测里覆盖双向跳转。
+fn footnote_jump(index: &FootnoteIndex, label: &str, src: usize) -> Option<usize> {
+    let entry = index.get(label)?;
+    if entry
+        .references
+        .iter()
+        .any(|r| src >= r.start && src <= r.end)
+    {
+        return entry.definition.as_ref().map(|r| r.start);
+    }
+    if entry
+        .definition
+        .as_ref()
+        .is_some_and(|r| src >= r.start && src <= r.end)
+    {
+        return entry.references.first().map(|r| r.start);
+    }
+    None
 }
 
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
@@ -3782,6 +3808,23 @@ impl DocView {
         (!url.is_empty()).then(|| url.to_string())
     }
 
+    /// 命中坐标处的脚注标签，返回跳转目标源偏移（D69；Cmd+点击用）。
+    ///
+    /// 只认投影里 `RunStyle::Footnote` 的片段（标签重编号前是 `[^label]` 的 label）：
+    /// 引用 → 定义块起点，定义标签 → 首个引用；其余位置返回 `None`，让普通点击放光标。
+    fn footnote_target_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let layout = self.layout.as_ref()?;
+        let (row, col) = layout.hit(position)?;
+        let block = &layout.blocks[row];
+        let run = block.proj.runs.iter().find(|run| {
+            run.style == RunStyle::Footnote
+                && col >= run.display_start
+                && col < run.display_start + run.text.chars().count()
+        })?;
+        let src = block.source_of_col(col);
+        footnote_jump(&self.doc.footnote_index(), &run.text, src)
+    }
+
     /// 导出当前文档为 PDF 并保存到文件。
     ///
     /// 异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框嵌套泵
@@ -4999,12 +5042,19 @@ impl Render for DocView {
                                         cx.notify();
                                         return;
                                     }
-                                    // Cmd+点击（Windows/Linux 为 Ctrl+点击）链接：交给系统默认应用打开，不移动光标
-                                    if event.modifiers.secondary()
-                                        && let Some(url) = view.link_at(event.position)
-                                    {
-                                        cx.open_url(&url);
-                                        return;
+                                    // Cmd+点击（Windows/Linux 为 Ctrl+点击）：脚注标签先跳转（D69），
+                                    // 其余位置再试链接（交给系统默认应用打开），都不移动光标。
+                                    if event.modifiers.secondary() {
+                                        if let Some(target) =
+                                            view.footnote_target_at(event.position)
+                                        {
+                                            view.goto_source(target, cx);
+                                            return;
+                                        }
+                                        if let Some(url) = view.link_at(event.position) {
+                                            cx.open_url(&url);
+                                            return;
+                                        }
                                     }
                                     // 点音视频卡片：播放/暂停或点进度条 seek，不移动光标。
                                     if !event.modifiers.shift
@@ -8302,9 +8352,9 @@ mod tests {
         BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
         QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
-        horizontal_step, inline_links, inline_reveals, is_image_path, markdown_image_path,
-        nearest_cell, oblique, quote_block_wrap_width, reveal_inline, table_arrow_step,
-        table_entry_snap,
+        footnote_jump, horizontal_step, inline_links, inline_reveals, is_image_path,
+        markdown_image_path, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
+        table_arrow_step, table_entry_snap,
     };
     use super::{decode_data_image, image_resource, px, size};
     use gpui_kit::{
@@ -8820,5 +8870,28 @@ mod tests {
         assert_eq!(super::percent_decode("a%20b"), "a b");
         assert_eq!(super::percent_decode("100%"), "100%");
         assert_eq!(super::percent_decode("%ZZ"), "%ZZ");
+    }
+
+    /// 脚注 Cmd+点击：引用 → 定义块起点，定义 → 首个引用；未知标签/无关落点不跳转。
+    #[test]
+    fn footnote_jump_resolves_both_directions() {
+        let src = "见[^a]。\n\n[^a]: note\n";
+        let index = mazha_md::FootnoteIndex::new(src, &mazha_md::parse(src));
+        let entry = index.get("a").expect("应有脚注 a");
+        let reference = entry.references[0].start;
+        let definition = entry.definition.as_ref().expect("应有定义").start;
+
+        assert_eq!(footnote_jump(&index, "a", reference), Some(definition));
+        assert_eq!(
+            footnote_jump(&index, "a", definition),
+            Some(reference),
+            "点击定义块应回跳到首个引用"
+        );
+        assert_eq!(footnote_jump(&index, "missing", reference), None);
+        assert_eq!(
+            footnote_jump(&index, "a", definition - 1),
+            None,
+            "定义块之外的落点不跳转"
+        );
     }
 }

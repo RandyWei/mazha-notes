@@ -16,9 +16,11 @@ use std::ops::Range;
 
 /// 把 Markdown 源文本渲染为 HTML 片段（不含 `<html>` 外壳）。
 pub fn to_html(source: &str) -> String {
-    let blocks = parse(source);
+    // D69：导出前统一编号并把脚注定义归集到文末（无脚注时原样返回）。
+    let source = crate::footnotes::prepare(source);
+    let blocks = parse(&source);
     let mut out = String::new();
-    render_blocks(source, &blocks, &mut out, false, false);
+    render_body(&source, &blocks, &mut out, false);
     out
 }
 
@@ -27,9 +29,10 @@ pub fn to_html(source: &str) -> String {
 /// 与 [`to_html`] 的唯一差别是**空元素自闭合**（`<hr/>`/`<br/>`/`<img .../>`/`<input .../>`）
 /// 且布尔属性写成 `disabled="disabled"`，以满足 EPUB 内容文档"必须是良构 XML"的约束。
 pub(crate) fn to_xhtml_body(source: &str) -> String {
-    let blocks = parse(source);
+    let source = crate::footnotes::prepare(source);
+    let blocks = parse(&source);
     let mut out = String::new();
-    render_blocks(source, &blocks, &mut out, false, true);
+    render_body(&source, &blocks, &mut out, true);
     out
 }
 
@@ -51,6 +54,10 @@ a:hover{text-decoration:underline}
 div.math{margin:1em 0;padding:.5em 0;text-align:center}
 span.math{font-style:italic}
 .fnref{font-size:.75em;vertical-align:super;color:#57606a;padding:0 .1em}
+.fnref a{color:inherit;text-decoration:none}
+.footnotes{margin-top:2em;padding-top:1em;border-top:1px solid #d0d7de;font-size:.9em;color:#57606a}
+.footnotes ol{padding-left:1.6em}
+.footnotes li{margin:.3em 0}
 div.footnote{font-size:.9em;color:#57606a;border-left:2px solid #d0d7de;padding:.2em 0 .2em .8em;margin:.6em 0}
 "#;
 
@@ -80,6 +87,53 @@ pub fn to_html_document(source: &str, title: &str, css: Option<&str>) -> String 
 /// 用 [`crate::Theme`] 渲染完整 HTML5 文档（等价 [`to_html_document`]，CSS 取自主题）。
 pub fn to_html_themed(source: &str, title: &str, theme: &crate::Theme) -> String {
     to_html_document(source, title, Some(theme.css.as_str()))
+}
+
+/// 渲染整篇正文：普通块 + 文末脚注小节。
+///
+/// `prepare` 已把**顶层**脚注定义块移到文末，这里把连续的顶层定义块包进
+/// `<section class="footnotes"><ol>`，让导出结果有统一的"脚注"区块。
+/// 嵌套在引用/列表里的定义仍由 [`render_block`] 按块内 `<div class="footnote">` 渲染。
+fn render_body(source: &str, blocks: &[Block], out: &mut String, xhtml: bool) {
+    // `prepare` 已把顶层定义移到末尾，正常情况下只开一次小节；
+    // 这里仍按"遇到定义就开、遇到普通块就关"处理，避免出现 `<ol>` 里夹段落的非法结构。
+    let mut section_open = false;
+    for block in blocks {
+        if matches!(block.kind, BlockKind::FootnoteDef { .. }) {
+            if !section_open {
+                out.push_str("<section class=\"footnotes\">\n<ol>\n");
+                section_open = true;
+            }
+            render_footnote_item(source, block, out, xhtml);
+        } else {
+            if section_open {
+                out.push_str("</ol>\n</section>");
+                section_open = false;
+            }
+            render_block(source, block, out, false, xhtml);
+        }
+    }
+    if section_open {
+        out.push_str("</ol>\n</section>");
+    }
+}
+
+/// 渲染文末脚注列表中的一项：`<li>` + 定义正文。
+///
+/// 序号已经由 `prepare` 写进标签（并作为 `<li id="fn-N">` 的锚点），
+/// 因此跳过定义头部的标签片段，避免正文里再出现一次上标序号。
+fn render_footnote_item(source: &str, block: &Block, out: &mut String, xhtml: bool) {
+    let BlockKind::FootnoteDef { label } = &block.kind else {
+        return;
+    };
+    let _ = write!(out, "<li id=\"fn-{}\">", escape_attr(label));
+    let body_start = block
+        .spans
+        .iter()
+        .position(|s| s.kind == SpanKind::Text && s.role == SpanRole::FootnoteRef)
+        .map_or(0, |i| i + 1);
+    render_inline(source, &block.spans[body_start..], out, xhtml);
+    out.push_str("</li>\n");
 }
 
 /// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项），`xhtml` 为真时空元素自闭合。
@@ -508,12 +562,15 @@ impl InlineState {
     }
 }
 
-/// 输出行内脚注标签（D35 ④）：引用与定义的标签都包 `<sup class="fnref">`，标签经转义。
+/// 输出行内脚注引用（D69）：序号（`prepare` 已把标签重编号）包 `<sup class="fnref">`，
+/// 并链接到文末定义 `<li id="fn-N">`。
 fn push_footnote_ref(source: &str, sp: &SyntaxSpan, out: &mut String) {
+    let label = &source[sp.range.clone()];
     let _ = write!(
         out,
-        "<sup class=\"fnref\">{}</sup>",
-        escape_text(&source[sp.range.clone()])
+        "<sup class=\"fnref\"><a href=\"#fn-{}\">{}</a></sup>",
+        escape_attr(label),
+        escape_text(label)
     );
 }
 
@@ -870,38 +927,69 @@ mod tests {
         );
     }
 
-    // ---------- 脚注（D35） ----------
+    // ---------- 脚注（D35 模型 / D69 导出编号与归集） ----------
 
     #[test]
-    fn html_footnote_ref_is_sup() {
-        // 引用：`[^`/`]` 隐藏，标签包 `<sup class="fnref">`
+    fn html_footnote_ref_is_linked_sup() {
+        // 引用：`[^`/`]` 隐藏；标签重编号为上标，并链接到文末定义锚点
         assert_eq!(
             to_html("见[^1]处\n"),
-            "<p>见<sup class=\"fnref\">1</sup>处</p>"
+            "<p>见<sup class=\"fnref\"><a href=\"#fn-1\">1</a></sup>处</p>"
         );
     }
 
     #[test]
-    fn html_footnote_def_in_place() {
-        // 定义：就地输出，`[^label]:` 隐藏，标签上标、正文可见（不重排文末、无回链）
-        let html = to_html("[^1]: note\n");
+    fn html_footnote_def_is_collected_at_end() {
+        // 定义：`[^label]:` 隐藏，整块归集到文末 `<section class="footnotes"><ol>`
+        assert_eq!(
+            to_html("[^1]: note\n"),
+            "<section class=\"footnotes\">\n<ol>\n<li id=\"fn-1\"> note</li>\n</ol>\n</section>"
+        );
+    }
+
+    #[test]
+    fn html_footnotes_are_numbered_by_reference_order() {
+        // 引用顺序 b → a：b 为 1、a 为 2；文末定义也按序号排序
+        let html = to_html("见[^b]与[^a]。\n\n[^a]: A\n[^b]: B\n");
         assert_eq!(
             html,
-            "<div class=\"footnote\" id=\"fn-1\"><sup class=\"fnref\">1</sup> note</div>"
+            "<p>见<sup class=\"fnref\"><a href=\"#fn-1\">1</a></sup>与\
+             <sup class=\"fnref\"><a href=\"#fn-2\">2</a></sup>。</p>\
+             <section class=\"footnotes\">\n<ol>\n\
+             <li id=\"fn-1\"> B</li>\n\
+             <li id=\"fn-2\"> A</li>\n\
+             </ol>\n</section>"
         );
     }
 
     #[test]
-    fn html_footnote_def_label_attr_escaped() {
-        // id 属性里的特殊字符要转义，避免属性被截断（标签串不含空白/方括号）
+    fn html_unreferenced_footnote_is_collected_after_referenced() {
+        let html = to_html("见[^a]\n\n[^a]: A\n[^b]: B\n");
+        assert!(html.contains("<a href=\"#fn-1\">1</a>"), "{html}");
+        assert!(html.contains("<li id=\"fn-1\"> A</li>"), "{html}");
+        assert!(html.contains("<li id=\"fn-2\"> B</li>"), "{html}");
+    }
+
+    #[test]
+    fn html_repeated_reference_shares_number() {
+        let html = to_html("甲[^note]乙[^note]\n\n[^note]: N\n");
+        assert_eq!(html.matches("href=\"#fn-1\"").count(), 2, "{html}");
+        assert_eq!(html.matches("<li id=\"fn-1\">").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn html_footnote_def_ids_are_numeric() {
+        // D69：标签在导出时被重编号，id 只含数字（不再直接拼原标签，避免非法/重复 id）
         let html = to_html("[^a&b]: x\n");
-        assert!(html.contains("id=\"fn-a&amp;b\""), "{html}");
+        assert!(html.contains("id=\"fn-1\""), "{html}");
+        assert!(!html.contains("fn-a"), "{html}");
     }
 
     #[test]
     fn html_footnote_default_css_has_rules() {
         let doc = to_html_document("见[^1]处\n\n[^1]: note\n", "t", None);
         assert!(doc.contains(".fnref"), "{doc}");
+        assert!(doc.contains(".footnotes"), "{doc}");
         assert!(doc.contains("div.footnote"), "{doc}");
     }
 }

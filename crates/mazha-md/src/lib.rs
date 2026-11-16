@@ -8,6 +8,7 @@
 //! 也不依赖 `mazha-core`（依赖方向为 `mazha-core → mazha-md`）。
 
 mod block;
+mod footnote;
 mod incremental;
 mod inline;
 mod media;
@@ -15,6 +16,7 @@ mod scanner;
 mod span;
 
 pub use block::{Align, Block, BlockKind, CalloutKind};
+pub use footnote::{FootnoteEntry, FootnoteIndex};
 pub use incremental::reparse;
 pub use inline::parse_inline;
 pub use media::{MediaElement, MediaKind, parse_media_element, parse_media_element_at};

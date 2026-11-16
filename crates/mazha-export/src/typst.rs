@@ -43,9 +43,11 @@ fn escape_typst_string(text: &str) -> String {
 
 /// 把 Markdown 源文本转换为 Typst 标记。
 pub fn to_typst(source: &str) -> String {
-    let blocks = parse(source);
+    // D69：导出前统一编号并把脚注定义归集到文末（无脚注时原样返回）。
+    let source = crate::footnotes::prepare(source);
+    let blocks = parse(&source);
     let mut out = String::new();
-    blocks_to_typst(source, &blocks, &mut out);
+    blocks_to_typst(&source, &blocks, &mut out);
     out
 }
 
@@ -736,6 +738,16 @@ mod tests {
     #[test]
     fn typst_footnote_continuation_keeps_line() {
         let t = to_typst("[^a]: first\n    续行\n");
-        assert!(t.contains("#super[a] first\n续行"), "{t}");
+        assert!(t.contains("#super[1] first\n续行"), "{t}");
+    }
+
+    #[test]
+    fn typst_footnotes_are_numbered_and_collected_at_end() {
+        // D69：按引用顺序编号，定义整体移到文末
+        let t = to_typst("见[^b]与[^a]。\n\n[^a]: A\n[^b]: B\n");
+        assert!(t.contains("见#super[1]与#super[2]。"), "{t}");
+        let first = t.find("#super[1] B").expect("B 应为第 1 条脚注");
+        let second = t.find("#super[2] A").expect("A 应为第 2 条脚注");
+        assert!(first < second, "文末定义应按序号排列：{t}");
     }
 }

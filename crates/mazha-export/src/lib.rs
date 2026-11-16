@@ -11,6 +11,7 @@
 
 mod docx;
 mod epub;
+mod footnotes;
 mod html;
 mod pdf;
 mod theme;

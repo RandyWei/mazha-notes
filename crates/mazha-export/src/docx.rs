@@ -41,10 +41,12 @@ pub enum DocxError {
 /// # Errors
 /// 当 `docx-rs` 写入 ZIP 包失败时返回 [`DocxError::Pack`]。
 pub fn to_docx(markdown: &str) -> Result<Vec<u8>, DocxError> {
-    let blocks = parse(markdown);
+    // D69：导出前统一编号并把脚注定义归集到文末（无脚注时原样返回）。
+    let markdown = crate::footnotes::prepare(markdown);
+    let blocks = parse(&markdown);
     let mut docx: Docx<'static> = Docx::default();
     let mut body: Vec<BodyContent<'static>> = Vec::new();
-    render_blocks(markdown, &blocks, 0, &mut body);
+    render_blocks(&markdown, &blocks, 0, &mut body);
     docx.document.body.content = body;
     let cursor = docx
         .write(Cursor::new(Vec::new()))
@@ -642,11 +644,12 @@ mod tests {
         s
     }
 
-    /// 渲染并返回顶层块。
+    /// 渲染并返回顶层块（与 [`to_docx`] 一样先做脚注规整，D69）。
     fn render(source: &str) -> Vec<BodyContent<'static>> {
-        let blocks = parse(source);
+        let source = crate::footnotes::prepare(source);
+        let blocks = parse(&source);
         let mut out = Vec::new();
-        render_blocks(source, &blocks, 0, &mut out);
+        render_blocks(&source, &blocks, 0, &mut out);
         out
     }
 
@@ -877,5 +880,21 @@ mod tests {
             "1 note",
             "`[^label]:` 隐藏，标签与正文可见"
         );
+    }
+
+    #[test]
+    fn docx_footnotes_are_numbered_and_collected_at_end() {
+        // D69：按引用顺序编号，定义整体移到文末（纯文本保留序号与正文）
+        let out = render("见[^b]与[^a]。\n\n[^a]: A\n[^b]: B\n");
+        let texts: Vec<String> = out
+            .iter()
+            .map(|b| match b {
+                BodyContent::Paragraph(p) => paragraph_text(p),
+                BodyContent::Table(_) => String::new(),
+            })
+            .collect();
+        assert_eq!(texts[0], "见1与2。");
+        assert_eq!(texts[1], "1 B");
+        assert_eq!(texts[2], "2 A");
     }
 }

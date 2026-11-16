@@ -111,6 +111,13 @@ impl Document {
         &self.blocks
     }
 
+    /// 构建脚注索引（决策 D69）：按引用首次出现顺序编号，并给出引用/定义位置。
+    ///
+    /// 桌面端只在命中脚注时调用；索引本身是派生数据，不做缓存，避免编辑后失效。
+    pub fn footnote_index(&self) -> mazha_md::FootnoteIndex {
+        mazha_md::FootnoteIndex::new(&self.text(), &self.blocks)
+    }
+
     /// 生成/获取整篇渲染投影（隐藏语法标记，供 UI 直接渲染）。
     ///
     /// 返回缓存引用（UI 逐帧渲染无需拷贝）：编辑后缓存会被**增量刷新**
@@ -1293,5 +1300,26 @@ mod tests {
         })
         .unwrap();
         assert_projection_matches(&mut d, "全特性追加");
+    }
+
+    /// 脚注索引跟随编辑重建（D69）：编号按引用顺序，编辑后偏移同步变化。
+    #[test]
+    fn footnote_index_tracks_edits() {
+        let mut d = doc("见[^b]与[^a]。\n\n[^a]: A\n[^b]: B\n");
+        let index = d.footnote_index();
+        assert_eq!(index.get("b").unwrap().number, 1);
+        assert_eq!(index.get("a").unwrap().number, 2);
+        let old_def = index.get("a").unwrap().definition.clone().unwrap();
+
+        // 在文首插入两字节，所有索引偏移应整体右移。
+        d.apply(Edit::Insert {
+            at: 0,
+            text: "前".into(),
+        })
+        .unwrap();
+        let index = d.footnote_index();
+        let new_def = index.get("a").unwrap().definition.clone().unwrap();
+        assert_eq!(new_def.start, old_def.start + "前".len());
+        assert_eq!(index.get("b").unwrap().number, 1, "编号不应因平移改变");
     }
 }
