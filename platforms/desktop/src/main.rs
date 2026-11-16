@@ -2559,27 +2559,52 @@ impl DocView {
     }
 
     /// 删除选区（或光标左侧一个字符，即退格）。返回是否发生了删除。
+    ///
+    /// 光标紧跟在独占图片块后面时，退格删除整张图片（视为一个整体）。
     fn delete_backward(&mut self, cx: &mut Context<Self>) -> bool {
         let mut any_deleted = false;
-        for c in &mut self.cursors {
-            if let Some(sel) = c.selection() {
+        for i in 0..self.cursors.len() {
+            if let Some(sel) = self.cursors[i].selection() {
                 let caret = sel.start;
                 if self.doc.apply(Edit::Delete { range: sel }).is_ok() {
+                    let c = &mut self.cursors[i];
                     c.caret = self.doc.snap_to_boundary(caret);
                     c.anchor = None;
                     c.marked = None;
                     any_deleted = true;
                 }
             } else {
-                let prev = self.doc.prev_char_boundary(c.caret);
-                if prev != c.caret
-                    && self
+                let caret = self.cursors[i].caret;
+                // 光标在图片块末尾：整块删除（`![...](...)` 作为一个整体）
+                let image_range = self
+                    .doc
+                    .projection()
+                    .block_widgets()
+                    .iter()
+                    .find(|w| {
+                        matches!(w.kind, BlockWidgetKind::Image { .. })
+                            && w.source_range.end == caret
+                    })
+                    .map(|w| w.source_range.clone());
+                if let Some(range) = image_range {
+                    if self
                         .doc
                         .apply(Edit::Delete {
-                            range: prev..c.caret,
+                            range: range.clone(),
                         })
                         .is_ok()
-                {
+                    {
+                        let c = &mut self.cursors[i];
+                        c.caret = self.doc.snap_to_boundary(range.start);
+                        c.anchor = None;
+                        c.marked = None;
+                        any_deleted = true;
+                    }
+                    continue;
+                }
+                let prev = self.doc.prev_char_boundary(caret);
+                if prev != caret && self.doc.apply(Edit::Delete { range: prev..caret }).is_ok() {
+                    let c = &mut self.cursors[i];
                     c.caret = self.doc.snap_to_boundary(prev);
                     c.anchor = None;
                     c.marked = None;
@@ -2594,22 +2619,60 @@ impl DocView {
     }
 
     /// 删除光标右侧一个字符（即 Delete 键）。返回是否发生了删除。
+    ///
+    /// 光标紧贴在独占图片块前面时，Delete 删除整张图片（视为一个整体）。
     fn delete_forward(&mut self, cx: &mut Context<Self>) -> bool {
         let mut any_deleted = false;
-        for c in &mut self.cursors {
-            let range = c.selection().unwrap_or_else(|| {
-                let next = self.doc.next_char_boundary(c.caret);
-                c.caret..next
-            });
-            if !range.is_empty()
-                && self
+        for i in 0..self.cursors.len() {
+            if let Some(sel) = self.cursors[i].selection() {
+                let range = sel;
+                if !range.is_empty()
+                    && self
+                        .doc
+                        .apply(Edit::Delete {
+                            range: range.clone(),
+                        })
+                        .is_ok()
+                {
+                    let c = &mut self.cursors[i];
+                    c.caret = self.doc.snap_to_boundary(range.start);
+                    c.anchor = None;
+                    c.marked = None;
+                    any_deleted = true;
+                }
+                continue;
+            }
+            let caret = self.cursors[i].caret;
+            // 光标在图片块开头：整块删除（`![...](...)` 作为一个整体）
+            let image_range = self
+                .doc
+                .projection()
+                .block_widgets()
+                .iter()
+                .find(|w| {
+                    matches!(w.kind, BlockWidgetKind::Image { .. }) && w.source_range.start == caret
+                })
+                .map(|w| w.source_range.clone());
+            if let Some(range) = image_range {
+                if self
                     .doc
                     .apply(Edit::Delete {
                         range: range.clone(),
                     })
                     .is_ok()
-            {
-                c.caret = self.doc.snap_to_boundary(range.start);
+                {
+                    let c = &mut self.cursors[i];
+                    c.caret = self.doc.snap_to_boundary(range.start);
+                    c.anchor = None;
+                    c.marked = None;
+                    any_deleted = true;
+                }
+                continue;
+            }
+            let next = self.doc.next_char_boundary(caret);
+            if caret != next && self.doc.apply(Edit::Delete { range: caret..next }).is_ok() {
+                let c = &mut self.cursors[i];
+                c.caret = self.doc.snap_to_boundary(caret);
                 c.anchor = None;
                 c.marked = None;
                 any_deleted = true;
@@ -3578,6 +3641,20 @@ impl DocView {
         let layout = self.layout.as_ref()?;
         if let Some((row, col)) = layout.hit(position) {
             let block = &layout.blocks[row];
+            // 渲染态的独占图片：点击左半定位到图片最前面，点击右半定位到最后面，
+            // 让光标落在图片语法边界而非进入字符级编辑位置（编辑态 raw_src 仍按原文命中）。
+            if let Some(image) = &block.image
+                && block.raw_src.is_none()
+            {
+                let image_x = layout.origin.x + block.indent;
+                let mid = image_x + image.size.width / 2.0;
+                let src = if position.x <= mid {
+                    block.proj.source_range.start
+                } else {
+                    block.proj.source_range.end
+                };
+                return Some(self.doc.snap_to_boundary(src));
+            }
             // 显示字符列 → 源字节偏移（空行等无显示文本的行落到行首）
             let src = self.doc.snap_to_boundary(block.source_of_col(col));
             return Some(src);
