@@ -7241,30 +7241,33 @@ impl Element for DocElement {
                         }
                     }
                     // 列表符号：任务项改画复选框（见 paint），其余 shape 成文本右对齐进标记区
-                    let marker = if line.block.bullet.is_some() && line.block.task.is_none() {
-                        let sym = match line.block.bullet.as_ref() {
-                            Some(b) if b.ordered => format!("{}.", b.number),
-                            _ => "•".to_string(),
+                    // 源码模式下显示原始 `-`/`1.`/`[ ]` 文本，不绘制渲染态标记与复选框。
+                    let marker =
+                        if !source_mode && line.block.bullet.is_some() && line.block.task.is_none()
+                        {
+                            let sym = match line.block.bullet.as_ref() {
+                                Some(b) if b.ordered => format!("{}.", b.number),
+                                _ => "•".to_string(),
+                            };
+                            let run = gpui::TextRun {
+                                len: sym.len(),
+                                font: base_font.clone(),
+                                color: palette.muted,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            Some(Box::new(window.text_system().shape_line(
+                                sym.into(),
+                                font_size,
+                                &[run],
+                                None,
+                            )))
+                        } else {
+                            None
                         };
-                        let run = gpui::TextRun {
-                            len: sym.len(),
-                            font: base_font.clone(),
-                            color: palette.muted,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        Some(Box::new(window.text_system().shape_line(
-                            sym.into(),
-                            font_size,
-                            &[run],
-                            None,
-                        )))
-                    } else {
-                        None
-                    };
                     // 已完成任务的勾（空框由 paint 画矩形，勾单独 shape 居中放进框内）
-                    let check = if line.block.task == Some(true) {
+                    let check = if !source_mode && line.block.task == Some(true) {
                         let run = gpui::TextRun {
                             len: "✓".len(),
                             font: base_font.clone(),
@@ -7282,7 +7285,7 @@ impl Element for DocElement {
                     } else {
                         None
                     };
-                    if line.block.task.is_some() {
+                    if !source_mode && line.block.task.is_some() {
                         task_cand.push((line.source_range.clone(), indent, top_acc, line_px));
                     }
                     // 行内图片占位：`![alt](url)` 整段被投影隐藏，画个小标签补上可见性。
@@ -7755,7 +7758,8 @@ impl Element for DocElement {
 
             // 引用块：所有层级都画左竖线和背景；仅最外层加上下内边距，
             // 避免嵌套引用之间产生多余的间隔分隔。
-            if block.proj.block.quote_depth > 0 {
+            // 源码模式下显示原始 `>` 文本，不绘制引用装饰。
+            if !self.view.read(cx).settings.source_mode && block.proj.block.quote_depth > 0 {
                 let is_outer = block.proj.block.quote_depth == 1;
                 let pad_y = if is_outer { px(2.) } else { px(0.) };
                 // 底色只在正文文本列内留 4px 内缩：左缘 = 正文左缘 + 4px，
@@ -8079,7 +8083,8 @@ impl Element for DocElement {
                 );
             }
             // 任务复选框：空框描边；已完成再把预 shape 的勾居中放进去
-            if block.proj.block.task.is_some() {
+            // 源码模式下显示原始 `[ ]`/`[x]` 文本，不绘制复选框 UI。
+            if !self.view.read(cx).settings.source_mode && block.proj.block.task.is_some() {
                 let box_rect = task_box_rect(line_x, row_top, line_px);
                 paint_rect_border(window, box_rect, palette.muted, px(1.));
                 if let Some(check) = &block.check {

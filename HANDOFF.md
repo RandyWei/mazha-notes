@@ -4,7 +4,7 @@
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
 - 最近更新：2026-11-16
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39 + 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39 + 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68，源码模式已修复任务列表/引用块渲染装饰残留）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
 - 当前版本：**0.1.90**（细节见 SPEC §15 变更记录；本节只列归总）
 
@@ -108,10 +108,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 131 条；本次提交为最新一条，下次同步时补入哈希）
+## 提交历史（近期，共 133 条）
 
 ```
-<本次提交：feat(desktop): 专注/打字机/源码模式（0.1.90，D68）>
+9db3c61 fix(desktop): 源码模式隐藏列表与引用渲染装饰（0.1.90）
+ddb185e feat(desktop): 专注/打字机/源码模式（0.1.90，D68）
 d487082 feat(desktop): 图片点击边界定位与整图删除（0.1.89）
 12400bc feat(desktop): 支持从剪贴板粘贴图片（0.1.88，D67）
 7b9574e fix(desktop): 表格多行单元格继承列对齐（0.1.87，D66）
@@ -192,7 +193,9 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 126（含本次）。
 
-- 2026-11-16（本提交，0.1.89）：优化桌面端独占图片交互：渲染态点击图片左半区将光标定位到图片源码起点、右半区定位到源码终点（进入编辑态后光标落在对应边界）；光标紧贴图片末尾时 `Backspace`、紧贴图片开头时 `Delete` 直接删除整段图片源码（`BlockWidgetKind::Image` 的 `source_range`），图片作为整体处理。桌面 fmt/clippy/test/build 全绿（43 项）。
+- 2026-11-16（本次提交，0.1.90 修复）：源码模式补齐任务列表与引用块渲染态抑制：不再 shape/绘制列表标记与任务勾选 glyph，不注册任务复选框命中区域，不绘制复选框边框/勾选与引用块竖条/背景，仅显示原始 Markdown 文本（如 `- [ ]`、`>`）。桌面 fmt/clippy/test 全绿（44 项）。
+- 2026-11-16（`ddb185e`，0.1.90）：新增专注模式/打字机模式/源码模式（D68），设置持久化与菜单/命令面板/快捷键接入；桌面与 workspace 门禁全绿。
+- 2026-11-16（`d487082`，0.1.89）：优化桌面端独占图片交互：渲染态点击图片左半区将光标定位到图片源码起点、右半区定位到源码终点（进入编辑态后光标落在对应边界）；光标紧贴图片末尾时 `Backspace`、紧贴图片开头时 `Delete` 直接删除整段图片源码（`BlockWidgetKind::Image` 的 `source_range`），图片作为整体处理。桌面 fmt/clippy/test/build 全绿（43 项）。
 - 2026-11-09（`8513df6`，0.1.83）：新增桌面外观设置（D62）：`settings.rs` 持久化主题（跟随系统/浅色/深色）、正文字体/等宽字体、正文字号/等宽字号到平台配置目录（`MAZHA_SETTINGS_PATH` 可覆盖）；启动时应用主题，`System` 订阅窗口 appearance；正文布局改用可调字号，行高兼容更大的等宽字号；命令面板新增外观命令，快捷键 `Cmd+=`/`Cmd+-`、`Cmd+Option+=`/`Cmd+Option+-`、`Cmd+Shift+L`、`Cmd+Option+0`，状态栏显示字号与主题。桌面 fmt/clippy/test/build 全绿（31 项）；实机验证深浅色切换、字号调整、字体循环、重置、重启持久化，以及正文 12px + 等宽 24px 极端组合。
 - 2026-11-06（`063e3c4`，0.1.82）：新增 macOS `.app` 打包链路（D61）：`macos/Info.plist` + `scripts/bundle-macos.sh`，从 `assets/appicon.png` 生成完整 `AppIcon.icns`，写入 Bundle ID/显示名/版本，复制 release 二进制，默认 ad-hoc 签名或指定 Developer ID，输出 `码札.app` 与 zip；新增 `notarize-macos.sh` 处理公证 + 装订。验证 Info.plist、`codesign --verify`、Finder 文件图标、`.app` 启动。
 - 2026-11-06（`16b993b`，0.1.81）：新增 `platforms/desktop/assets/appicon.png`；启动时把嵌入二进制的 PNG 解码为 `NSImage`，经 `NSApplication.setApplicationIconImage` 设置 macOS Dock 图标；新增 macOS 专用 `objc2` 依赖。桌面 fmt/clippy/test/build 全绿（24 项）；实机确认启动正常、图标解码与 `setApplicationIconImage` 调用成功。
