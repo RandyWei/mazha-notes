@@ -4,6 +4,7 @@
 //! 命令面板与快捷键只改本结构，渲染层再据此覆盖 gpui-kit 主题与编辑区字体。
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// 正文字号范围（px）。
@@ -85,6 +86,8 @@ pub struct Settings {
     pub typewriter_mode: bool,
     /// 源码模式（代码模式）：按原始 Markdown 源码编辑/显示（D68）。
     pub source_mode: bool,
+    /// 文件树展开状态：键为工作区根目录字符串，值为已展开的相对目录路径列表（D72）。
+    pub tree_expanded: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
@@ -98,6 +101,7 @@ impl Default for Settings {
             focus_mode: false,
             typewriter_mode: false,
             source_mode: false,
+            tree_expanded: BTreeMap::new(),
         }
     }
 }
@@ -156,15 +160,31 @@ impl Settings {
         self.mono_font_family = next_font(MONO_FONT_CHOICES, self.mono_font_family.as_deref());
     }
 
-    /// 恢复默认外观（跟随系统 + 主题默认字体/字号），保留视图模式开关。
+    /// 恢复默认外观（跟随系统 + 主题默认字体/字号），保留视图模式开关与文件树展开状态。
     pub fn reset_appearance(&mut self) {
         let focus_mode = self.focus_mode;
         let typewriter_mode = self.typewriter_mode;
         let source_mode = self.source_mode;
+        let tree_expanded = std::mem::take(&mut self.tree_expanded);
         *self = Self::default();
         self.focus_mode = focus_mode;
         self.typewriter_mode = typewriter_mode;
         self.source_mode = source_mode;
+        self.tree_expanded = tree_expanded;
+    }
+
+    /// 取某工作区已保存的文件树展开目录列表（无记录时为空）。
+    pub fn tree_expanded_for(&self, root: &str) -> Vec<String> {
+        self.tree_expanded.get(root).cloned().unwrap_or_default()
+    }
+
+    /// 记录某工作区的文件树展开目录列表；列表为空时移除该键，避免配置无限膨胀。
+    pub fn set_tree_expanded_for(&mut self, root: &str, dirs: Vec<String>) {
+        if dirs.is_empty() {
+            self.tree_expanded.remove(root);
+        } else {
+            self.tree_expanded.insert(root.to_string(), dirs);
+        }
     }
 }
 
@@ -300,6 +320,10 @@ mod tests {
             focus_mode: true,
             typewriter_mode: true,
             source_mode: false,
+            tree_expanded: BTreeMap::from([(
+                "/tmp/ws".to_string(),
+                vec!["sub".to_string(), "sub/deep".to_string()],
+            )]),
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();
@@ -311,6 +335,29 @@ mod tests {
         assert!(parsed.focus_mode);
         assert!(parsed.typewriter_mode);
         assert!(!parsed.source_mode);
+        assert_eq!(
+            parsed.tree_expanded_for("/tmp/ws"),
+            vec!["sub".to_string(), "sub/deep".to_string()]
+        );
+    }
+
+    /// 文件树展开状态按工作区根存取：空列表删除键，恢复默认外观不清空（D72）。
+    #[test]
+    fn tree_expanded_is_per_workspace_and_survives_reset() {
+        let mut settings = Settings::default();
+        assert!(settings.tree_expanded_for("/a").is_empty());
+        settings.set_tree_expanded_for("/a", vec!["x".to_string()]);
+        settings.set_tree_expanded_for("/b", vec!["y".to_string()]);
+        assert_eq!(settings.tree_expanded_for("/a"), vec!["x".to_string()]);
+        // 设为空列表时移除该工作区的键。
+        settings.set_tree_expanded_for("/a", vec![]);
+        assert!(settings.tree_expanded_for("/a").is_empty());
+        assert_eq!(settings.tree_expanded_for("/b"), vec!["y".to_string()]);
+        // 恢复默认外观保留展开状态与视图模式。
+        settings.focus_mode = true;
+        settings.reset_appearance();
+        assert_eq!(settings.tree_expanded_for("/b"), vec!["y".to_string()]);
+        assert!(settings.focus_mode);
     }
 
     #[test]

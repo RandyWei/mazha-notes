@@ -4,9 +4,9 @@
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
 - 最近更新：2026-11-17
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + **文件树层级化（目录展开折叠/目录内新建，D70）** + **文件树拖拽移动/新建文件夹（D71）** + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39（**已移至右侧独立面板 D70**）+ 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68 + 脚注双向跳转与导出编号/文末归集 D69，源码模式已修复任务列表/引用块渲染装饰残留）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + **文件树层级化（目录展开折叠/目录内新建，D70）** + **文件树拖拽移动/新建文件夹（D71）** + **展开状态持久化（D72）** + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39（**已移至右侧独立面板 D70**）+ 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68 + 脚注双向跳转与导出编号/文末归集 D69，源码模式已修复任务列表/引用块渲染装饰残留）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.93**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.94**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -39,7 +39,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | 平台 | 状态 | 已实现（要点） | 待办 |
 |------|------|----------------|------|
-| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **行内格式局部展开**（光标在链接/粗体/斜体/删除线/行内代码内时**该组**显示原文，`inline_reveals`/`reveal_inline`，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底（各层引用都铺底 + 左侧竖线，仅最外层加上下 padding；底色限制在正文列内，D52）；自写 `Element`（连续布局 + 视觉行表 `row_starts`/`row_tops`，软换行后逐视觉行建顶边）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板**浅底+语言标签**、表格网格、分割线、**公式描边、图表弱底+标签**）；**中文斜体渲染器级合成倾斜**（macOS 中文字体无斜体字面、CoreText 也不为 CJK 合成，故 `oblique.rs` 取 CT 字形轮廓做 12° 剪切自绘，CJK 段以透明 run 占位保留排版；D43）；**行内代码可见底色**（`code_bg` = 前景 alpha 0.08，经 `TextRun.background_color` 逐视觉行绘制）；**代码块浅底 + 左右 padding**（`code_block_bg`，缩进 +1.5em、文本 +12px、面板右缘与正文右边距对齐，D51）；**Tab/Shift+Tab 缩进/反缩进**（D44：覆盖 Root 的焦点切换绑定，行选区整体缩进，多光标重映射）；**列表/任务回车续行**（D45：走核心 `IntentMapper`，新项图标即时显示，空项再回车退出列表，嵌套保留缩进，引用内列表也续行；修复空 `ListItem` 无样式导致图标不显示）；**Typora 式就地显源码**（光标进入围栏代码块/独占图片行 → 整行就地显出原文，`BlockGeom::raw_src` 走 1:1 字符↔字节映射，移开复原）；**图片真实渲染**（D53/D54/D55：核心保留 `dest`，独占行产出 `BlockWidgetKind::Image`；桌面按文档目录解析本地路径、`http(s)` 与协议相对 `//host/...` 走 GPUI `Resource::Uri` + `ImageAssetLoader` 下载缓存，`data:image/...` 内联 base64/百分号编码走 `Image::from_bytes`，按正文宽等比缩放且不放大小图，行高随图片；光标进入显示 `![alt](dest)`，缺失/行内图片仍占位；启动时安装 `reqwest` HTTP 客户端）；表格增删行列 + **表格观感**（表头加粗/底色、分隔行收起、单元格留白，D46）+ **按内容列宽/竖向网格线/列对齐 + 单元格 Tab 导航**（D47）+ **表格内左右方向键跳过隐藏标记/竖线/填充**（D48）+ **表格光标视觉命中按最近格距离选择**（D49）+ **从表格外横移第一下即进入单元格**（D50）+ **超宽表格列宽压缩 + 单元格软换行**（D57）；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）+ **Cmd+点击双向跳转**（引用 ↔ 定义，D69）；**内联 HTML 标签**（`<font color>`/`<span style>` 自定义前景色经 `TextRun.color` 透传，`<b>/<i>/<s>/<code>` 映射既有样式，`<br>` 仅剥离）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、**文件树层级化（D70：按 `Workspace::list` 递归渲染目录/文件，目录 `▸/▾` 展开折叠、目录行 `＋` 在目录内新建、`✎` 重命名、`✕` 递归删除，侧栏标题栏 `＋` 根目录新建；删除/重命名目录同步迁移展开态与当前文档路径；宽度可拖动 160–420px；长文件名末尾省略号；**拖拽移动 + 新建文件夹** D71：文件/目录行可拖拽，目录行与侧栏标题为落点（`can_drop`/`on_drop`），落点经 `move_entry` 移动并迁移展开态/当前文档路径，标题栏 `＋文件`/`＋文件夹`）、脏状态 `*`；多标签页（D37/D58，Cmd+T/W/Shift+W/1..9/0；标签点击/侧栏打开统一装载，保留撤销历史）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，**已移至右侧独立可拖动面板** D70，标题列表+点击跳转，Cmd+Shift+O）；**UI 细化（D59）：活动标签/侧栏当前项浅灰选中（文本选区仍蓝色）、大纲跳转目标行置顶、标签 `✕` 关闭按钮（单标签隐藏）、文件信息/行数/快捷键移入底部 24px 全宽状态栏；macOS Dock 图标（D60，`assets/appicon.png` 编入二进制 → `NSApplication.setApplicationIconImage`）；**macOS `.app` 打包（D61，`scripts/bundle-macos.sh` 生成 `AppIcon.icns` + Info.plist + ad-hoc/Developer ID 签名 + zip）**；**外观设置（D62，主题/字体/字号持久化 + 命令面板/快捷键 + 状态栏）**；**视图模式（D68，专注模式淡化非当前块、打字机模式居中光标行、源码模式按原始 Markdown 源码编辑显示，可持久化并通过菜单/命令面板/快捷键切换）** | 全工作区搜索 `Cmd+Shift+F`（D40，低优先）
+| `desktop`（GPUI + gpui-kit 0.7） | 🟡 Phase 2/3 主体完成（Phase 4 MVP 主体达成） | 只读投影渲染 + 主题；光标/点击命中 + **行内格式局部展开**（光标在链接/粗体/斜体/删除线/行内代码内时**该组**显示原文，`inline_reveals`/`reveal_inline`，D42）+ **Cmd+点击打开链接**；行内代码用正文前景色、引用块整行浅底（各层引用都铺底 + 左侧竖线，仅最外层加上下 padding；底色限制在正文列内，D52）；自写 `Element`（连续布局 + 视觉行表 `row_starts`/`row_tops`，软换行后逐视觉行建顶边）+ 跨行选区；**滚动**：自持 `ScrollHandle`（`track_scroll`）+ 外层叠加 `Scrollbar`，内容高度两帧收敛、光标行滚动跟随（含 `cx.notify`）；**IME**：全 UTF-16 区间换算、组合文本按 marked 区间替换（修复拼音字母逐个上屏）；空行/纯语法行命中落行首；编辑命令（行内 Cmd+B/I/X/`、块级 Cmd+1-6/段落/引用/列表）；多光标（Alt+Click）；PDF 导出（Cmd+E）；文档级坐标 API 接入；块级 widget 装饰（代码面板**浅底+语言标签**、表格网格、分割线、**公式描边、图表弱底+标签**）；**中文斜体渲染器级合成倾斜**（macOS 中文字体无斜体字面、CoreText 也不为 CJK 合成，故 `oblique.rs` 取 CT 字形轮廓做 12° 剪切自绘，CJK 段以透明 run 占位保留排版；D43）；**行内代码可见底色**（`code_bg` = 前景 alpha 0.08，经 `TextRun.background_color` 逐视觉行绘制）；**代码块浅底 + 左右 padding**（`code_block_bg`，缩进 +1.5em、文本 +12px、面板右缘与正文右边距对齐，D51）；**Tab/Shift+Tab 缩进/反缩进**（D44：覆盖 Root 的焦点切换绑定，行选区整体缩进，多光标重映射）；**列表/任务回车续行**（D45：走核心 `IntentMapper`，新项图标即时显示，空项再回车退出列表，嵌套保留缩进，引用内列表也续行；修复空 `ListItem` 无样式导致图标不显示）；**Typora 式就地显源码**（光标进入围栏代码块/独占图片行 → 整行就地显出原文，`BlockGeom::raw_src` 走 1:1 字符↔字节映射，移开复原）；**图片真实渲染**（D53/D54/D55：核心保留 `dest`，独占行产出 `BlockWidgetKind::Image`；桌面按文档目录解析本地路径、`http(s)` 与协议相对 `//host/...` 走 GPUI `Resource::Uri` + `ImageAssetLoader` 下载缓存，`data:image/...` 内联 base64/百分号编码走 `Image::from_bytes`，按正文宽等比缩放且不放大小图，行高随图片；光标进入显示 `![alt](dest)`，缺失/行内图片仍占位；启动时安装 `reqwest` HTTP 客户端）；表格增删行列 + **表格观感**（表头加粗/底色、分隔行收起、单元格留白，D46）+ **按内容列宽/竖向网格线/列对齐 + 单元格 Tab 导航**（D47）+ **表格内左右方向键跳过隐藏标记/竖线/填充**（D48）+ **表格光标视觉命中按最近格距离选择**（D49）+ **从表格外横移第一下即进入单元格**（D50）+ **超宽表格列宽压缩 + 单元格软换行**（D57）；代码高亮；软换行；剪贴板 Cmd+C/X/V；视觉行上下移动；查找/替换 Cmd+F；行内公式 `RunStyle::Math`（斜体+主题色）；脚注标签 `RunStyle::Footnote`（主题色）+ **Cmd+点击双向跳转**（引用 ↔ 定义，D69）；**内联 HTML 标签**（`<font color>`/`<span style>` 自定义前景色经 `TextRun.color` 透传，`<b>/<i>/<s>/<code>` 映射既有样式，`<br>` 仅剥离）；**Phase 4：打开 Cmd+O / 保存 Cmd+S / 另存为 Cmd+Shift+S、**文件树层级化（D70：按 `Workspace::list` 递归渲染目录/文件，目录 `▸/▾` 展开折叠、目录行 `＋` 在目录内新建、`✎` 重命名、`✕` 递归删除，侧栏标题栏 `＋` 根目录新建；删除/重命名目录同步迁移展开态与当前文档路径；宽度可拖动 160–420px；长文件名末尾省略号；**拖拽移动 + 新建文件夹** D71：文件/目录行可拖拽，目录行与侧栏标题为落点（`can_drop`/`on_drop`），落点经 `move_entry` 移动并迁移展开态/当前文档路径，标题栏 `＋文件`/`＋文件夹`；**展开状态持久化** D72：按工作区根存入 `settings.json` 的 `tree_expanded`，启动恢复、切换/CRUD 后落盘）、脏状态 `*`；多标签页（D37/D58，Cmd+T/W/Shift+W/1..9/0；标签点击/侧栏打开统一装载，保留撤销历史）；命令面板（D38，Cmd+P，命令表+过滤+执行）；大纲/目录导航（D39，**已移至右侧独立可拖动面板** D70，标题列表+点击跳转，Cmd+Shift+O）；**UI 细化（D59）：活动标签/侧栏当前项浅灰选中（文本选区仍蓝色）、大纲跳转目标行置顶、标签 `✕` 关闭按钮（单标签隐藏）、文件信息/行数/快捷键移入底部 24px 全宽状态栏；macOS Dock 图标（D60，`assets/appicon.png` 编入二进制 → `NSApplication.setApplicationIconImage`）；**macOS `.app` 打包（D61，`scripts/bundle-macos.sh` 生成 `AppIcon.icns` + Info.plist + ad-hoc/Developer ID 签名 + zip）**；**外观设置（D62，主题/字体/字号持久化 + 命令面板/快捷键 + 状态栏）**；**视图模式（D68，专注模式淡化非当前块、打字机模式居中光标行、源码模式按原始 Markdown 源码编辑显示，可持久化并通过菜单/命令面板/快捷键切换）** | 全工作区搜索 `Cmd+Shift+F`（D40，低优先）
 | `ios` / `android` / `harmony` / `web` | ⬜ 仅 README | — | Phase 6 / 8 / 7 |
 
 > 桌面端入口：`cargo run -- [path/to/file.md]`。渲染效果可可视化验证：`swift` 查窗口号（CGWindowListCopyWindowInfo）→ `screencapture -x -o -l<窗口号>` 截图 → PIL 逐像素核对底色/字形（本机屏幕录制权限已可用）。交互可用 `CGEvent.postToPid` 合成按键（无需 `osascript` 置前；置前脚本偶发 -1719，重试即可），已验证 Tab/Shift+Tab/回车等链路。
@@ -53,7 +53,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | `mazha-export` | 139 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
 | 合计 | **548**（其余含 store 与占位 crate 测试） |
-| `platforms/desktop`（独立 workspace） | 48（不计入上面的 548） |
+| `platforms/desktop`（独立 workspace） | 49（不计入上面的 548） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -103,13 +103,13 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 ## 下一步（建议顺序）
 
-1. **Phase 4 余项**：**文件树层级化（D70）与拖拽移动/新建文件夹（D71）已完成**；**全工作区搜索（`Cmd+Shift+F`）列为低优先规划（D40，暂不排期）**；**当前文档查找/替换** `Cmd+F` 已于 0.1.49 实现。文件树可择机补**展开状态持久化 / 落点高亮**。专注/打字机/源码（代码）模式已于 0.1.90 落地（D68），可根据实机体验继续打磨（专注范围粒度、打字机滚动策略、源码模式下的表格/媒体交互细节）。
+1. **Phase 4 余项**：**文件树层级化（D70）、拖拽移动/新建文件夹（D71）、展开状态持久化（D72）均已完成**；**全工作区搜索（`Cmd+Shift+F`）列为低优先规划（D40，暂不排期）**；**当前文档查找/替换** `Cmd+F` 已于 0.1.49 实现。文件树可择机补**拖拽落点高亮**。专注/打字机/源码（代码）模式已于 0.1.90 落地（D68），可根据实机体验继续打磨（专注范围粒度、打字机滚动策略、源码模式下的表格/媒体交互细节）。
 2. **中文斜体合成仍不完美**（D43 遗留）：当前 `paint_path` 自绘倾斜只保证"倾斜"本身，字符间距/笔画抗锯齿与原生 italic 字面仍有差异（透明占位 run 的 advance 与自绘轮廓起点可能相差不足 1px），且每次 paint 逐字取轮廓；后续可考虑：轮廓路径缓存到 `BlockGeom`（只在 shape 变化时重算）、按 run 基线与 advance 校正、或改用 Metal 自定义着色器做剪切变换。观感需实机对比 Typora 后决定优先级。
 3. **渲染层深化**（R4）：数学排版（`ratex-*`）与图表 SVG（`mermaid-rs-renderer`）替换块级占位面板；脚注点击跳转/自动编号/文末归集已于 0.1.91 完成（D69，后续可补定义→引用回链、嵌套定义归集）；软换行**横向滚动**（D33 已知限制）。
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 136 条）
+## 提交历史（近期，共 137 条）
 
 ```
 9db3c61 fix(desktop): 源码模式隐藏列表与引用渲染装饰（0.1.90）
@@ -192,7 +192,9 @@ e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线�
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 ```
 
-> 更早提交见 `git log`；历史累计 = 136（含本次）。
+> 更早提交见 `git log`；历史累计 = 137（含本次）。
+
+- 2026-11-17（本次提交，0.1.94）：**文件树展开状态持久化**（D72）：`Settings` 新增 `tree_expanded`（按工作区根存展开目录列表），`tree_expanded_for`/`set_tree_expanded_for`（空列表删键），`reset_appearance` 保留。`DocView` 启动按工作区根恢复 `expanded_dirs`，`toggle_dir`/`refresh_workspace` 后落盘。新增 1 条设置单测；桌面 fmt/clippy/test/build 全绿（49 项）。
 
 - 2026-11-17（本次提交，0.1.93）：**文件树拖拽移动 + 新建文件夹**（D71）：文件/目录行接入 GPUI `on_drag`（`TreeDrag` + `TreeDragPreview`），目录行与侧栏标题 `sb-h` 作为落点（`can_drop`/`on_drop`），落点经 `move_entry` 移动文件/目录（拒绝自身/后代/同名，跟随更新当前文档路径与展开态前缀）。新增 `new_folder_in_root`/`new_folder_in` 建文件夹并进入重命名态，标题栏改为 `＋文件`/`＋文件夹`，命令面板加「新建 Markdown」「新建文件夹」。文件行打开/目录行折叠改 `on_click` 避免拖拽误触。新增纯函数 `drop_allowed`/`remap_expanded` 与 2 条单测；桌面 fmt/clippy/test/build 全绿（48 项）。
 

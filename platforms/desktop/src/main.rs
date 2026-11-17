@@ -2194,6 +2194,16 @@ impl DocView {
                     .map(|p| (Some(r.clone()), Some(Workspace::new(p))))
             })
             .unwrap_or((None, None));
+        // 恢复该工作区上次的文件树展开状态（D72）；键为工作区根目录字符串。
+        let expanded_dirs: HashSet<String> = ws_root
+            .as_ref()
+            .map(|r| {
+                settings
+                    .tree_expanded_for(&r.to_string_lossy())
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
         let t = Tab {
             path: path.cloned(),
             doc: Document::new(&text),
@@ -2246,7 +2256,7 @@ impl DocView {
             workspace_root: ws_root,
             workspace: ws,
             tree_open: true,
-            expanded_dirs: HashSet::new(),
+            expanded_dirs,
             sidebar_width: px(220.),
             sidebar_resizing: false,
             outline_width: px(220.),
@@ -4744,7 +4754,27 @@ impl DocView {
         }
         self.layout = None;
         self.caret_scroll_key = None;
+        // CRUD 可能改动展开态（新建/重命名/移动/删除），一并落盘（D72）。
+        self.persist_tree_expanded();
         cx.notify();
+    }
+
+    /// 当前工作区根目录的持久化键（绝对路径字符串）；无工作区时为 `None`。
+    fn workspace_key(&self) -> Option<String> {
+        self.workspace_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// 把当前文件树展开状态写入设置并落盘（D72）。
+    fn persist_tree_expanded(&mut self) {
+        let Some(key) = self.workspace_key() else {
+            return;
+        };
+        let mut dirs: Vec<String> = self.expanded_dirs.iter().cloned().collect();
+        dirs.sort();
+        self.settings.set_tree_expanded_for(&key, dirs);
+        self.persist_settings();
     }
 
     /// 收集文件树要渲染的行：`(缩进深度, 条目)`。
@@ -4766,6 +4796,7 @@ impl DocView {
         if !self.expanded_dirs.remove(&rel) {
             self.expanded_dirs.insert(rel);
         }
+        self.persist_tree_expanded();
         cx.notify();
     }
 
