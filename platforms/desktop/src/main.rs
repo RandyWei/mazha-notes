@@ -33,7 +33,7 @@
 use base64::Engine as _;
 use rfd::AsyncFileDialog;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ use mazha_core::{
 use mazha_export::to_pdf;
 use mazha_md::{FootnoteIndex, MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
-use mazha_store::{DocPath, FileSystemProvider};
+use mazha_store::{DocPath, Entry, EntryKind, FileSystemProvider};
 mod media;
 mod oblique;
 mod settings;
@@ -547,6 +547,39 @@ fn footnote_jump(index: &FootnoteIndex, label: &str, src: usize) -> Option<usize
         return entry.references.first().map(|r| r.start);
     }
     None
+}
+
+/// 递归收集文件树的行（`(深度, 条目)`），供侧栏按层级渲染。
+///
+/// 根目录的子项由调用方直接展开；子目录仅当 `expanded` 含其相对路径时继续下钻。
+/// 目录一律显示（即使为空，便于在树里定位/新建），文件只保留 Markdown 文档。
+fn collect_tree_rows(
+    ws: &Workspace<FileSystemProvider>,
+    dir: &DocPath,
+    depth: usize,
+    expanded: &HashSet<String>,
+    rows: &mut Vec<(usize, Entry)>,
+) {
+    let Ok(entries) = ws.list(dir) else {
+        return;
+    };
+    for entry in entries {
+        match entry.kind {
+            EntryKind::Dir => {
+                let rel = entry.path.as_str().to_string();
+                let is_expanded = expanded.contains(&rel);
+                rows.push((depth, entry.clone()));
+                if is_expanded {
+                    collect_tree_rows(ws, &entry.path, depth + 1, expanded, rows);
+                }
+            }
+            EntryKind::File => {
+                if entry.path.is_markdown() {
+                    rows.push((depth, entry));
+                }
+            }
+        }
+    }
 }
 
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
@@ -2001,10 +2034,16 @@ struct DocView {
     workspace: Option<Workspace<FileSystemProvider>>,
     /// 文件树是否展开
     tree_open: bool,
+    /// 文件树中已展开的目录（存相对工作区根的 `DocPath` 字符串；根目录恒展开，不记录）。
+    expanded_dirs: HashSet<String>,
     /// 文件树侧栏宽度（可拖动分隔条缩放，D58）。
     sidebar_width: Pixels,
-    /// 是否正在拖动侧栏分隔条。
+    /// 是否正在拖动左侧文件树分隔条。
     sidebar_resizing: bool,
+    /// 右侧大纲面板宽度（可拖动分隔条缩放）。
+    outline_width: Pixels,
+    /// 是否正在拖动右侧大纲分隔条。
+    outline_resizing: bool,
     /// 大纲（目录导航）是否展开
     outline_open: bool,
     /// 已打开文件的保存快照（脏状态用）
@@ -2128,8 +2167,11 @@ impl DocView {
             workspace_root: ws_root,
             workspace: ws,
             tree_open: true,
+            expanded_dirs: HashSet::new(),
             sidebar_width: px(220.),
             sidebar_resizing: false,
+            outline_width: px(220.),
+            outline_resizing: false,
             outline_open: true,
             saved_text,
             cmd_palette: PaletteState::default(),
@@ -4351,35 +4393,46 @@ impl DocView {
         }
     }
 
-    #[allow(dead_code)]
+    /// 在工作区根目录新建一篇 Markdown 并打开（侧栏「＋」）。
     fn new_markdown_in_root(&mut self, cx: &mut Context<Self>) {
-        if let Some(_ws) = self.workspace.as_ref()
-            && let Some(ref root) = self.workspace_root
-        {
-            let mut name = "未命名.md".to_string();
-            let mut i = 1;
-            loop {
-                let candidate = root.join(&name);
-                if !candidate.exists() {
-                    break;
-                }
-                name = format!("未命名{}.md", i);
-                i += 1;
-                if i > 1000 {
-                    break;
-                }
-            }
-            let full = root.join(&name);
-            let _ = std::fs::write(
-                &full,
-                "# 新文档
-",
-            );
-            if let Ok(p) = FileSystemProvider::open(root) {
-                self.workspace = Some(Workspace::new(p));
-            }
-            self.open_path(full, cx);
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        self.new_markdown_in(root, cx);
+    }
+
+    /// 在指定目录内新建一篇 Markdown 并打开（目录行「＋」）。
+    ///
+    /// 文件名从「未命名.md」递增，避免覆盖同名；若目标目录已展开，新文件立即可见。
+    fn new_markdown_in(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !dir.is_dir() {
+            return;
         }
+        let mut name = "未命名.md".to_string();
+        let mut i = 1;
+        let full = loop {
+            let candidate = dir.join(&name);
+            if !candidate.exists() {
+                break candidate;
+            }
+            name = format!("未命名{i}.md");
+            i += 1;
+            if i > 1000 {
+                break candidate;
+            }
+        };
+        if let Err(e) = std::fs::write(&full, "# 新文档\n") {
+            eprintln!("新建失败：{}", e);
+            return;
+        }
+        // 让新文件所在目录保持展开（根目录恒展开，无需记录）。
+        if let Some(rel) = self.rel_of(&dir)
+            && !rel.is_empty()
+        {
+            self.expanded_dirs.insert(rel);
+        }
+        self.refresh_workspace(cx);
+        self.open_path(full, cx);
     }
 
     /// 开始重命名（文件树条目）。
@@ -4407,24 +4460,47 @@ impl DocView {
         cx.notify();
     }
 
-    /// 删除指定路径的文件（文件树 CRUD）。
-    fn delete_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!("删除失败：{}", e);
+    /// 删除指定路径的文件或目录（文件树 CRUD；目录递归删除）。
+    fn delete_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let is_dir = path.is_dir();
+        let result = if is_dir {
+            std::fs::remove_dir_all(&path)
         } else {
-            // 若当前打开的是该文件，清空为未保存示例（避免悬挂路径）
-            if self.path.as_ref().is_some_and(|p| p == &path) {
-                self.path = None;
-                self.saved_text = None;
-                self.layout = None;
-                self.caret_scroll_key = None;
-                self.highlighter = None;
-            }
-            self.refresh_workspace(cx);
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = result {
+            eprintln!("删除失败：{}", e);
+            return;
         }
+        // 当前打开的文档落在被删文件/目录内：清空为未保存示例，避免悬挂路径。
+        let affected = self
+            .path
+            .as_ref()
+            .is_some_and(|p| p == &path || (is_dir && p.starts_with(&path)));
+        if affected {
+            self.path = None;
+            self.saved_text = None;
+            self.layout = None;
+            self.caret_scroll_key = None;
+            self.highlighter = None;
+        }
+        // 清理已删除目录（及其子目录）的展开记录。
+        if is_dir && let Some(rel) = self.rel_of(&path) {
+            let prefix = format!("{rel}/");
+            self.expanded_dirs
+                .retain(|d| d != &rel && !d.starts_with(&prefix));
+        }
+        self.refresh_workspace(cx);
     }
 
-    /// 重命名指定文件（同目录下的新文件名）。
+    /// 把绝对路径换算成工作区相对路径字符串（不在工作区内则 `None`）。
+    fn rel_of(&self, path: &Path) -> Option<String> {
+        let root = self.workspace_root.as_ref()?;
+        let rel = path.strip_prefix(root).ok()?;
+        Some(rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// 重命名指定文件/目录（同父目录下的新名字）。
     fn rename_file(&mut self, path: PathBuf, new_name: &str, cx: &mut Context<Self>) {
         if new_name.trim().is_empty() {
             return;
@@ -4437,12 +4513,37 @@ impl DocView {
         }
         if let Err(e) = std::fs::rename(&path, &target) {
             eprintln!("重命名失败：{}", e);
-        } else {
-            if self.path.as_ref().is_some_and(|p| p == &path) {
-                self.path = Some(target.clone());
-            }
-            self.refresh_workspace(cx);
+            return;
         }
+        let is_dir = target.is_dir();
+        // 当前文档正好是该文件，或落在被重命名的目录内：跟随更新绝对路径。
+        if let Some(cur) = self.path.clone() {
+            if cur == path {
+                self.path = Some(target.clone());
+            } else if is_dir
+                && cur.starts_with(&path)
+                && let Ok(suffix) = cur.strip_prefix(&path)
+            {
+                self.path = Some(target.join(suffix));
+            }
+        }
+        // 目录重命名后，把展开记录里的旧前缀迁移到新前缀，保持展开状态。
+        if is_dir && let (Some(old_rel), Some(new_rel)) = (self.rel_of(&path), self.rel_of(&target))
+        {
+            let old_prefix = format!("{old_rel}/");
+            let moved: Vec<String> = self
+                .expanded_dirs
+                .iter()
+                .filter(|d| **d == old_rel || d.starts_with(&old_prefix))
+                .cloned()
+                .collect();
+            for d in moved {
+                self.expanded_dirs.remove(&d);
+                let suffix = d.strip_prefix(&old_rel).unwrap_or("");
+                self.expanded_dirs.insert(format!("{new_rel}{suffix}"));
+            }
+        }
+        self.refresh_workspace(cx);
     }
 
     /// 移动当前文件到选定目录（命令面板入口）。
@@ -4499,6 +4600,28 @@ impl DocView {
         }
         self.layout = None;
         self.caret_scroll_key = None;
+        cx.notify();
+    }
+
+    /// 收集文件树要渲染的行：`(缩进深度, 条目)`。
+    ///
+    /// 根目录的子项恒展开；子目录仅在其路径出现在 `expanded_dirs` 时递归展开。
+    /// 只保留**目录**与 **Markdown 文档**（与 `list_markdown` 的过滤一致），
+    /// 避免把图片/其它格式等无关文件混进树。
+    fn file_tree_rows(&self) -> Vec<(usize, Entry)> {
+        let Some(ws) = self.workspace.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        collect_tree_rows(ws, &DocPath::root(), 0, &self.expanded_dirs, &mut rows);
+        rows
+    }
+
+    /// 切换某个目录的展开/折叠状态（文件树点击目录行）。
+    fn toggle_dir(&mut self, rel: String, cx: &mut Context<Self>) {
+        if !self.expanded_dirs.remove(&rel) {
+            self.expanded_dirs.insert(rel);
+        }
         cx.notify();
     }
 
@@ -4666,41 +4789,229 @@ impl Render for DocView {
             None
         };
 
-        // 文件树
+        // 左侧文件树（只显示文件/目录，不再混入大纲）
         let mut sb: Vec<gpui::AnyElement> = Vec::new();
         sb.push(
             div()
                 .id("sb-h")
                 .px_2()
                 .h(px(28.))
+                .flex()
                 .items_center()
+                .justify_between()
                 .border_b_1()
                 .border_color(palette.border)
                 .child("资源管理器")
+                .child(
+                    div()
+                        .id("sb-new")
+                        .cursor_pointer()
+                        .text_xs()
+                        .hover(|d| d.text_color(palette.foreground))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|view, _ev, _w, cx| {
+                                view.new_markdown_in_root(cx);
+                            }),
+                        )
+                        .child("＋"),
+                )
                 .into_any_element(),
         );
-        // 大纲（目录导航）：列出当前文档标题，按级别缩进，点击跳转
+        if self.tree_open
+            && let Some(ref root) = self.workspace_root
+        {
+            let rows = self.file_tree_rows();
+            for (depth, entry) in rows {
+                let name = entry.name.clone();
+                let rel = entry.path.as_str().to_string();
+                let full = root.join(&rel);
+                // 缩进按层级：每层 +12px，基准 8px。
+                let indent = (depth as f32) * 12.0 + 8.0;
+                // 重命名态：该行渲染为可编辑输入
+                let renaming_this = self.renaming.as_ref().is_some_and(|(rp, _)| rp == &full);
+                if renaming_this {
+                    let edit_text = self
+                        .renaming
+                        .as_ref()
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or_default();
+                    sb.push(
+                        div()
+                            .id(gpui::ElementId::Name(format!("sb-edit-{rel}").into()))
+                            .pl(px(indent))
+                            .pr_3()
+                            .py_1()
+                            .text_sm()
+                            .bg(palette.selection)
+                            .child(edit_text)
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                match entry.kind {
+                    // 目录行：▸/▾ 切换展开；＋ 在该目录内新建 Markdown；✎ 重命名；✕ 删除。
+                    EntryKind::Dir => {
+                        let expanded = self.expanded_dirs.contains(&rel);
+                        let arrow = if expanded { "▾" } else { "▸" };
+                        let rel_toggle = rel.clone();
+                        let full_ren = full.clone();
+                        let full_del = full.clone();
+                        let full_new = full.clone();
+                        sb.push(
+                            div()
+                                .id(gpui::ElementId::Name(format!("sb-dir-{rel}").into()))
+                                .pl(px(indent))
+                                .pr_2()
+                                .py_1()
+                                .text_sm()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .cursor_pointer()
+                                        .truncate()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.toggle_dir(rel_toggle.clone(), cx);
+                                            }),
+                                        )
+                                        .child(arrow)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .hover(|d| d.text_color(palette.foreground))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.new_markdown_in(full_new.clone(), cx);
+                                            }),
+                                        )
+                                        .child("＋"),
+                                )
+                                .child(
+                                    div()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.start_rename(full_ren.clone(), cx);
+                                            }),
+                                        )
+                                        .child("✎"),
+                                )
+                                .child(
+                                    div()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.delete_path(full_del.clone(), cx);
+                                            }),
+                                        )
+                                        .child("✕"),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    // 文件行：点击打开；✎ 重命名；✕ 删除。
+                    EntryKind::File => {
+                        let cur = self.path.as_ref().is_some_and(|cp| cp.ends_with(&rel));
+                        let full_open = full.clone();
+                        let full_ren = full.clone();
+                        let full_del = full.clone();
+                        sb.push(
+                            div()
+                                .id(gpui::ElementId::Name(format!("sb-{rel}").into()))
+                                .pl(px(indent))
+                                .pr_2()
+                                .py_1()
+                                .text_sm()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .when(cur, |d| d.bg(palette.selected_bg))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        // `truncate()` = nowrap + hidden + 末尾省略号（D58）。
+                                        .truncate()
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.open_path(full_open.clone(), cx);
+                                            }),
+                                        )
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.start_rename(full_ren.clone(), cx);
+                                            }),
+                                        )
+                                        .child("✎"),
+                                )
+                                .child(
+                                    div()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _ev, _w, cx| {
+                                                view.delete_path(full_del.clone(), cx);
+                                            }),
+                                        )
+                                        .child("✕"),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // 右侧大纲面板（目录导航）
+        let mut ol: Vec<gpui::AnyElement> = Vec::new();
+        ol.push(
+            div()
+                .id("ol-h")
+                .px_2()
+                .h(px(28.))
+                .items_center()
+                .border_b_1()
+                .border_color(palette.border)
+                .child("大纲")
+                .into_any_element(),
+        );
         if self.outline_open {
-            sb.push(
-                div()
-                    .id("ol-h")
-                    .px_2()
-                    .h(px(24.))
-                    .items_center()
-                    .text_xs()
-                    .text_color(palette.border)
-                    .child("大纲")
-                    .into_any_element(),
-            );
             let items = self.outline_items();
             if items.is_empty() {
-                sb.push(
+                ol.push(
                     div()
                         .id("ol-empty")
                         .px_3()
-                        .py_1()
-                        .text_xs()
-                        .text_color(palette.border)
+                        .py_2()
+                        .text_sm()
+                        .text_color(palette.muted)
                         .child("（无标题）")
                         .into_any_element(),
                 );
@@ -4708,7 +5019,7 @@ impl Render for DocView {
                 for (i, (level, title, src)) in items.into_iter().enumerate() {
                     // 缩进按级别：level=1 无缩进，每级 +8px
                     let indent = ((level.saturating_sub(1)) as f32) * 8.0 + 8.0;
-                    sb.push(
+                    ol.push(
                         div()
                             .id(gpui::ElementId::Name(format!("ol-{i}").into()))
                             .pl(px(indent))
@@ -4727,102 +5038,34 @@ impl Render for DocView {
                             .into_any_element(),
                     );
                 }
-                sb.push(
-                    div()
-                        .id("ol-sep")
-                        .h(px(1.))
-                        .mt_1()
-                        .bg(palette.border)
-                        .into_any_element(),
-                );
             }
         }
-        if self.tree_open
-            && let Some(ref ws) = self.workspace
-            && let Some(ref root) = self.workspace_root
-            && let Ok(list) = ws.list_markdown(&DocPath::root())
-        {
-            for entry in list {
-                let name = entry.name.clone();
-                let rel = entry.path.to_string();
-                let full = root.join(&rel);
-                let cur = self.path.as_ref().is_some_and(|cp| cp.ends_with(&rel));
-                // 重命名态：该行渲染为可编辑输入
-                let renaming_this = self.renaming.as_ref().is_some_and(|(rp, _)| rp == &full);
-                if renaming_this {
-                    let edit_text = self
-                        .renaming
-                        .as_ref()
-                        .map(|(_, t)| t.clone())
-                        .unwrap_or_default();
-                    sb.push(
-                        div()
-                            .id(gpui::ElementId::Name(format!("sb-edit-{rel}").into()))
-                            .px_3()
-                            .py_1()
-                            .text_sm()
-                            .bg(palette.selection)
-                            .child(edit_text)
-                            .into_any_element(),
-                    );
-                } else {
-                    let full_open = full.clone();
-                    let full_ren = full.clone();
-                    let full_del = full.clone();
-                    sb.push(
-                        div()
-                            .id(gpui::ElementId::Name(format!("sb-{rel}").into()))
-                            .px_3()
-                            .py_1()
-                            .text_sm()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .when(cur, |d| d.bg(palette.selected_bg))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    // `truncate()` = nowrap + hidden + 末尾省略号（D58）。
-                                    .truncate()
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(move |view, _ev, _w, cx| {
-                                            view.open_path(full_open.clone(), cx);
-                                        }),
-                                    )
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(move |view, _ev, _w, cx| {
-                                            view.start_rename(full_ren.clone(), cx);
-                                        }),
-                                    )
-                                    .child("✎"),
-                            )
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(move |view, _ev, _w, cx| {
-                                            view.delete_file(full_del.clone(), cx);
-                                        }),
-                                    )
-                                    .child("✕"),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
+        let outline_panel = div()
+            .id("outline")
+            .w(self.outline_width)
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(palette.border)
+            .bg(palette.subtle)
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .children(ol);
+        let outline_resize = div()
+            .id("outline-resize")
+            .w(px(4.))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .hover(|d| d.bg(palette.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _ev, _w, cx| {
+                    view.outline_resizing = true;
+                    cx.notify();
+                }),
+            );
         let sidebar_el = div()
             .id("sidebar")
             .w(self.sidebar_width)
@@ -4833,6 +5076,7 @@ impl Render for DocView {
             .bg(palette.subtle)
             .flex()
             .flex_col()
+            .overflow_y_scroll()
             .children(sb);
         // 侧栏分隔条：按下后由 `#app` 的 move/up 监听统一改宽度，避免鼠标快速移出
         // 4px 手柄后丢失拖拽（D58）。
@@ -4976,28 +5220,45 @@ impl Render for DocView {
             .on_action(cx.listener(|view, action: &MenuAction, window, cx| {
                 view.run_menu_command(action.command, window, cx);
             }))
-            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 if view.update_table_resize(event.position, cx) {
                     return;
                 }
-                if !view.sidebar_resizing {
+                if view.sidebar_resizing {
+                    // 左侧栏贴左缘，鼠标窗口 x 即目标宽度；限幅避免拖没或占满正文。
+                    let width = event.position.x.clamp(px(160.), px(420.));
+                    if width != view.sidebar_width {
+                        view.sidebar_width = width;
+                        cx.notify();
+                    }
                     return;
                 }
-                // 侧栏贴左缘，鼠标窗口 x 即目标宽度；限幅避免拖没或占满正文。
-                let width = event.position.x.clamp(px(160.), px(420.));
-                if width != view.sidebar_width {
-                    view.sidebar_width = width;
-                    cx.notify();
+                if view.outline_resizing {
+                    // 右侧大纲栏贴右缘，宽度 = 窗口宽度 - 鼠标 x。
+                    let window_width = window.viewport_size().width;
+                    let width = (window_width - event.position.x).clamp(px(160.), px(420.));
+                    if width != view.outline_width {
+                        view.outline_width = width;
+                        cx.notify();
+                    }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, _event: &MouseUpEvent, _w, cx| {
+                    let mut changed = false;
                     if view.table_resizing.take().is_some() {
-                        cx.notify();
+                        changed = true;
                     }
                     if view.sidebar_resizing {
                         view.sidebar_resizing = false;
+                        changed = true;
+                    }
+                    if view.outline_resizing {
+                        view.outline_resizing = false;
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }),
@@ -5011,7 +5272,7 @@ impl Render for DocView {
                     .min_h(px(0.))
                     .child(sidebar_el)
                     .child(sidebar_resize)
-                    // 右侧主列：标签栏 + 查找/命令浮层 + 编辑区（纵向排列）
+                    // 中间主列：标签栏 + 查找/命令浮层 + 编辑区（纵向排列）
                     .child(
                         div()
                             .id("doc")
@@ -5211,7 +5472,10 @@ impl Render for DocView {
                                         ),
                                     ),
                             ),
-                    ),
+                    )
+                    .when(self.outline_open, |d| {
+                        d.child(outline_resize).child(outline_panel)
+                    }),
             )
             .child(status_bar)
     }
@@ -8893,5 +9157,51 @@ mod tests {
             None,
             "定义块之外的落点不跳转"
         );
+    }
+
+    /// 文件树按层级递归：未展开的目录不显示子项，展开后子项带正确深度，
+    /// 非 Markdown 文件被过滤。
+    #[test]
+    fn file_tree_rows_respect_expansion_and_depth() {
+        use super::collect_tree_rows;
+        use mazha_core::Workspace;
+        use mazha_store::{DocPath, FileSystemProvider};
+        use std::collections::HashSet;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileSystemProvider::open(dir.path()).unwrap();
+        // 结构：a.md、sub/(deep/(c.md)、b.md)、img.png
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+        std::fs::write(dir.path().join("sub/b.md"), "b").unwrap();
+        std::fs::write(dir.path().join("sub/deep/c.md"), "c").unwrap();
+        std::fs::write(dir.path().join("img.png"), "x").unwrap();
+
+        let ws = Workspace::new(store);
+        let mut expanded = HashSet::new();
+
+        // 根层：目录 sub 在前、随后 a.md；img.png 被过滤。
+        let mut rows = Vec::new();
+        collect_tree_rows(&ws, &DocPath::root(), 0, &expanded, &mut rows);
+        let names: Vec<_> = rows.iter().map(|(_, e)| e.name.as_str()).collect();
+        assert_eq!(names, ["sub", "a.md"]);
+        assert!(rows.iter().all(|(d, _)| *d == 0));
+
+        // 展开 sub：出现 deep 目录与 b.md（深度 1），deep 未展开故 c.md 不出现。
+        expanded.insert("sub".to_string());
+        let mut rows = Vec::new();
+        collect_tree_rows(&ws, &DocPath::root(), 0, &expanded, &mut rows);
+        let names: Vec<_> = rows.iter().map(|(_, e)| e.name.as_str()).collect();
+        assert_eq!(names, ["sub", "deep", "b.md", "a.md"]);
+        assert_eq!(rows[1].0, 1);
+        assert_eq!(rows[2].0, 1);
+
+        // 再展开 sub/deep：c.md 以深度 2 出现。
+        expanded.insert("sub/deep".to_string());
+        let mut rows = Vec::new();
+        collect_tree_rows(&ws, &DocPath::root(), 0, &expanded, &mut rows);
+        let names: Vec<_> = rows.iter().map(|(_, e)| e.name.as_str()).collect();
+        assert_eq!(names, ["sub", "deep", "c.md", "b.md", "a.md"]);
+        assert_eq!(rows[2].0, 2);
     }
 }
