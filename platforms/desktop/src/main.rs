@@ -140,6 +140,52 @@ struct Palette {
     selection: Hsla,
 }
 
+/// 文件树拖拽负载（`on_drag` 的值，也是 `on_drop` / `can_drop` 收到的 `&dyn Any`）。
+///
+/// 只携带相对工作区根的路径与展示信息：落点据此算出目标目录，再交给 `DocView::move_entry`。
+#[derive(Clone)]
+struct TreeDrag {
+    /// 被拖拽条目的相对工作区根路径（正斜杠分隔，与 `Entry::path` 一致）。
+    rel: String,
+    /// 条目名（拖拽预览展示）。
+    name: String,
+    /// 是否为目录；用于在 `can_drop` 中拒绝把目录拖进自身或其后代。
+    is_dir: bool,
+    /// 预览底色。
+    bg: Hsla,
+    /// 预览文字色。
+    fg: Hsla,
+    /// 预览边框色。
+    border: Hsla,
+}
+
+/// 拖拽跟随预览：跟随光标的半透明小标签（由 `on_drag` 的 constructor 生成）。
+struct TreeDragPreview {
+    /// 展示文本（条目名）。
+    label: String,
+    /// 底色。
+    bg: Hsla,
+    /// 文字色。
+    fg: Hsla,
+    /// 边框色。
+    border: Hsla,
+}
+
+impl Render for TreeDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .text_sm()
+            .bg(self.bg)
+            .text_color(self.fg)
+            .border_1()
+            .border_color(self.border)
+            .rounded(px(4.))
+            .child(self.label.clone())
+    }
+}
+
 impl Palette {
     /// 从当前主题取色（`ActiveTheme::theme`，经 Deref 到 `ThemeColor`）。
     fn from_theme(theme: &Theme) -> Self {
@@ -579,6 +625,37 @@ fn collect_tree_rows(
                 }
             }
         }
+    }
+}
+
+/// 判断拖拽落点是否合法（供文件树 `can_drop` 与单测复用）。
+///
+/// 非法落点：拖到条目自身所在的同一位置（`from_rel == target_rel`），
+/// 或把目录拖进自身及其后代（`target_rel` 以 `from_rel + "/"` 开头，会把自己搬进自己内部）。
+fn drop_allowed(from_rel: &str, from_is_dir: bool, target_rel: &str) -> bool {
+    if from_rel == target_rel {
+        return false;
+    }
+    if from_is_dir && target_rel.starts_with(&format!("{from_rel}/")) {
+        return false;
+    }
+    true
+}
+
+/// 把展开集合中的旧目录前缀整体迁移为新前缀（目录重命名/移动后保持展开态）。
+///
+/// 命中条件：等于 `old_rel` 本身，或以 `old_rel/` 开头；迁移时保留其后的子路径后缀。
+fn remap_expanded(expanded: &mut HashSet<String>, old_rel: &str, new_rel: &str) {
+    let old_prefix = format!("{old_rel}/");
+    let moved: Vec<String> = expanded
+        .iter()
+        .filter(|d| d.as_str() == old_rel || d.starts_with(&old_prefix))
+        .cloned()
+        .collect();
+    for d in moved {
+        expanded.remove(&d);
+        let suffix = d.strip_prefix(old_rel).unwrap_or("");
+        expanded.insert(format!("{new_rel}{suffix}"));
     }
 }
 
@@ -1637,6 +1714,8 @@ enum PaletteAction {
     CloseTab,
     CloseAllTabs,
     OpenFile,
+    NewFile,
+    NewFolder,
     Save,
     SaveAs,
     ExportPdf,
@@ -3923,6 +4002,8 @@ impl DocView {
             mk("关闭标签页", "Cmd+W", CloseTab),
             mk("关闭全部标签页", "Cmd+Shift+W", CloseAllTabs),
             mk("打开文件…", "Cmd+O", OpenFile),
+            mk("新建 Markdown", "", NewFile),
+            mk("新建文件夹", "", NewFolder),
             mk("保存", "Cmd+S", Save),
             mk("另存为…", "Cmd+Shift+S", SaveAs),
             mk("导出 PDF", "Cmd+E", ExportPdf),
@@ -4045,6 +4126,8 @@ impl DocView {
             CloseTab => self.close_current_tab(cx),
             CloseAllTabs => self.close_all_tabs(cx),
             OpenFile => self.open_file_dialog(window, cx),
+            NewFile => self.new_markdown_in_root(cx),
+            NewFolder => self.new_folder_in_root(cx),
             Save => self.save_current(window, cx),
             SaveAs => self.save_as(window, cx),
             ExportPdf => self.export_pdf(window, cx),
@@ -4435,6 +4518,48 @@ impl DocView {
         self.open_path(full, cx);
     }
 
+    /// 在工作区根目录新建文件夹（侧栏「＋文件夹」）。
+    fn new_folder_in_root(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        self.new_folder_in(root, cx);
+    }
+
+    /// 在指定目录内新建子文件夹，并进入重命名态（侧栏/目录行「＋文件夹」）。
+    ///
+    /// 名字从「新建文件夹」递增，避免覆盖；父目录保持展开，随后 `start_rename` 让用户改名。
+    fn new_folder_in(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !dir.is_dir() {
+            return;
+        }
+        let mut name = "新建文件夹".to_string();
+        let mut i = 1;
+        let full = loop {
+            let candidate = dir.join(&name);
+            if !candidate.exists() {
+                break candidate;
+            }
+            name = format!("新建文件夹{i}");
+            i += 1;
+            if i > 1000 {
+                break candidate;
+            }
+        };
+        if let Err(e) = std::fs::create_dir(&full) {
+            eprintln!("新建文件夹失败：{}", e);
+            return;
+        }
+        // 让父目录保持展开，新目录立即可见（根目录恒展开，无需记录）。
+        if let Some(rel) = self.rel_of(&dir)
+            && !rel.is_empty()
+        {
+            self.expanded_dirs.insert(rel);
+        }
+        self.refresh_workspace(cx);
+        self.start_rename(full, cx);
+    }
+
     /// 开始重命名（文件树条目）。
     fn start_rename(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let name = path
@@ -4530,18 +4655,7 @@ impl DocView {
         // 目录重命名后，把展开记录里的旧前缀迁移到新前缀，保持展开状态。
         if is_dir && let (Some(old_rel), Some(new_rel)) = (self.rel_of(&path), self.rel_of(&target))
         {
-            let old_prefix = format!("{old_rel}/");
-            let moved: Vec<String> = self
-                .expanded_dirs
-                .iter()
-                .filter(|d| **d == old_rel || d.starts_with(&old_prefix))
-                .cloned()
-                .collect();
-            for d in moved {
-                self.expanded_dirs.remove(&d);
-                let suffix = d.strip_prefix(&old_rel).unwrap_or("");
-                self.expanded_dirs.insert(format!("{new_rel}{suffix}"));
-            }
+            remap_expanded(&mut self.expanded_dirs, &old_rel, &new_rel);
         }
         self.refresh_workspace(cx);
     }
@@ -4562,7 +4676,7 @@ impl DocView {
             let _ = this.update(cx, |view, cx| {
                 view.dialog_open = false;
                 if let Some(handle) = picked {
-                    view.move_file(cur, handle.path().to_path_buf(), cx);
+                    view.move_entry(cur, handle.path().to_path_buf(), cx);
                 }
                 cx.notify();
             });
@@ -4570,25 +4684,55 @@ impl DocView {
         .detach();
     }
 
-    /// 把文件移动到目标目录（文件树 CRUD）。
-    fn move_file(&mut self, path: PathBuf, target_dir: PathBuf, cx: &mut Context<Self>) {
-        let Some(name) = path.file_name() else { return };
-        let target = target_dir.join(name);
-        if target == path {
+    /// 把文件或目录移动到目标目录（文件树拖拽 / 命令面板「移动当前文件…」）。
+    ///
+    /// 拒绝三种非法落点：目标就是条目自身、把目录移进自身或其后代、目标位置已有同名条目。
+    /// 成功后跟随更新当前打开文档的绝对路径，并迁移 `expanded_dirs` 的旧前缀（目录）。
+    fn move_entry(&mut self, from: PathBuf, target_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(name) = from.file_name().map(|n| n.to_owned()) else {
+            return;
+        };
+        let target = target_dir.join(&name);
+        if target == from {
+            return;
+        }
+        // rename 后原路径即消失，先记录是否为目录，供后续路径/展开态迁移判断。
+        let from_is_dir = from.is_dir();
+        if !target_dir.is_dir() {
+            eprintln!("移动失败：目标不是目录");
+            return;
+        }
+        // 目录不能移进自身或其子孙，否则会把自己搬进自己内部。
+        if from_is_dir && (target_dir == from || target_dir.starts_with(&from)) {
+            eprintln!("移动失败：不能把目录移动到自身或其子目录");
             return;
         }
         if target.exists() {
             eprintln!("移动失败：目标已存在");
             return;
         }
-        if let Err(e) = std::fs::rename(&path, &target) {
+        if let Err(e) = std::fs::rename(&from, &target) {
             eprintln!("移动失败：{}", e);
-        } else {
-            if self.path.as_ref().is_some_and(|p| p == &path) {
-                self.path = Some(target.clone());
-            }
-            self.refresh_workspace(cx);
+            return;
         }
+        // 当前文档正好是被移动条目，或落在被移动目录内：跟随更新绝对路径。
+        if let Some(cur) = self.path.clone() {
+            if cur == from {
+                self.path = Some(target.clone());
+            } else if from_is_dir
+                && cur.starts_with(&from)
+                && let Ok(suffix) = cur.strip_prefix(&from)
+            {
+                self.path = Some(target.join(suffix));
+            }
+        }
+        // 目录移动后，把展开记录里的旧前缀迁移到新前缀，保持展开状态。
+        if from_is_dir
+            && let (Some(old_rel), Some(new_rel)) = (self.rel_of(&from), self.rel_of(&target))
+        {
+            remap_expanded(&mut self.expanded_dirs, &old_rel, &new_rel);
+        }
+        self.refresh_workspace(cx);
     }
 
     /// 重建 Workspace（CRUD 后刷新文件树）。
@@ -4801,20 +4945,47 @@ impl Render for DocView {
                 .justify_between()
                 .border_b_1()
                 .border_color(palette.border)
+                // 侧栏标题也是「拖到根目录」的落点（根目录恒展开，rel 为空串）。
+                .on_drop(cx.listener(|view, drag: &TreeDrag, _w, cx| {
+                    if let Some(root) = view.workspace_root.clone() {
+                        let from = root.join(&drag.rel);
+                        view.move_entry(from, root, cx);
+                    }
+                }))
                 .child("资源管理器")
                 .child(
                     div()
-                        .id("sb-new")
-                        .cursor_pointer()
-                        .text_xs()
-                        .hover(|d| d.text_color(palette.foreground))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|view, _ev, _w, cx| {
-                                view.new_markdown_in_root(cx);
-                            }),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("sb-new-file")
+                                .cursor_pointer()
+                                .text_xs()
+                                .hover(|d| d.text_color(palette.foreground))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|view, _ev, _w, cx| {
+                                        view.new_markdown_in_root(cx);
+                                    }),
+                                )
+                                .child("＋文件"),
                         )
-                        .child("＋"),
+                        .child(
+                            div()
+                                .id("sb-new-folder")
+                                .cursor_pointer()
+                                .text_xs()
+                                .hover(|d| d.text_color(palette.foreground))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|view, _ev, _w, cx| {
+                                        view.new_folder_in_root(cx);
+                                    }),
+                                )
+                                .child("＋文件夹"),
+                        ),
                 )
                 .into_any_element(),
         );
@@ -4855,9 +5026,11 @@ impl Render for DocView {
                         let expanded = self.expanded_dirs.contains(&rel);
                         let arrow = if expanded { "▾" } else { "▸" };
                         let rel_toggle = rel.clone();
+                        let rel_for_drop = rel.clone();
                         let full_ren = full.clone();
                         let full_del = full.clone();
                         let full_new = full.clone();
+                        let full_drop = full.clone();
                         sb.push(
                             div()
                                 .id(gpui::ElementId::Name(format!("sb-dir-{rel}").into()))
@@ -4868,8 +5041,40 @@ impl Render for DocView {
                                 .flex()
                                 .justify_between()
                                 .items_center()
+                                // 目录行可作为拖拽源（拖动该目录）与落点（接收其它条目）。
+                                .on_drag(
+                                    TreeDrag {
+                                        rel: rel.clone(),
+                                        name: name.clone(),
+                                        is_dir: true,
+                                        bg: palette.subtle,
+                                        fg: palette.foreground,
+                                        border: palette.border,
+                                    },
+                                    |drag, _offset, _window, cx| {
+                                        cx.new(|_| TreeDragPreview {
+                                            label: drag.name.clone(),
+                                            bg: drag.bg,
+                                            fg: drag.fg,
+                                            border: drag.border,
+                                        })
+                                    },
+                                )
+                                // 拒绝自身与「把目录拖进自己的子孙」两种非法落点。
+                                .can_drop(move |drag, _w, _cx| {
+                                    drag.downcast_ref::<TreeDrag>().is_some_and(|d| {
+                                        drop_allowed(&d.rel, d.is_dir, &rel_for_drop)
+                                    })
+                                })
+                                .on_drop(cx.listener(move |view, drag: &TreeDrag, _w, cx| {
+                                    if let Some(root) = view.workspace_root.clone() {
+                                        let from = root.join(&drag.rel);
+                                        view.move_entry(from, full_drop.clone(), cx);
+                                    }
+                                }))
                                 .child(
                                     div()
+                                        .id(gpui::ElementId::Name(format!("sb-dir-t-{rel}").into()))
                                         .flex_1()
                                         .min_w(px(0.))
                                         .flex()
@@ -4877,12 +5082,10 @@ impl Render for DocView {
                                         .gap_1()
                                         .cursor_pointer()
                                         .truncate()
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            cx.listener(move |view, _ev, _w, cx| {
-                                                view.toggle_dir(rel_toggle.clone(), cx);
-                                            }),
-                                        )
+                                        // 用 on_click（而非 on_mouse_down）：拖动该目录时不误触发折叠。
+                                        .on_click(cx.listener(move |view, _ev, _w, cx| {
+                                            view.toggle_dir(rel_toggle.clone(), cx);
+                                        }))
                                         .child(arrow)
                                         .child(name),
                                 )
@@ -4943,19 +5146,37 @@ impl Render for DocView {
                                 .justify_between()
                                 .items_center()
                                 .when(cur, |d| d.bg(palette.selected_bg))
+                                // 文件行可拖拽到任意目录（含根目录标题）完成移动。
+                                .on_drag(
+                                    TreeDrag {
+                                        rel: rel.clone(),
+                                        name: name.clone(),
+                                        is_dir: false,
+                                        bg: palette.subtle,
+                                        fg: palette.foreground,
+                                        border: palette.border,
+                                    },
+                                    |drag, _offset, _window, cx| {
+                                        cx.new(|_| TreeDragPreview {
+                                            label: drag.name.clone(),
+                                            bg: drag.bg,
+                                            fg: drag.fg,
+                                            border: drag.border,
+                                        })
+                                    },
+                                )
                                 .child(
                                     div()
+                                        .id(gpui::ElementId::Name(format!("sb-open-{rel}").into()))
                                         .flex_1()
                                         .min_w(px(0.))
                                         // `truncate()` = nowrap + hidden + 末尾省略号（D58）。
                                         .truncate()
                                         .cursor_pointer()
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            cx.listener(move |view, _ev, _w, cx| {
-                                                view.open_path(full_open.clone(), cx);
-                                            }),
-                                        )
+                                        // 用 on_click：拖动该文件时不误触发打开。
+                                        .on_click(cx.listener(move |view, _ev, _w, cx| {
+                                            view.open_path(full_open.clone(), cx);
+                                        }))
                                         .child(name),
                                 )
                                 .child(
@@ -9203,5 +9424,46 @@ mod tests {
         let names: Vec<_> = rows.iter().map(|(_, e)| e.name.as_str()).collect();
         assert_eq!(names, ["sub", "deep", "c.md", "b.md", "a.md"]);
         assert_eq!(rows[2].0, 2);
+    }
+
+    /// 拖拽落点合法性：不能拖到自身所在目录；目录不能拖进自身或其后代；其余允许。
+    #[test]
+    fn drop_allowed_rejects_self_and_descendants() {
+        use super::drop_allowed;
+        // 文件拖到任意不同目录都允许（含根目录 ""）。
+        assert!(drop_allowed("a.md", false, "sub"));
+        assert!(drop_allowed("sub/a.md", false, ""));
+        // 拖到自身所在目录（原地不动）被拒绝。
+        assert!(!drop_allowed("sub", true, "sub"));
+        assert!(!drop_allowed("a.md", false, "a.md"));
+        // 目录不能拖进自身或其后代。
+        assert!(!drop_allowed("sub", true, "sub/deep"));
+        assert!(!drop_allowed("sub", true, "sub/deep/more"));
+        // 目录拖到根目录或兄弟目录允许。
+        assert!(drop_allowed("sub", true, ""));
+        assert!(drop_allowed("sub", true, "other"));
+        // 前缀相近但非子孙（sub2 不是 sub 的后代）允许。
+        assert!(drop_allowed("sub", true, "sub2"));
+    }
+
+    /// 目录重命名/移动后，展开集合里的旧前缀整体迁移为新前缀，子路径后缀保留。
+    #[test]
+    fn remap_expanded_moves_prefix_and_keeps_suffix() {
+        use super::remap_expanded;
+        use std::collections::HashSet;
+        let mut set: HashSet<String> = ["sub", "sub/deep", "sub/deep/more", "other", "subx"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        remap_expanded(&mut set, "sub", "moved");
+        // 旧前缀全部消失，新前缀保留子路径后缀。
+        assert!(set.contains("moved"));
+        assert!(set.contains("moved/deep"));
+        assert!(set.contains("moved/deep/more"));
+        // 不相干的项（other）与前缀相近项（subx）不受影响。
+        assert!(set.contains("other"));
+        assert!(set.contains("subx"));
+        assert!(!set.contains("sub"));
+        assert!(!set.contains("sub/deep"));
     }
 }
