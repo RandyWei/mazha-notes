@@ -112,7 +112,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 140 条）
 
 ```
-0000000 fix(desktop): 侧栏标题栏固定，列表独立滚动（0.1.97，D75）
+4ca24cd fix(desktop): 侧栏标题栏固定，列表独立滚动（0.1.97，D75）
 4b3e9ca feat(desktop): 入站外部拖拽（从 Finder 拖入）（0.1.96，D74）
 5213bc1 feat(desktop): 拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索（0.1.95，D40/D73）
 be5f7ef feat(desktop): 文件树展开状态持久化（0.1.94，D72）
@@ -201,7 +201,7 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 140（含本次）。
 
-- 2026-11-18（`0000000`，0.1.97）：**侧栏标题栏固定**（D75）：把「资源管理器 / ＋文件 / ＋文件夹」标题从滚动列表中拆出，作为 `#sidebar` 直接子节点（`h(28px)` + `flex_none()`），条目列表改由 `sidebar-list`（`flex_1` + `min_h(0)` + `overflow_y_scroll`）承载，列表过长时标题与新建入口始终可见；标题的根目录拖拽落点（`TreeDrag` / `ExternalPaths`）保持不变。桌面 fmt/clippy/test/build 全绿（55 项）；根 workspace fmt/clippy/test 全绿（548 项）。
+- 2026-11-18（`4ca24cd`，0.1.97）：**侧栏标题栏固定**（D75）：把「资源管理器 / ＋文件 / ＋文件夹」标题从滚动列表中拆出，作为 `#sidebar` 直接子节点（`h(28px)` + `flex_none()`），条目列表改由 `sidebar-list`（`flex_1` + `min_h(0)` + `overflow_y_scroll`）承载，列表过长时标题与新建入口始终可见；标题的根目录拖拽落点（`TreeDrag` / `ExternalPaths`）保持不变。桌面 fmt/clippy/test/build 全绿（55 项）；根 workspace fmt/clippy/test 全绿（548 项）。
 
 - 2026-11-18（`4b3e9ca`，0.1.96）：**入站外部拖拽（从 Finder 拖入）**（D74）：根元素、侧栏标题与目录行接受 GPUI `ExternalPaths` 拖拽负载并高亮落点，与 `TreeDrag` 落点共存；拖入条目复制进目标目录（同名递增编号、目录递归、跳过符号链接），Finder 原件不动；`.md`/`.markdown` 自动打开为标签，编辑区拖入的非 Markdown 文件按当前文档目录生成相对链接（图片 `![ ]`、其它 `[ ]`）并插入所有光标。新增纯函数 `plan_imports`/`unique_import_path`/`copy_entry`/`dropped_link_markdown` 与 3 条桌面单测，`insert_text_at_cursors` 抽出供粘贴复用。桌面 fmt/clippy/test/build 全绿（55 项）；根 workspace 门禁全绿（548 项）。Finder→窗口入站拖拽已实机验收通过；D73 出站拖拽亦已实机验收通过（拖出窗口→目标目录复制文件）。
 
