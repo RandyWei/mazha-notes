@@ -114,7 +114,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 146 条）
 
 ```
-@@HASH@@ fix(desktop): Mermaid 图表去背景边框并修正示例连线（0.1.103，D77）
+df78360 fix(desktop): Mermaid 图表去背景边框并修正示例连线（0.1.103，D77）
 9b6af0c feat(desktop): Mermaid 图表真实渲染，替换块级占位面板（0.1.102，D77）
 ed19d00 fix(desktop): 块级公式编辑态显 TeX 原文并修行内重叠（0.1.101，D76）
 7eadc91 fix(desktop): 块级公式点击进编辑态并去装饰（0.1.100，D76）
@@ -209,7 +209,7 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 146（含本次）。
 
-- 2026-11-18（`@@HASH@@`，0.1.103）：**Mermaid 渲染观感按实机反馈细化（D77 细化）**：① **去背景/边框**——`render_chart_preview` 改用 `render_with_options` 把 `theme.background` 设为 `transparent`（mermaid-rs 默认在 SVG 根节点画白色 `<rect>`，深色主题下是突兀白块），paint 阶段不再画 `palette.subtle` 弱底与 `paint_rect_border`（节点自带浅底/描边，同 D76 公式块）；新增透明背景单测断言（角落 padding 像素 alpha=0）。② **连线起点/标签位置**——内置示例 `B -->|否| A` 改为无回边分叉 `B -->|否| D[重试]`：dump SVG 实测确认 mermaid-rs-renderer 0.3.1 对菱形 branching shape 在 degree≥3 时用边中点作端口（「否」线起点 `193.505,75.600` 落在菱形下边中点而非顶点）、回边标签用路由前锚点（「否」字甩到 `x=53.51,y=111.79` 脱离连线）；这是上游布局缺陷，0.3.1 为最新版无修复，应用层只能靠无回边写法规避，用户文档含回边图仍会复现。无回边分叉时两条出边精确从菱形右顶点 `216.11,77.31` 出发、标签贴线。核心/导出不改。桌面 68 项、根 workspace 548 项门禁全绿。已据用户实机反馈修正，待用户复验。
+- 2026-11-18（`df78360`，0.1.103）：**Mermaid 渲染观感按实机反馈细化（D77 细化）**：① **去背景/边框**——`render_chart_preview` 改用 `render_with_options` 把 `theme.background` 设为 `transparent`（mermaid-rs 默认在 SVG 根节点画白色 `<rect>`，深色主题下是突兀白块），paint 阶段不再画 `palette.subtle` 弱底与 `paint_rect_border`（节点自带浅底/描边，同 D76 公式块）；新增透明背景单测断言（角落 padding 像素 alpha=0）。② **连线起点/标签位置**——内置示例 `B -->|否| A` 改为无回边分叉 `B -->|否| D[重试]`：dump SVG 实测确认 mermaid-rs-renderer 0.3.1 对菱形 branching shape 在 degree≥3 时用边中点作端口（「否」线起点 `193.505,75.600` 落在菱形下边中点而非顶点）、回边标签用路由前锚点（「否」字甩到 `x=53.51,y=111.79` 脱离连线）；这是上游布局缺陷，0.3.1 为最新版无修复，应用层只能靠无回边写法规避，用户文档含回边图仍会复现。无回边分叉时两条出边精确从菱形右顶点 `216.11,77.31` 出发、标签贴线。核心/导出不改。桌面 68 项、根 workspace 548 项门禁全绿。已据用户实机反馈修正，待用户复验。
 
 - 2026-11-18（`9b6af0c`，0.1.102）：**桌面 Mermaid 图表真实渲染（R4 第二步，D77）**：桌面新增 `mermaid-rs-renderer 0.3.1`（render-only，纯 Rust `render(src)` 产 SVG，关 CLI/内置 PNG），SVG 经 GPUI `SvgRenderer::render_single_frame` 栅格化（逻辑尺寸除 `SMOOTH_SVG_SCALE_FACTOR`）；`DocView` 按 DSL 源码缓存（含失败缓存，与主题/DPR 无关）。渲染态 mermaid 块源码转透明占位、锚点行显示图像（弱底 + 圆角 + 描边，按正文宽等比适配）其余行归零；`DocLayout::chart_boxes` 命中图像把光标放进围栏块显示 DSL 原文，移开恢复；失败/不支持语法回退弱底 + 语言标签占位面板。内置 `SAMPLE` 增加 mermaid 示例。核心/导出不改，导出仍按字面量。桌面新增 DSL 提取/缓存键/SVG 栅格化出图/命中框/文本透明化 5 条单测（68 项）；根 workspace 548 项门禁全绿。截图环境不可用（`screencapture` 取窗口空/全黑），未做实机目视验收，由渲染管线单测（非空像素断言）验证。
 
