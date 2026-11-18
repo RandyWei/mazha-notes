@@ -628,6 +628,105 @@ fn collect_tree_rows(
     }
 }
 
+/// 递归收集工作区内全部 Markdown 文档的相对路径（`/` 分隔，按目录名/文件名排序）。
+///
+/// 全工作区搜索复用文件树的遍历规则：目录在前、名称排序；不展开就能拿到全量，
+/// 与用户当前的展开/折叠状态无关。目录读取失败直接跳过（权限/竞态），不让整次搜索失败。
+fn collect_markdown_paths(
+    ws: &Workspace<FileSystemProvider>,
+    dir: &DocPath,
+    out: &mut Vec<String>,
+) {
+    // 记录已访问目录的规范路径，防止符号链接成环导致无限递归。
+    let root = ws.store().root().to_path_buf();
+    let mut visited = HashSet::new();
+    collect_markdown_paths_inner(ws, &root, dir, &mut visited, out);
+}
+
+/// [`collect_markdown_paths`] 的递归实现（`visited` 用规范路径去重）。
+fn collect_markdown_paths_inner(
+    ws: &Workspace<FileSystemProvider>,
+    root: &Path,
+    dir: &DocPath,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Vec<String>,
+) {
+    let abs_dir = if dir.is_root() {
+        root.to_path_buf()
+    } else {
+        root.join(dir.as_str())
+    };
+    // 规范路径解析失败（权限/竞态）时退回原路径，仍可继续遍历。
+    let key = abs_dir
+        .canonicalize()
+        .unwrap_or_else(|_| abs_dir.to_path_buf());
+    if !visited.insert(key) {
+        return;
+    }
+    let Ok(entries) = ws.list(dir) else {
+        return;
+    };
+    for entry in entries {
+        match entry.kind {
+            EntryKind::Dir => {
+                collect_markdown_paths_inner(ws, root, &entry.path, visited, out);
+            }
+            EntryKind::File if entry.path.is_markdown() => {
+                out.push(entry.path.as_str().to_string());
+            }
+            EntryKind::File => {}
+        }
+    }
+}
+
+/// 在一段文件文本中查找查询词，按行产出命中（纯函数，可脱离文件系统单测）。
+///
+/// 逐行调用核心 `find_all`（大小写语义与文档内查找一致）；行号 1 基，
+/// `range` 相对于行文本、`source` 相对于整段文本，供预览高亮与打开后选区使用。
+fn search_text_lines(text: &str, query: &str, case_sensitive: bool) -> Vec<WorkspaceTextHit> {
+    let mut out = Vec::new();
+    if query.is_empty() {
+        return out;
+    }
+    let mut offset = 0usize;
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
+        // 行文本去掉行尾换行（CRLF 同时去掉 `\r`），但源偏移仍按原始行长度推进。
+        let line = raw.trim_end_matches(['\n', '\r']);
+        for range in find_all(line, query, case_sensitive) {
+            out.push(WorkspaceTextHit {
+                line_no: idx + 1,
+                line: line.to_string(),
+                source: offset + range.start..offset + range.end,
+                range,
+            });
+        }
+        offset += raw.len();
+    }
+    out
+}
+
+/// 取 `s` 末尾最多 `n` 个字符（超出时加前导省略号）；按字符边界截断，避免切坏 UTF-8。
+fn tail_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        return s.to_string();
+    }
+    let mut out = String::from("…");
+    out.extend(&chars[chars.len() - n..]);
+    out
+}
+
+/// 取 `s` 开头最多 `n` 个字符（超出时加尾随省略号）；按字符边界截断。
+fn head_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        return s.to_string();
+    }
+    let mut out: String = chars[..n].iter().collect();
+    out.push('…');
+    out
+}
+
 /// 判断拖拽落点是否合法（供文件树 `can_drop` 与单测复用）。
 ///
 /// 非法落点：拖到条目自身所在的同一位置（`from_rel == target_rel`），
@@ -1686,6 +1785,60 @@ struct FindState {
     index: usize,
 }
 
+/// 单个文件内的命中行（全工作区搜索的纯文本中间结果）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceTextHit {
+    /// 行号（1 基，展示用）。
+    line_no: usize,
+    /// 该行文本（不含行尾 `\n` / `\r\n`）。
+    line: String,
+    /// 命中在该行文本中的字节区间（用于预览高亮）。
+    range: Range<usize>,
+    /// 命中在文件源文本中的字节区间（打开文件后据此选区/定位）。
+    source: Range<usize>,
+}
+
+/// 全工作区搜索的 UI 状态（`Cmd+Shift+F`，SPEC D40）。
+///
+/// 结果在每次查询变化时同步重算（本地工作区、仅 Markdown 文件）；每条命中保留
+/// 文件相对路径与源偏移，点击后走 `open_path` + 光标选区完成「打开并定位」。
+#[derive(Default)]
+struct WorkspaceSearchState {
+    /// 面板是否展开。
+    open: bool,
+    /// 查询文本。
+    query: String,
+    /// 是否区分大小写（默认 `false`）。
+    case_sensitive: bool,
+    /// 扁平命中列表（按文件、行号排序）。
+    hits: Vec<WorkspaceHit>,
+    /// 当前选中项下标（`hits` 内）。
+    selected: usize,
+    /// 命中的文件数（按路径去重）。
+    file_count: usize,
+    /// 读取失败/非 UTF-8 等原因跳过的文件数。
+    skipped: usize,
+    /// 是否因结果上限被截断。
+    truncated: bool,
+}
+
+/// 全工作区搜索的一条命中（带文件信息，供 UI 与跳转使用）。
+#[derive(Clone)]
+struct WorkspaceHit {
+    /// 文件相对工作区根路径（`/` 分隔）。
+    rel: String,
+    /// 文件绝对路径。
+    path: PathBuf,
+    /// 行号（1 基）。
+    line_no: usize,
+    /// 该行文本（不含行尾换行）。
+    line: String,
+    /// 命中在该行文本中的字节区间。
+    range: Range<usize>,
+    /// 命中在文件源文本中的字节区间（跳转后选区）。
+    source: Range<usize>,
+}
+
 /// 命令面板状态（`Cmd+P` 展开；SPEC D38）。
 #[derive(Default)]
 #[allow(dead_code)]
@@ -1720,6 +1873,7 @@ enum PaletteAction {
     SaveAs,
     ExportPdf,
     Find,
+    WorkspaceSearch,
     ToggleTree,
     ToggleOutline,
     ToggleFocusMode,
@@ -1931,6 +2085,7 @@ fn app_menus(settings: &Settings) -> Vec<Menu> {
             ),
             MenuItem::separator(),
             menu_item("查找/替换…", Palette(Find)),
+            menu_item("全工作区搜索…", Palette(WorkspaceSearch)),
         ]),
         Menu::new("视图").items([
             menu_item("命令面板…", MenuCommand::OpenPalette),
@@ -1999,6 +2154,11 @@ fn menu_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-v", menu_action(MenuCommand::Paste), doc),
         KeyBinding::new("secondary-a", menu_action(MenuCommand::SelectAll), doc),
         KeyBinding::new("secondary-f", menu_action(Palette(Find)), doc),
+        KeyBinding::new(
+            "secondary-shift-f",
+            menu_action(Palette(WorkspaceSearch)),
+            doc,
+        ),
         KeyBinding::new("secondary-p", menu_action(MenuCommand::OpenPalette), doc),
         KeyBinding::new(
             "secondary-shift-o",
@@ -2107,6 +2267,8 @@ struct DocView {
     highlighter: Option<Highlighter>,
     /// 查找/替换条状态（`Cmd+F` 展开）。
     find: FindState,
+    /// 全工作区搜索状态（`Cmd+Shift+F` 展开，D40）。
+    workspace_search: WorkspaceSearchState,
     /// 工作区根（文件树）
     workspace_root: Option<PathBuf>,
     /// Workspace（本地文件系统）
@@ -2253,6 +2415,7 @@ impl DocView {
             palette,
             highlighter: None,
             find: FindState::default(),
+            workspace_search: WorkspaceSearchState::default(),
             workspace_root: ws_root,
             workspace: ws,
             tree_open: true,
@@ -3495,6 +3658,120 @@ impl DocView {
         cx.notify();
     }
 
+    // ==================== 全工作区搜索（Cmd+Shift+F，D40）====================
+
+    /// 展开全工作区搜索面板；同时收起命令面板/文档内查找，避免多层浮层抢键盘。
+    fn open_workspace_search(&mut self, cx: &mut Context<Self>) {
+        self.cmd_palette.open = false;
+        self.find.open = false;
+        self.workspace_search.open = true;
+        self.workspace_search.selected = 0;
+        self.recompute_workspace_hits();
+        cx.notify();
+    }
+
+    /// 收起全工作区搜索面板（保留查询与结果，便于再次展开）。
+    fn close_workspace_search(&mut self, cx: &mut Context<Self>) {
+        self.workspace_search.open = false;
+        cx.notify();
+    }
+
+    /// 按当前查询重扫工作区；结果上限 `MAX_WORKSPACE_HITS`，超出标记截断。
+    ///
+    /// 遍历与读取都走本地文件系统（工作区 MVP 只有 `FileSystemProvider`），
+    /// 非 UTF-8/读取失败的文件计入 `skipped` 后跳过，不影响其它文件。
+    fn recompute_workspace_hits(&mut self) {
+        /// 单次搜索最多保留的命中数，避免超大型工作区把 UI 卡死。
+        const MAX_WORKSPACE_HITS: usize = 500;
+
+        let query = self.workspace_search.query.clone();
+        let cs = self.workspace_search.case_sensitive;
+        self.workspace_search.hits.clear();
+        self.workspace_search.file_count = 0;
+        self.workspace_search.skipped = 0;
+        self.workspace_search.truncated = false;
+        if query.is_empty() {
+            self.workspace_search.selected = 0;
+            return;
+        }
+        let Some(ws) = self.workspace.as_ref() else {
+            self.workspace_search.selected = 0;
+            return;
+        };
+        let root = ws.store().root().to_path_buf();
+        let mut rels = Vec::new();
+        collect_markdown_paths(ws, &DocPath::root(), &mut rels);
+
+        // 先在局部变量里累积，最后一次性写回，避免同时借用 `workspace` 与 `workspace_search`。
+        let mut hits: Vec<WorkspaceHit> = Vec::new();
+        let mut file_count = 0usize;
+        let mut skipped = 0usize;
+        let mut truncated = false;
+        let mut last_rel: Option<String> = None;
+        for rel in rels {
+            if hits.len() >= MAX_WORKSPACE_HITS {
+                truncated = true;
+                break;
+            }
+            let path = root.join(&rel);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                skipped += 1;
+                continue;
+            };
+            let file_hits = search_text_lines(&text, &query, cs);
+            if file_hits.is_empty() {
+                continue;
+            }
+            if last_rel.as_deref() != Some(rel.as_str()) {
+                file_count += 1;
+                last_rel = Some(rel.clone());
+            }
+            for hit in file_hits {
+                if hits.len() >= MAX_WORKSPACE_HITS {
+                    truncated = true;
+                    break;
+                }
+                hits.push(WorkspaceHit {
+                    rel: rel.clone(),
+                    path: path.clone(),
+                    line_no: hit.line_no,
+                    line: hit.line,
+                    range: hit.range,
+                    source: hit.source,
+                });
+            }
+        }
+        self.workspace_search.hits = hits;
+        self.workspace_search.file_count = file_count;
+        self.workspace_search.skipped = skipped;
+        self.workspace_search.truncated = truncated;
+        if self.workspace_search.selected >= self.workspace_search.hits.len() {
+            self.workspace_search.selected = 0;
+        }
+    }
+
+    /// 打开第 `idx` 条命中：切到对应标签/文件，选中命中文本并把该行滚到视口顶部。
+    fn open_workspace_hit(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(hit) = self.workspace_search.hits.get(idx).cloned() else {
+            return;
+        };
+        self.workspace_search.open = false;
+        // `open_path` 对已打开文件走 `switch_tab`，之后 `self.doc` 即目标文档。
+        self.open_path(hit.path, cx);
+        let start = self.doc.snap_to_boundary(hit.source.start);
+        let end = self.doc.snap_to_boundary(hit.source.end);
+        self.cursors = vec![Cursor {
+            caret: end,
+            anchor: Some(start),
+            marked: None,
+        }];
+        self.primary = 0;
+        self.selecting = false;
+        self.scroll_to_source_top = Some(start);
+        self.reset_blink(cx);
+        cx.notify();
+    }
+
     /// 用 `text` 替换主光标处的指定区间 `target`（不先取当前选区）；IME 的内部替换原语。
     ///
     /// 与 [`Self::replace_selection_with`] 的区别：后者以"当前选区"为目标，
@@ -4018,6 +4295,7 @@ impl DocView {
             mk("另存为…", "Cmd+Shift+S", SaveAs),
             mk("导出 PDF", "Cmd+E", ExportPdf),
             mk("查找/替换", "Cmd+F", Find),
+            mk("全工作区搜索", "Cmd+Shift+F", WorkspaceSearch),
             mk("切换文件树", "", ToggleTree),
             mk("切换大纲", "Cmd+Shift+O", ToggleOutline),
             mk(
@@ -4142,6 +4420,7 @@ impl DocView {
             SaveAs => self.save_as(window, cx),
             ExportPdf => self.export_pdf(window, cx),
             Find => self.open_find(cx),
+            WorkspaceSearch => self.open_workspace_search(cx),
             ToggleTree => {
                 self.tree_open = !self.tree_open;
                 cx.notify();
@@ -4933,6 +5212,165 @@ impl Render for DocView {
         } else {
             None
         };
+        // 全工作区搜索（`Cmd+Shift+F`）：悬浮面板 + 按文件分组的结果列表。
+        let workspace_search_overlay = if self.workspace_search.open {
+            let st = &self.workspace_search;
+            let mut rows: Vec<gpui::AnyElement> = Vec::new();
+            let mut last_rel: Option<&str> = None;
+            for (i, hit) in st.hits.iter().enumerate() {
+                if last_rel != Some(hit.rel.as_str()) {
+                    rows.push(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_1()
+                            .text_xs()
+                            .text_color(palette.muted)
+                            .child(hit.rel.clone())
+                            .into_any_element(),
+                    );
+                    last_rel = Some(hit.rel.as_str());
+                }
+                // 命中前后各截一段上下文，中间命中文本用浅色底强调（按字符截断）。
+                let before = tail_chars(&hit.line[..hit.range.start], 36);
+                let matched = hit.line[hit.range.clone()].to_string();
+                let after = head_chars(&hit.line[hit.range.end..], 80);
+                rows.push(
+                    div()
+                        .id(gpui::ElementId::Name(format!("ws-hit-{i}").into()))
+                        .w_full()
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(i == st.selected, |d| d.bg(palette.selection))
+                        .child(
+                            div()
+                                .w(px(40.))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(palette.muted)
+                                .child(format!("{}", hit.line_no)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .items_center()
+                                .overflow_hidden()
+                                .child(div().flex_none().text_color(palette.muted).child(before))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .rounded(px(2.))
+                                        .bg(palette.selection)
+                                        .child(matched),
+                                )
+                                .child(div().flex_none().text_color(palette.muted).child(after)),
+                        )
+                        .on_click(cx.listener(move |view, _ev, _w, cx| {
+                            view.open_workspace_hit(i, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            let query_shown = if st.query.is_empty() {
+                "输入要搜索的内容…".to_string()
+            } else {
+                st.query.clone()
+            };
+            let case_label = if st.case_sensitive {
+                "Aa·开"
+            } else {
+                "aa·关"
+            };
+            let summary = if st.query.is_empty() {
+                "输入查询后自动扫描工作区内的 Markdown 文件".to_string()
+            } else {
+                format!(
+                    "{} 处 · {} 个文件{}{}",
+                    st.hits.len(),
+                    st.file_count,
+                    if st.truncated { "（已截断）" } else { "" },
+                    if st.skipped > 0 {
+                        format!(" · 跳过 {} 个文件", st.skipped)
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            Some(
+                div()
+                    .id("ws-search")
+                    .absolute()
+                    .top(px(60.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("ws-search-box")
+                            .w(px(620.))
+                            .h(px(430.))
+                            .flex()
+                            .flex_col()
+                            .border_1()
+                            .border_color(palette.border)
+                            .bg(palette.subtle)
+                            .child(
+                                h_flex()
+                                    .id("ws-search-head")
+                                    .items_center()
+                                    .gap_2()
+                                    .px_3()
+                                    .py_2()
+                                    .border_b_1()
+                                    .border_color(palette.border)
+                                    .child(
+                                        div()
+                                            .min_w(px(220.))
+                                            .flex_1()
+                                            .px_2()
+                                            .h(px(24.))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(palette.accent)
+                                            .bg(palette.background)
+                                            .text_sm()
+                                            .child(query_shown),
+                                    )
+                                    .child(div().text_xs().child(case_label)),
+                            )
+                            .child(
+                                div()
+                                    .id("ws-search-results")
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_y_scroll()
+                                    .children(rows),
+                            )
+                            .child(
+                                div()
+                                    .id("ws-search-foot")
+                                    .px_3()
+                                    .py_1()
+                                    .border_t_1()
+                                    .border_color(palette.border)
+                                    .text_xs()
+                                    .text_color(palette.muted)
+                                    .child(format!(
+                                        "{summary} · ↑↓ 选择 · Enter 打开 · Cmd+Alt+C 大小写 · Esc 关闭"
+                                    )),
+                            ),
+                    ),
+            )
+        } else {
+            None
+        };
         let find_bar = if self.find.open {
             let query = self.find.query.clone();
             let replace = self.find.replace.clone();
@@ -4983,6 +5421,13 @@ impl Render for DocView {
                         view.move_entry(from, root, cx);
                     }
                 }))
+                // 根目录落点不接受「本来就在根目录」的条目（移动无变化）。
+                .can_drop(|drag, _w, _cx| {
+                    drag.downcast_ref::<TreeDrag>()
+                        .is_some_and(|d| d.rel.contains('/'))
+                })
+                // 拖到根目录标题时整行铺强调底色，明确当前落点（D73）。
+                .drag_over::<TreeDrag>(move |style, _drag, _w, _cx| style.bg(palette.selection))
                 .child("资源管理器")
                 .child(
                     div()
@@ -5091,11 +5536,25 @@ impl Render for DocView {
                                         })
                                     },
                                 )
+                                // 拖出窗口 → 交给系统原生文件拖拽（可跨应用/拖到 Finder/桌面）。
+                                .external_drag_payload({
+                                    let full = full.clone();
+                                    move |_drag: &TreeDrag, _w, _cx| {
+                                        Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                                            full.clone(),
+                                            true,
+                                        )])))
+                                    }
+                                })
                                 // 拒绝自身与「把目录拖进自己的子孙」两种非法落点。
                                 .can_drop(move |drag, _w, _cx| {
                                     drag.downcast_ref::<TreeDrag>().is_some_and(|d| {
                                         drop_allowed(&d.rel, d.is_dir, &rel_for_drop)
                                     })
+                                })
+                                // 合法落点上铺强调底色（`can_drop` 为 false 时不应用）。
+                                .drag_over::<TreeDrag>(move |style, _drag, _w, _cx| {
+                                    style.bg(palette.selection)
                                 })
                                 .on_drop(cx.listener(move |view, drag: &TreeDrag, _w, cx| {
                                     if let Some(root) = view.workspace_root.clone() {
@@ -5196,6 +5655,16 @@ impl Render for DocView {
                                         })
                                     },
                                 )
+                                // 拖出窗口 → 系统原生文件拖拽（跨应用/窗口外，如拖进 Finder）。
+                                .external_drag_payload({
+                                    let full = full.clone();
+                                    move |_drag: &TreeDrag, _w, _cx| {
+                                        Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                                            full.clone(),
+                                            false,
+                                        )])))
+                                    }
+                                })
                                 .child(
                                     div()
                                         .id(gpui::ElementId::Name(format!("sb-open-{rel}").into()))
@@ -5461,7 +5930,7 @@ impl Render for DocView {
                 f32::from(self.font_size),
                 self.settings.theme.label()
             )))
-            .child("Cmd+O 打开 · Cmd+S 保存 · Cmd+Shift+S 另存为 · Cmd+F 查找替换");
+            .child("Cmd+O 打开 · Cmd+S 保存 · Cmd+F 查找替换 · Cmd+Shift+F 全工作区搜索");
         div()
             .id("app")
             .size_full()
@@ -5695,6 +6164,7 @@ impl Render for DocView {
                             // 查找/替换条（`Cmd+F` 展开时才渲染）
                             .children(find_bar)
                             .children(palette_overlay)
+                            .children(workspace_search_overlay)
                             // 正文滚动区：滚动**只包正文**——标签栏不随之卷走。
                             // 自己 `track_scroll` 绑定 `self.scroll`：可见区/滚动量回填到该句柄，
                             // 供命中测试与光标滚动跟随使用；DocElement 上报绝对像素高度，
@@ -5987,6 +6457,22 @@ fn handle_key(
         return;
     }
 
+    // 全工作区搜索（Cmd+Shift+F）：在其它浮层之前拦截，保证任何状态下都能打开。
+    // 已展开时重复按下不清空查询（只聚焦面板），避免误覆盖输入。
+    if m.platform && shift && event.keystroke.key.as_str() == "f" {
+        if !view.workspace_search.open {
+            view.open_workspace_search(cx);
+        }
+        cx.stop_propagation();
+        return;
+    }
+
+    // 全工作区搜索展开时：所有按键优先交给搜索面板。
+    if view.workspace_search.open {
+        handle_workspace_search_key(view, event, window, cx);
+        return;
+    }
+
     // 命令面板展开时：所有按键优先交给面板处理
     if view.cmd_palette.open {
         handle_palette_key(view, event, window, cx);
@@ -6183,11 +6669,6 @@ fn handle_key(
     cx.notify();
 }
 
-/// 查找条展开时的按键处理（`handle_key` 在 `find.open` 时全部转到这里）。
-///
-/// 语义：`Enter`/`Shift+Enter` 上/下一个匹配、`Tab` 切换查找/替换框、`Backspace`/`Delete`
-/// 编辑聚焦框、`Esc` 关闭、`Cmd+F` 再按关闭、`Cmd+Enter` 替换当前、`Cmd+Shift+Enter`
-/// 替换全部、`Cmd+Alt+C` 切换大小写敏感；其余 `Cmd` 组合一律忽略（不在查找时改正文）。
 /// 命令面板展开时的按键处理（`handle_key` 在 `cmd_palette.open` 时全部转到这里）。
 ///
 /// 语义：可打印字符追加到查询、`Backspace` 删除、`↑`/`↓` 移动选择、`Enter` 执行、
@@ -6245,6 +6726,77 @@ fn handle_palette_key(
     cx.notify();
 }
 
+/// 全工作区搜索展开时的按键处理（`handle_key` 在 `workspace_search.open` 时转到这里）。
+///
+/// 语义：可打印字符追加查询并即时重扫；`Backspace` 删字符；`↑`/`↓` 选择命中；
+/// `Enter` 打开并定位；`Esc` 关闭；`Cmd+Alt+C` 切换大小写；其余 `Cmd` 组合忽略。
+fn handle_workspace_search_key(
+    view: &mut DocView,
+    event: &KeyDownEvent,
+    _window: &mut Window,
+    cx: &mut Context<DocView>,
+) {
+    let m = &event.keystroke.modifiers;
+    let key = event.keystroke.key.as_str();
+
+    if m.control || m.platform {
+        match key {
+            // Cmd+Shift+F 再按：关闭；其它 Cmd 组合不抢正文编辑。
+            "f" if m.platform && m.shift => view.close_workspace_search(cx),
+            "c" if m.platform && m.alt => {
+                view.workspace_search.case_sensitive = !view.workspace_search.case_sensitive;
+                view.recompute_workspace_hits();
+                cx.notify();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        "escape" => view.close_workspace_search(cx),
+        "up" => {
+            let len = view.workspace_search.hits.len();
+            if len > 0 {
+                view.workspace_search.selected = (view.workspace_search.selected + len - 1) % len;
+            }
+            cx.notify();
+        }
+        "down" => {
+            let len = view.workspace_search.hits.len();
+            if len > 0 {
+                view.workspace_search.selected = (view.workspace_search.selected + 1) % len;
+            }
+            cx.notify();
+        }
+        "enter" | "return" => {
+            view.open_workspace_hit(view.workspace_search.selected, cx);
+        }
+        "backspace" => {
+            view.workspace_search.query.pop();
+            view.recompute_workspace_hits();
+            cx.notify();
+        }
+        "delete" => {
+            view.workspace_search.query.clear();
+            view.recompute_workspace_hits();
+            cx.notify();
+        }
+        k if k.chars().count() == 1 && !k.chars().next().unwrap().is_control() => {
+            // 可打印 ASCII 直键兜底（与命令面板/查找条一致，不走 IME）。
+            view.workspace_search.query.push(k.chars().next().unwrap());
+            view.recompute_workspace_hits();
+            cx.notify();
+        }
+        _ => {}
+    }
+}
+
+/// 查找条展开时的按键处理（`handle_key` 在 `find.open` 时全部转到这里）。
+///
+/// 语义：`Enter`/`Shift+Enter` 上/下一个匹配、`Tab` 切换查找/替换框、`Backspace`/`Delete`
+/// 编辑聚焦框、`Esc` 关闭、`Cmd+F` 再按关闭、`Cmd+Enter` 替换当前、`Cmd+Shift+Enter`
+/// 替换全部、`Cmd+Alt+C` 切换大小写敏感；其余 `Cmd` 组合一律忽略（不在查找时改正文）。
 fn handle_find_key(view: &mut DocView, event: &KeyDownEvent, cx: &mut Context<DocView>) {
     let m = &event.keystroke.modifiers;
     let key = event.keystroke.key.as_str();
@@ -9409,6 +9961,72 @@ mod tests {
             None,
             "定义块之外的落点不跳转"
         );
+    }
+
+    /// 全工作区搜索：逐行命中、行号 1 基、源偏移跨行累计、大小写与 CJK 均正确。
+    #[test]
+    fn workspace_search_text_lines() {
+        use super::search_text_lines;
+
+        let text = "第一行 foo\n第二行 Foo 与 foo\n末行";
+        let hits = search_text_lines(text, "foo", false);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].line_no, 1);
+        assert_eq!(hits[0].line, "第一行 foo");
+        // 第一行 "第一行 " 为 3 个三字节字符 + 1 空格 = 10 字节
+        assert_eq!(hits[0].range, 10..13);
+        assert_eq!(hits[0].source, 10..13);
+
+        // 第二行两个命中，源偏移 = 第一行（含换行）长度 + 行内偏移
+        let line2_start = "第一行 foo\n".len();
+        assert_eq!(hits[1].line_no, 2);
+        assert_eq!(
+            hits[1].source,
+            line2_start + hits[1].range.start..line2_start + hits[1].range.end
+        );
+        assert_eq!(hits[2].line_no, 2);
+
+        // 大小写敏感只命中全小写（第一行与第二行第二个 foo）
+        let strict = search_text_lines(text, "foo", true);
+        assert_eq!(strict.len(), 2);
+        assert_eq!(strict[0].line_no, 1);
+        assert_eq!(strict[1].line_no, 2);
+
+        // 空查询/无命中返回空
+        assert!(search_text_lines(text, "", false).is_empty());
+        assert!(search_text_lines(text, "不存在", false).is_empty());
+    }
+
+    /// 全工作区搜索递归收集所有 Markdown（与展开状态无关），忽略非 Markdown。
+    #[test]
+    fn workspace_search_collects_nested_markdown() {
+        use super::collect_markdown_paths;
+        use mazha_core::Workspace;
+        use mazha_store::{DocPath, FileSystemProvider};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileSystemProvider::open(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+        std::fs::write(dir.path().join("sub/b.markdown"), "b").unwrap();
+        std::fs::write(dir.path().join("sub/deep/c.md"), "c").unwrap();
+
+        let ws = Workspace::new(store);
+        let mut rels = Vec::new();
+        collect_markdown_paths(&ws, &DocPath::root(), &mut rels);
+        // 目录在前、名称排序：sub 先于 a.md，sub/deep 先于 sub/b.markdown。
+        assert_eq!(rels, ["sub/deep/c.md", "sub/b.markdown", "a.md"]);
+    }
+
+    /// 预览截断按字符边界进行，不切坏 UTF-8，并在截断侧补省略号。
+    #[test]
+    fn workspace_search_preview_truncates_by_chars() {
+        use super::{head_chars, tail_chars};
+        assert_eq!(tail_chars("中文测试", 2), "…测试");
+        assert_eq!(head_chars("中文测试", 2), "中文…");
+        assert_eq!(tail_chars("abc", 5), "abc");
+        assert_eq!(head_chars("abc", 5), "abc");
     }
 
     /// 文件树按层级递归：未展开的目录不显示子项，展开后子项带正确深度，

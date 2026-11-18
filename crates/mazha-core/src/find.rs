@@ -35,7 +35,11 @@ pub fn find_all(text: &str, pattern: &str, case_sensitive: bool) -> Vec<Range<us
     let pat: Vec<char> = pattern.chars().collect();
     let pat_len = pat.len();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    for i in 0..=chars.len().saturating_sub(pat_len) {
+    // 模式比文本长时不可能命中；提前返回，避免 `i + pat_len` 越界。
+    if pat_len > chars.len() {
+        return out;
+    }
+    for i in 0..=chars.len() - pat_len {
         let window = &chars[i..i + pat_len];
         if pat
             .iter()
@@ -123,6 +127,9 @@ mod tests {
         assert!(find_all("abc", "", true).is_empty());
         assert!(find_all("abc", "", false).is_empty());
         assert!(find_all("abc", "z", true).is_empty());
+        // 模式比文本长：不能因为窗口越界而 panic。
+        assert!(find_all("末行", "foo", false).is_empty());
+        assert!(find_all("", "a", false).is_empty());
     }
 
     #[test]
