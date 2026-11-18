@@ -7878,6 +7878,79 @@ fn code_block_wrap_width(content_width_total: Pixels, indent: Pixels) -> Pixels 
     (content_width_total - indent - BASE - CODE_TEXT_INSET - CODE_RIGHT_INSET).max(px(48.))
 }
 
+/// 专注模式（D68/D78）的焦点行范围：光标所在段落，或块级 widget 的整块行范围。
+///
+/// 段落按「连续的普通文本行」界定：光标行属于块级 widget（代码/表格/公式/图表/图片）时
+/// 整块高亮；否则向上下扩展相邻行，遇到空行、标题、列表/任务、引用、代码块、表格、
+/// 分割线或块 widget 行即停止——避免把相邻结构块一并高亮。列表项续行、引用内多行
+/// 因缺少块级段落归属信息，仍按单行处理。
+fn focus_line_range(projection: &Projection, line: usize) -> Range<usize> {
+    // 块级 widget 保持整块高亮：编辑态/渲染态切换本来就按块处理。
+    // 普通行：非空、无块级语义、不属于任何块 widget。
+    let is_plain = |idx: usize| -> bool {
+        let Some(l) = projection.lines.get(idx) else {
+            return false;
+        };
+        if l.display_text().trim().is_empty() || projection.block_widget_on_line(idx).is_some() {
+            return false;
+        }
+        let b = &l.block;
+        b.heading.is_none()
+            && b.bullet.is_none()
+            && b.task.is_none()
+            && b.quote_depth == 0
+            && !b.code_block
+            && !b.thematic_break
+            && b.table_line.is_none()
+    };
+    if let Some(widget) = projection.block_widget_on_line(line) {
+        return widget.line_range.clone();
+    }
+    // 光标行本身带块级语义（标题/列表/引用/空行等）时只高亮该行：
+    // 扩展只适用于"连续普通文本行"组成的段落，不能让标题吞掉其后的正文。
+    if !is_plain(line) {
+        return line..line + 1;
+    }
+    let mut start = line;
+    while start > 0 && is_plain(start - 1) {
+        start -= 1;
+    }
+    let mut end = line + 1;
+    while end < projection.lines.len() && is_plain(end) {
+        end += 1;
+    }
+    start..end
+}
+
+/// 打字机模式（D68/D78）的目标滚动 y 偏移：让光标中心维持在视口中间的「中心带」内。
+///
+/// `top` / `row_h` 是光标视觉行的顶边与高度（内容坐标系），`cur_y` 是当前滚动偏移
+/// （∈ `[-max_scroll, 0]`），`viewport_h` 是视口高度。光标中心落在带内时返回 `cur_y`
+/// （不滚动，避免连续移动时视口持续跟随）；越出上/下边界时才把它滚回带边缘，
+/// 最后按内容总高 clamp，保证不与滚动边界打架。
+fn typewriter_scroll_y(
+    top: Pixels,
+    row_h: Pixels,
+    cur_y: Pixels,
+    viewport_h: Pixels,
+    max_scroll: Pixels,
+) -> Pixels {
+    // 半带取视口高的 1/4 → 中心带宽 50%；光标中心当前在内容坐标系中的位置。
+    let center = top + row_h / 2.;
+    let band = viewport_h / 4.;
+    let focus_center = viewport_h / 2.;
+    // 当前滚动下，光标中心在视口坐标系里的位置。
+    let on_screen = center + cur_y;
+    let want = if on_screen < focus_center - band {
+        (focus_center - band) - center
+    } else if on_screen > focus_center + band {
+        (focus_center + band) - center
+    } else {
+        cur_y
+    };
+    want.clamp(-max_scroll, Pixels::ZERO)
+}
+
 /// 引用块单行可排版宽度：在正文宽度基础上再给右侧留出 `QUOTE_TEXT_RIGHT_INSET`。
 ///
 /// 引用文字左缘 = 正文左缘 + 每层引用缩进，底色左缘只比正文左缘缩 4px，
@@ -8685,14 +8758,12 @@ impl Element for DocElement {
                     .iter()
                     .map(|&s| projection.line_of_source(s))
                     .collect();
-                // 专注模式（D68）：仅当前主光标所在块正常显示，其余行淡化。
-                let focus_range: Option<std::ops::Range<usize>> = if focus_mode {
-                    let line = projection.line_of_source(caret);
-                    if let Some(w) = projection.block_widget_on_line(line) {
-                        Some(w.line_range.clone())
-                    } else {
-                        Some(line..line + 1)
-                    }
+                // 专注模式（D68/D78）：仅当前段落/块正常显示，其余行淡化。
+                let focus_range: Option<Range<usize>> = if focus_mode {
+                    Some(focus_line_range(
+                        projection,
+                        projection.line_of_source(caret),
+                    ))
                 } else {
                     None
                 };
@@ -9654,9 +9725,8 @@ impl Element for DocElement {
                         let cur = sc.offset(); // y ∈ [-max_offset, 0]
                         let max_scroll = (total_height - viewport_h).max(Pixels::ZERO);
                         let want = if v.settings.typewriter_mode {
-                            // 打字机模式（D68）：尽量将当前光标行居中。
-                            let center = top + row_h / 2.;
-                            -(center - viewport_h / 2.)
+                            // 打字机模式（D68/D78）：光标行在中心带内不滚动，越出才滚回带边缘。
+                            typewriter_scroll_y(top, row_h, cur.y, viewport_h, max_scroll)
                         } else {
                             const MARGIN: Pixels = px(8.);
                             // 行完全落在上下留白内才不动；否则把它拉回留白内（最少滚动）
@@ -10448,11 +10518,12 @@ mod tests {
         Document, MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings,
         app_menus, block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
         chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
-        copy_entry, dropped_link_markdown, footnote_jump, hide_text_runs, horizontal_step,
-        inline_links, inline_reveals, is_image_path, is_markdown_file, join_math_body,
-        markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom, nearest_cell,
-        oblique, plan_imports, quote_block_wrap_width, render_chart_preview, render_math_preview,
-        reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs, unique_import_path,
+        copy_entry, dropped_link_markdown, focus_line_range, footnote_jump, hide_text_runs,
+        horizontal_step, inline_links, inline_reveals, is_image_path, is_markdown_file,
+        join_math_body, markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom,
+        nearest_cell, oblique, plan_imports, quote_block_wrap_width, render_chart_preview,
+        render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
+        typewriter_scroll_y, unique_import_path,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -10462,6 +10533,58 @@ mod tests {
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    /// 专注模式（D78）：中文段落按源文本手动换行时整段高亮，块级 widget 整块高亮。
+    #[test]
+    fn focus_mode_highlights_whole_paragraph_and_block_widget() {
+        let text = "第一段第一行\n第一段第二行\n第一段第三行\n\n# 标题\n后续文字\n\n```rust\nfn main() {}\n```\n\n尾段";
+        let mut doc = Document::new(text);
+        let p = doc.projection();
+        let line = |needle: &str| p.line_of_source(text.find(needle).expect(needle));
+
+        // 段落内三行互相扩展，遇空行/标题截断。
+        assert_eq!(focus_line_range(&p, line("第一段第二行")), 0..3);
+        // 标题自身、标题后的普通行各自独立（相邻是标题/空行）。
+        assert_eq!(focus_line_range(&p, line("# 标题")), 4..5);
+        assert_eq!(focus_line_range(&p, line("后续文字")), 5..6);
+        // 代码块属于块 widget：整块（围栏行到闭合围栏）高亮。
+        assert_eq!(focus_line_range(&p, line("fn main()")), 7..10);
+        // 末尾段落独立成段。
+        assert_eq!(focus_line_range(&p, line("尾段")), 11..12);
+    }
+
+    /// 打字机模式（D78）：光标中心在中心带内不滚动，越出带才滚回带边缘并受边界 clamp。
+    #[test]
+    fn typewriter_scroll_stays_in_center_band() {
+        let viewport = px(800.);
+        let row = px(20.);
+        let max = px(2000.);
+        // 光标中心在 300（带 [200, 600] 内）→ 保持当前偏移 -100，不强制居中。
+        assert_eq!(
+            typewriter_scroll_y(px(290.), row, px(-100.), viewport, max),
+            px(-100.)
+        );
+        // 光标中心在 250（仍带内）→ 同样不动。
+        assert_eq!(
+            typewriter_scroll_y(px(340.), row, px(-100.), viewport, max),
+            px(-100.)
+        );
+        // 光标中心在 690（带下方）→ 滚到带底 600，偏移 = 600 - 700 = -100。
+        assert_eq!(
+            typewriter_scroll_y(px(690.), row, px(-10.), viewport, max),
+            px(-100.)
+        );
+        // 滚动上限收紧到 50px 时 clamp 生效。
+        assert_eq!(
+            typewriter_scroll_y(px(690.), row, px(-10.), viewport, px(50.)),
+            px(-50.)
+        );
+        // 光标中心在带上方时 want 为正，被滚动上界 clamp 到 0（内容不能上移露白）。
+        assert_eq!(
+            typewriter_scroll_y(px(90.), row, px(-10.), viewport, max),
+            px(0.)
+        );
+    }
 
     #[test]
     fn app_menus_include_standard_groups_and_theme_checks() {
