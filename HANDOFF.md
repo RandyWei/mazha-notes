@@ -116,7 +116,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 148 条）
 
 ```
-PENDING feat(desktop): 中文斜体合成优化，缓存轮廓并校正绘制原点（0.1.105，D79）
+dfe036b feat(desktop): 中文斜体合成优化，缓存轮廓并校正绘制原点（0.1.105，D79）
 2b5efe3 feat(desktop): 专注段落粒度与打字机中心带（0.1.104，D78）
 df78360 fix(desktop): Mermaid 图表去背景边框并修正示例连线（0.1.103，D77）
 9b6af0c feat(desktop): Mermaid 图表真实渲染，替换块级占位面板（0.1.102，D77）
@@ -213,7 +213,7 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 148（含本次）。
 
-- 2026-11-18（`PENDING`，0.1.105）：**中文斜体合成优化（D43 遗留，D79）**：① **轮廓缓存**——`oblique::cached_path` 按 `(字符, 字号位模式)` 线程局部缓存**本地坐标**（原点 0、基线 0、已施加 12° 剪切）的 `Path<Pixels>`，失败结果同样缓存；paint 阶段用 `place_path` 仅平移顶点与包围盒（不重取 CoreText 轮廓、不重新三角化），跨帧/跨块/跨文档复用，字号变化自动落到新键。选线程局部而非 `BlockGeom` 是因为布局每帧重建，挂在块上无法跨帧复用。② **原点校正**——自绘起点改为与 gpui `paint_line`/`paint_glyph` 一致：x 沿用 `position_for_index`（软换行已扣行首偏移），y 叠加从 `shaped.runs()` 中按首个 `index >= byte` 取到的 `glyph.position.y`（`glyph_y_for_index`），再按 `window.scale_factor()` 做 `(abs(v)-0.5).ceil().copysign(v)` 设备像素对齐（`snap_origin`），修掉透明占位 run 与自绘轮廓不足 1px 的错位。③ 未选 Metal 自定义着色器：需重写 gpui 场景管线、风险高且无法纯函数验证。核心 / `mazha-md` / 导出 / 其它平台不改。新增 4 条桌面纯函数单测（缓存复用同指针且字号变化重取、路径平移只改几何、DPR 对齐含负坐标与 0.5 边界、字形 y 判据），桌面 74 项、根 workspace 548 项，根与桌面 fmt/clippy/test/build 全绿。**限制/待验**：抗锯齿仍是 gpui 路径 st coverage 而非 CoreText 字形栅格化，笔画边缘不可能逐像素一致；字形仍按固定 `CJK_FALLBACKS` 顺序取，个别标点可能与 CoreText 级联字面不同；截图环境不可用（`screencapture` 取窗口空/全黑），未做实机目视验收，待用户对比 Typora 后决定是否继续打磨。
+- 2026-11-18（`dfe036b`，0.1.105）：**中文斜体合成优化（D43 遗留，D79）**：① **轮廓缓存**——`oblique::cached_path` 按 `(字符, 字号位模式)` 线程局部缓存**本地坐标**（原点 0、基线 0、已施加 12° 剪切）的 `Path<Pixels>`，失败结果同样缓存；paint 阶段用 `place_path` 仅平移顶点与包围盒（不重取 CoreText 轮廓、不重新三角化），跨帧/跨块/跨文档复用，字号变化自动落到新键。选线程局部而非 `BlockGeom` 是因为布局每帧重建，挂在块上无法跨帧复用。② **原点校正**——自绘起点改为与 gpui `paint_line`/`paint_glyph` 一致：x 沿用 `position_for_index`（软换行已扣行首偏移），y 叠加从 `shaped.runs()` 中按首个 `index >= byte` 取到的 `glyph.position.y`（`glyph_y_for_index`），再按 `window.scale_factor()` 做 `(abs(v)-0.5).ceil().copysign(v)` 设备像素对齐（`snap_origin`），修掉透明占位 run 与自绘轮廓不足 1px 的错位。③ 未选 Metal 自定义着色器：需重写 gpui 场景管线、风险高且无法纯函数验证。核心 / `mazha-md` / 导出 / 其它平台不改。新增 4 条桌面纯函数单测（缓存复用同指针且字号变化重取、路径平移只改几何、DPR 对齐含负坐标与 0.5 边界、字形 y 判据），桌面 74 项、根 workspace 548 项，根与桌面 fmt/clippy/test/build 全绿。**限制/待验**：抗锯齿仍是 gpui 路径 st coverage 而非 CoreText 字形栅格化，笔画边缘不可能逐像素一致；字形仍按固定 `CJK_FALLBACKS` 顺序取，个别标点可能与 CoreText 级联字面不同；截图环境不可用（`screencapture` 取窗口空/全黑），未做实机目视验收，待用户对比 Typora 后决定是否继续打磨。
 
 - 2026-11-18（`2b5efe3`，0.1.104）：**专注/打字机模式打磨（D68 首轮细化，D78）**：① **专注范围改段落粒度**——原先只淡化「当前单个逻辑行」，中文写作一段多行（源文本手动换行）会被相邻行误淡化；新增桌面纯函数 `focus_line_range`：光标行属于块级 widget（代码/表格/公式/图表/图片）时整块高亮，普通行向上下扩展连续文本行，遇空行/标题/列表/任务/引用/代码块/表格/分割线/块 widget 行即截断，标题等带块级语义的行只高亮自身（避免标题吞掉其后正文）。② **打字机滚动改中心带**——原先每次光标行几何变化都强制居中、连续移动时视口持续跟随；新增纯函数 `typewriter_scroll_y`：光标中心落在视口中间 50%（半带 = 视口高 1/4）内不滚动，越出才滚回带边缘；滚动上界 clamp 仍把正偏移截到 0（内容不上移露白），大纲/查找跳转置顶（D59）与边界 clamp 不变。核心 / `mazha-md` / 导出 / 源码模式不改；新增 2 条桌面纯函数单测（70 项），根 workspace 548 项、桌面 fmt/clippy/test/build 全绿。已由用户实机验收通过。
 
