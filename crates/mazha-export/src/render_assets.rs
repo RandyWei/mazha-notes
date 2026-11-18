@@ -12,7 +12,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use mazha_md::{Block, BlockKind, SpanKind, SpanRole, parse};
+use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -162,6 +162,39 @@ fn chart_block_body(source: &str, block: &Block) -> String {
     lines.join("\n")
 }
 
+/// 纯函数：计算块内某个行内公式 `Math` 片段的**完整替换区间**。
+///
+/// `mazha-md` 把 `$x^2$` 解析为三个首尾相接的片段：开 `$`（`MathMarker`）、
+/// 公式体（`Math`）、闭 `$`（`MathMarker`）。D84 只替换公式体会残留 `$…$`，
+/// 导出器二次解析该副本时把 `![公式](dest)` 当公式字面输出（用户实机反馈，D85），
+/// 因此这里把区间扩到覆盖整对定界符，替换后不再有 `$` 包裹图片语法。
+///
+/// 边界：只合并与该 `Math` 片段**首尾相接**且长度恰为 1 的前后 `MathMarker`，
+/// 既避免误伤其它 marker，也避免把相邻公式的定界符跨公式合并进来；
+/// 不满足条件时退回公式体原区间（保留既有降级行为）。
+fn inline_math_range(spans: &[SyntaxSpan], index: usize) -> Range<usize> {
+    let math = &spans[index];
+    let mut start = math.range.start;
+    let mut end = math.range.end;
+    // 前一定界符：必须紧接公式体起点、角色为 MathMarker 且恰占一个字节（单个 `$`）。
+    if let Some(prev) = index.checked_sub(1).and_then(|i| spans.get(i))
+        && prev.role == SpanRole::MathMarker
+        && prev.range.end == start
+        && prev.range.end - prev.range.start == 1
+    {
+        start = prev.range.start;
+    }
+    // 后一定界符：必须紧接公式体终点、角色为 MathMarker 且恰占一个字节（单个 `$`）。
+    if let Some(next) = spans.get(index + 1)
+        && next.role == SpanRole::MathMarker
+        && next.range.start == end
+        && next.range.end - next.range.start == 1
+    {
+        end = next.range.end;
+    }
+    start..end
+}
+
 /// 递归收集块及其子块中的渲染请求。
 fn collect_from_blocks(source: &str, blocks: &[Block], out: &mut Vec<RenderRequest>) {
     for block in blocks {
@@ -187,13 +220,14 @@ fn collect_from_blocks(source: &str, blocks: &[Block], out: &mut Vec<RenderReque
                 );
             }
             _ => {
-                // 行内公式只取文本片段（`$` 定界符是 Marker，不参与替换）。
-                for sp in &block.spans {
+                // 行内公式：替换区间覆盖整对 `$…$`（含两端 MathMarker，D85），
+                // 键仍取纯公式体，保证与桌面 RaTeX 渲染键一致（不能把 `$` 塞进 key）。
+                for (i, sp) in block.spans.iter().enumerate() {
                     if sp.kind == SpanKind::Text && sp.role == SpanRole::Math {
                         push_request(
                             out,
                             RenderKind::Math,
-                            sp.range.clone(),
+                            inline_math_range(&block.spans, i),
                             source[sp.range.clone()].to_string(),
                         );
                     }
@@ -307,6 +341,8 @@ mod tests {
         );
         assert_eq!(requests[2].kind, RenderKind::Chart);
         assert_eq!(requests[2].key, "graph LR\nA-->B");
+        // 行内请求也覆盖整对 `$…$`（D85），与块级公式/图表一致不残留定界符。
+        assert_eq!(&src[requests[0].range.clone()], "$x^2$");
         // 块级请求覆盖 `$$`/围栏，替换后不会残留定界符。
         assert!(src[requests[1].range.clone()].contains("$$"));
         assert!(src[requests[2].range.clone()].contains("```mermaid"));
@@ -412,6 +448,158 @@ mod tests {
         let mut assets = RenderAssets::new();
         assets.insert_math("x", SVG);
         let prepared = prepare_renderables(src, &assets, AssetTarget::VirtualFile);
+        assert_eq!(prepared.source, src);
+        assert!(prepared.files.is_empty());
+    }
+
+    /// 递归收集解析结果里的全部片段，便于断言行内公式是否变成图片 Widget。
+    fn all_spans(blocks: &[Block]) -> Vec<SyntaxSpan> {
+        let mut out = Vec::new();
+        for block in blocks {
+            out.extend(block.spans.iter().cloned());
+            out.extend(all_spans(&block.children));
+        }
+        out
+    }
+
+    #[test]
+    fn inline_math_range_merges_only_adjacent_single_dollar_markers() {
+        // 标准三片段 `$x$`：两侧定界符都应并入区间。
+        let spans = vec![
+            SyntaxSpan::marker(0..1, SpanRole::MathMarker),
+            SyntaxSpan::text(1..2, SpanRole::Math),
+            SyntaxSpan::marker(2..3, SpanRole::MathMarker),
+        ];
+        assert_eq!(inline_math_range(&spans, 1), 0..3);
+        // 缺闭定界符：只扩左侧，不凭空造右侧区间。
+        let missing_close = vec![
+            SyntaxSpan::marker(0..1, SpanRole::MathMarker),
+            SyntaxSpan::text(1..2, SpanRole::Math),
+        ];
+        assert_eq!(inline_math_range(&missing_close, 1), 0..2);
+        // 相邻片段是其它 marker（如加粗）而非 `$`：不合并，避免误伤。
+        let other_markers = vec![
+            SyntaxSpan::marker(0..2, SpanRole::Strong),
+            SyntaxSpan::text(2..3, SpanRole::Math),
+            SyntaxSpan::marker(3..5, SpanRole::Strong),
+        ];
+        assert_eq!(inline_math_range(&other_markers, 1), 2..3);
+        // MathMarker 长度不为 1（`$$`）：不合并，防止跨块级定界符。
+        let double_marker = vec![
+            SyntaxSpan::marker(0..2, SpanRole::MathMarker),
+            SyntaxSpan::text(2..3, SpanRole::Math),
+            SyntaxSpan::marker(3..5, SpanRole::MathMarker),
+        ];
+        assert_eq!(inline_math_range(&double_marker, 1), 2..3);
+        // 前置 marker 不与公式体首尾相接：不合并。
+        let gapped = vec![
+            SyntaxSpan::marker(0..1, SpanRole::MathMarker),
+            SyntaxSpan::text(1..2, SpanRole::Normal),
+            SyntaxSpan::text(2..3, SpanRole::Math),
+        ];
+        assert_eq!(inline_math_range(&gapped, 2), 2..3);
+    }
+
+    #[test]
+    fn inline_math_request_range_covers_both_delimiters() {
+        let src = "$x^2$";
+        let requests = collect_render_requests(src);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].kind, RenderKind::Math);
+        // 键仍为纯公式体（不含 `$`），与桌面 RaTeX 渲染键一致。
+        assert_eq!(requests[0].key, "x^2");
+        // 区间覆盖整个 `$…$`，替换后不再残留 `$`。
+        assert_eq!(requests[0].range, 0..src.len());
+        assert_eq!(&src[requests[0].range.clone()], "$x^2$");
+        let mut assets = RenderAssets::new();
+        assets.insert_math("x^2", SVG);
+        let prepared = prepare_renderables(src, &assets, AssetTarget::VirtualFile);
+        assert!(!prepared.source.contains('$'), "{}", prepared.source);
+    }
+
+    #[test]
+    fn inline_math_becomes_image_widget_after_prepare() {
+        let src = "计算 $x^2$ 完毕";
+        let mut assets = RenderAssets::new();
+        assets.insert_math("x^2", SVG);
+        let prepared = prepare_renderables(src, &assets, AssetTarget::DataUri);
+        // 替换后没有 `$` 残留；图片语法不被 `$…$` 包裹。
+        assert!(!prepared.source.contains('$'), "{}", prepared.source);
+        assert!(
+            prepared
+                .source
+                .contains("![公式](data:image/svg+xml;base64,"),
+            "{}",
+            prepared.source
+        );
+        // 重新解析 prepared 副本：图片语法必须被识别为 Widget/ImageMarker，
+        // 而不是 Math 字面（这正是用户实机看到的回归现象）。
+        let spans = all_spans(&parse(&prepared.source));
+        assert!(
+            spans
+                .iter()
+                .any(|s| { s.kind == SpanKind::Widget && s.role == SpanRole::ImageMarker }),
+            "应识别为图片 Widget：{spans:?}"
+        );
+        assert!(
+            !spans.iter().any(|s| s.role == SpanRole::Math),
+            "不应再有行内公式字面：{spans:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_inline_math_on_one_line_are_disjoint() {
+        let src = "行内 $a$ 与 $b$ 结束";
+        let requests = collect_render_requests(src);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let a = src.find("$a$").expect("应有 $a$");
+        let b = src.find("$b$").expect("应有 $b$");
+        assert_eq!(requests[0].range, a..a + 3);
+        assert_eq!(requests[1].range, b..b + 3);
+        assert_eq!(requests[0].key, "a");
+        assert_eq!(requests[1].key, "b");
+        // 区间不重叠，也不覆盖两个公式之间的文字。
+        assert!(requests[0].range.end <= requests[1].range.start);
+        assert!(!requests[0].range.contains(&b));
+        assert!(!requests[1].range.contains(&a));
+        let mut assets = RenderAssets::new();
+        assets.insert_math("a", SVG);
+        assets.insert_math("b", SVG);
+        let prepared = prepare_renderables(src, &assets, AssetTarget::DataUri);
+        assert!(!prepared.source.contains('$'), "{}", prepared.source);
+        assert_eq!(
+            prepared
+                .source
+                .matches("data:image/svg+xml;base64,")
+                .count(),
+            2,
+            "{}",
+            prepared.source
+        );
+        let spans = all_spans(&parse(&prepared.source));
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|s| s.kind == SpanKind::Widget && s.role == SpanRole::ImageMarker)
+                .count(),
+            2,
+            "两个公式都应变成图片 Widget：{spans:?}"
+        );
+        assert!(
+            !spans.iter().any(|s| s.role == SpanRole::Math),
+            "不应残留公式字面：{spans:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_inline_math_keeps_literal() {
+        // 空白/非法公式不构成请求，导出副本原样保留、不中断。
+        let src = "空公式 $ $ 与跨行 $a\nb$ 保留字面\n";
+        let requests = collect_render_requests(src);
+        assert!(requests.is_empty(), "{requests:?}");
+        let mut assets = RenderAssets::new();
+        assets.insert_math("a", SVG);
+        let prepared = prepare_renderables(src, &assets, AssetTarget::DataUri);
         assert_eq!(prepared.source, src);
         assert!(prepared.files.is_empty());
     }
