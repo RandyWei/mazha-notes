@@ -10320,9 +10320,11 @@ impl Element for DocElement {
                     cx,
                 );
             }
-            // 合成斜体：在文本绘制后填充倾斜字形。
-            // 轮廓按 (字符, 字号) 缓存为本地坐标路径（D79），无需每帧逐字取 CoreText；
-            // 绘制原点按 gpui 原生字形公式校正：叠加形状化字形的 y 微调 + 设备像素对齐。
+            // 合成斜体：在文本绘制后叠加倾斜字形。
+            // 主路径（D80）：CoreText 直接栅格化剪切字形成 DPR 位图，经 paint_image 1:1 叠加，
+            //   避免 gpui 路径仅 ≤4× MSAA、无灰阶 AA/字干加粗造成的「发虚」；
+            // 回退（D79）：位图不可用时仍用缓存轮廓 paint_path，保证字形不消失。
+            // 两条路径共用同一字形原点公式（y 微调 + 设备像素对齐），且不改透明占位 advance。
             if !block.oblique_spans.is_empty() {
                 let line_text = block.shaped.text.as_str();
                 let font_size: f32 = block.font_size.into();
@@ -10352,7 +10354,22 @@ impl Element for DocElement {
                             // 自绘路径必须落同一栅格，消除与透明占位 run 不足 1px 的错位。
                             let origin =
                                 oblique::snap_origin(point(text_x + p.x, baseline_y), scale);
-                            if let Some(local) = oblique::cached_path(ch, font_size) {
+                            if let Some(glyph) =
+                                oblique::cached_glyph(ch, font_size, scale, span.color)
+                            {
+                                // 位图的尺寸/原点都是整数设备像素，放置只做整数比换算；
+                                // texel↔pixel 1:1，不被线性采样二次模糊。
+                                let place = glyph.placement(origin);
+                                let _ = window.paint_image(
+                                    Bounds::new(place.origin, place.size),
+                                    Bounds::new(place.origin, place.size),
+                                    Corners::default(),
+                                    glyph.image.clone(),
+                                    0,
+                                    false,
+                                );
+                            } else if let Some(local) = oblique::cached_path(ch, font_size) {
+                                // 栅格化失败的兜底：质量回到 D79 水平，但不至于缺字。
                                 window.paint_path(oblique::place_path(&local, origin), span.color);
                             }
                         }
