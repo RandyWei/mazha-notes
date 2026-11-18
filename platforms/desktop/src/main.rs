@@ -54,6 +54,9 @@ use mazha_core::{
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit, table_cells,
 };
+use mazha_export::{
+    AssetTarget, RenderAssets, RenderKind, collect_render_requests, prepare_renderables,
+};
 use mazha_md::{FootnoteIndex, MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, Entry, EntryKind, FileSystemProvider};
@@ -2247,20 +2250,127 @@ fn export_title(doc_path: Option<&Path>) -> String {
         .unwrap_or_else(|| "码札文档".to_string())
 }
 
+/// 导出状态栏消息的三态（D83）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportStatusKind {
+    /// 后台任务进行中。
+    Progress,
+    /// 文件已成功写入。
+    Success,
+    /// 渲染或写文件失败。
+    Failure,
+}
+
+/// 状态栏展示的一次导出状态（`seq` 用于过期清理，避免旧定时器清掉新导出）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExportStatus {
+    seq: u64,
+    kind: ExportStatusKind,
+    text: String,
+}
+
+/// 纯函数：导出格式在状态消息中的短名。
+fn export_format_label(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Html => "HTML",
+        ExportFormat::Pdf => "PDF",
+        ExportFormat::Docx => "DOCX",
+        ExportFormat::Epub => "EPUB",
+    }
+}
+
+/// 纯函数：导出进行中的状态栏文案。
+fn export_progress_text(format: ExportFormat) -> String {
+    format!("正在导出 {}…", export_format_label(format))
+}
+
+/// 纯函数：导出成功的状态栏文案（带目标文件名，给出明确结果反馈）。
+fn export_success_text(format: ExportFormat, file_name: &str) -> String {
+    format!("已导出 {}：{}", export_format_label(format), file_name)
+}
+
+/// 纯函数：导出失败的状态栏文案（保留底层原因，便于用户判断下一步）。
+fn export_failure_text(format: ExportFormat, reason: &str) -> String {
+    format!("导出 {} 失败：{}", export_format_label(format), reason)
+}
+
+/// 纯函数：定时清理是否仍然匹配当前状态（仅当前序号才允许清空）。
+fn export_status_should_clear(status: Option<&ExportStatus>, seq: u64) -> bool {
+    status.is_some_and(|status| status.seq == seq)
+}
+
 /// 把 Markdown 渲染为所选格式的字节（D82；不含对话框/文件系统写入）。
 ///
-/// 各 `to_*` API 内部已做脚注规整（D69/D81），这里不重复调用 `footnotes::prepare`。
-/// PDF 用 `PdfExporter::with_options` 传 `base_dir`，保证真实文档的相对路径图片可解析；
-/// 缺图/远程图片由导出 crate 在独立副本里降级为占位文字（见 `mazha-export::pdf`）。
+/// 保留旧签名供既有测试使用；D84 起内部委托给带资产的
+/// [`render_export_with_assets`]，传空资产时行为与原先完全一致。
+#[cfg(test)]
 fn render_export(
     format: ExportFormat,
     markdown: &str,
     title: &str,
     base_dir: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
+    render_export_with_assets(format, markdown, title, base_dir, &RenderAssets::new())
+}
+
+/// 导出公式 SVG 的字号（px/em）。字形轮廓内嵌，不依赖阅读端字体。
+const EXPORT_MATH_FONT_SIZE: f32 = 32.0;
+
+/// 把 mermaid DSL 渲染为自包含 SVG 文本（D84）。
+///
+/// 与编辑区预览共用 modern 主题，但把背景设为 transparent：导出的 HTML 可能是浅色，
+/// EPUB/PDF 阅读器主题也不可控，透明底能避免难看的白色方块。
+/// `None` 表示 DSL 非法或渲染失败，此时导出侧保留原字面（见 `prepare_renderables`）。
+fn render_chart_svg(src: &str) -> Option<String> {
+    let mut theme = mermaid_rs_renderer::Theme::modern();
+    theme.background = "transparent".to_string();
+    let opts = mermaid_rs_renderer::RenderOptions {
+        theme,
+        ..Default::default()
+    };
+    let svg = mermaid_rs_renderer::render_with_options(src, opts).ok()?;
+    (!svg.trim().is_empty()).then_some(svg)
+}
+
+/// 收集并渲染当前 Markdown 中全部公式/图表，产出导出用 SVG 资产表（D84）。
+///
+/// 复用 `mazha-export` 的纯收集函数保证「收集到的区间/键」与替换阶段一致；
+/// 渲染失败的条目不写入，后续 `prepare_renderables` 会保留原字面而非让导出失败。
+fn collect_render_assets(markdown: &str) -> RenderAssets {
+    let mut assets = RenderAssets::new();
+    for request in collect_render_requests(markdown) {
+        let svg = match request.kind {
+            RenderKind::Math => {
+                ratex_gpui::render::render_latex_to_svg(&request.key, EXPORT_MATH_FONT_SIZE)
+            }
+            RenderKind::Chart => render_chart_svg(&request.key),
+        };
+        let Some(svg) = svg else { continue };
+        let key = request.key;
+        match request.kind {
+            RenderKind::Math => assets.insert_math(key, svg),
+            RenderKind::Chart => assets.insert_chart(key, svg),
+        }
+    }
+    assets
+}
+
+/// 带渲染资产的 Markdown → 目标格式字节（D84；无对话框/文件写入）。
+///
+/// HTML/EPUB 把 SVG 以 base64 data URI 内嵌进既有 `<img>` 通道；PDF 把 SVG 交给
+/// `PdfExporter` 的 Typst `World` 充当内存虚拟文件；DOCX（`docx` crate 无图片写入 API）
+/// 仍保留字面 TeX/mermaid，作为已记录的限制，而不是半成品图片。
+fn render_export_with_assets(
+    format: ExportFormat,
+    markdown: &str,
+    title: &str,
+    base_dir: Option<&Path>,
+    assets: &RenderAssets,
+) -> Result<Vec<u8>, String> {
     match format {
         ExportFormat::Html => {
-            Ok(mazha_export::to_html_document(markdown, title, None).into_bytes())
+            let prepared = prepare_renderables(markdown, assets, AssetTarget::DataUri);
+            Ok(mazha_export::to_html_document(&prepared.source, title, None).into_bytes())
         }
         ExportFormat::Pdf => {
             let options = mazha_export::PdfExportOptions {
@@ -2268,7 +2378,7 @@ fn render_export(
                 ..Default::default()
             };
             let pdf = mazha_export::PdfExporter::with_options(&options)
-                .export(markdown)
+                .export_with_assets(markdown, assets)
                 .map_err(|err| err.to_string())?;
             // 字体回退等警告不影响成文，只写 stderr 供排障
             for warning in &pdf.warnings {
@@ -2277,7 +2387,10 @@ fn render_export(
             Ok(pdf.bytes)
         }
         ExportFormat::Docx => mazha_export::to_docx(markdown).map_err(|err| err.to_string()),
-        ExportFormat::Epub => mazha_export::to_epub(markdown, title).map_err(|err| err.to_string()),
+        ExportFormat::Epub => {
+            let prepared = prepare_renderables(markdown, assets, AssetTarget::DataUri);
+            mazha_export::to_epub(&prepared.source, title).map_err(|err| err.to_string())
+        }
     }
 }
 
@@ -2709,6 +2822,12 @@ struct DocView {
     table_row_heights: HashMap<usize, Pixels>,
     /// 正在拖动的表格内部列边界。
     table_resizing: Option<TableResizeState>,
+    /// 底部状态栏的导出反馈（D83：`None` 时显示默认快捷键提示）。
+    export_status: Option<ExportStatus>,
+    /// 导出状态序号：每次开始导出递增，供 6s 自动清理判断是否为同一条状态。
+    export_status_seq: u64,
+    /// 导出完成后的自动清理定时任务（替换即取消上一个）。
+    _export_status_task: Task<()>,
 }
 
 impl DocView {
@@ -2840,6 +2959,9 @@ impl DocView {
             table_column_widths: HashMap::new(),
             table_row_heights: HashMap::new(),
             table_resizing: None,
+            export_status: None,
+            export_status_seq: 0,
+            _export_status_task: Task::ready(()),
         }
     }
 
@@ -2997,6 +3119,59 @@ impl DocView {
                     break;
                 }
             }
+        })
+    }
+
+    /// 开始一次导出：状态栏立即切到「正在导出…」，并取消上一条自动清理。
+    ///
+    /// 返回本次序号；后台完成回调据此写入结果，避免并发/连续导出时旧结果覆盖新状态。
+    fn begin_export_status(&mut self, format: ExportFormat, cx: &mut Context<Self>) -> u64 {
+        self.export_status_seq = self.export_status_seq.wrapping_add(1);
+        self._export_status_task = Task::ready(());
+        self.export_status = Some(ExportStatus {
+            seq: self.export_status_seq,
+            kind: ExportStatusKind::Progress,
+            text: export_progress_text(format),
+        });
+        cx.notify();
+        self.export_status_seq
+    }
+
+    /// 结束一次导出：仅当仍是同一序号才更新结果并启动 6s 自动清理。
+    fn finish_export_status(
+        &mut self,
+        seq: u64,
+        kind: ExportStatusKind,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !export_status_should_clear(self.export_status.as_ref(), seq) {
+            return;
+        }
+        self.export_status = Some(ExportStatus { seq, kind, text });
+        self._export_status_task = Self::spawn_export_status_clear(seq, cx);
+        cx.notify();
+    }
+
+    /// 用户取消保存对话框时立即清除「正在导出…」；序号不匹配则不动，避免误清新状态。
+    fn clear_export_status(&mut self, seq: u64, cx: &mut Context<Self>) {
+        if export_status_should_clear(self.export_status.as_ref(), seq) {
+            self.export_status = None;
+            self._export_status_task = Task::ready(());
+            cx.notify();
+        }
+    }
+
+    /// 6s 后清除状态；若期间开始了新导出（序号不匹配）则本次清理自然作废。
+    fn spawn_export_status_clear(seq: u64, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(6)).await;
+            let _ = this.update(cx, |view, cx| {
+                if export_status_should_clear(view.export_status.as_ref(), seq) {
+                    view.export_status = None;
+                    cx.notify();
+                }
+            });
         })
     }
 
@@ -4665,12 +4840,13 @@ impl DocView {
         footnote_jump(&self.doc.footnote_index(), &run.text, src)
     }
 
-    /// 导出当前文档为所选格式并保存到文件（D82）。
+    /// 导出当前文档为所选格式并保存到文件（D82、D83、D84）。
     ///
-    /// 异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框嵌套泵
-    /// runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。对话框参数与渲染全部由
-    /// 纯函数 `export_target`/`export_title`/`pdf_base_dir`/`render_export` 算出，
-    /// 这里只负责取当前视图快照、驱动异步对话框与写文件。
+    /// 异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41）只负责取路径；随后把
+    /// 「公式/图表渲染 + 文档排版 + 写文件」整体放到 `background_executor`，前台
+    /// 仅接收结果并更新状态栏，因此导出期间窗口仍可编辑/滚动（不弹全局 Loading）。
+    /// 状态栏依次显示「正在导出…」「已导出 文件名」或「失败原因」，6s 后自动清除；
+    /// 保存对话框被取消则立即清除进行中状态。
     fn export_document(
         &mut self,
         format: ExportFormat,
@@ -4678,6 +4854,8 @@ impl DocView {
         cx: &mut Context<Self>,
     ) {
         self.begin_dialog(cx);
+        // 对话框打开前就标记进行中，取消时再清除（见下）。
+        let seq = self.begin_export_status(format, cx);
         // 先把依赖当前视图的参数算好，避免 async 闭包里借 `self`。
         let markdown = self.doc.text().to_string();
         let title = export_title(self.path.as_deref());
@@ -4692,20 +4870,50 @@ impl DocView {
                 .await;
             let _ = this.update(cx, |view, cx| {
                 view.dialog_open = false;
+                if picked.is_none() {
+                    view.clear_export_status(seq, cx);
+                }
                 cx.notify();
             });
             let Some(handle) = picked else { return };
             let path = handle.path().to_path_buf();
-            match render_export(format, &markdown, &title, base_dir.as_deref()) {
-                Ok(bytes) => {
-                    if let Err(e) = std::fs::write(&path, &bytes) {
-                        eprintln!("导出 {} 失败：{}", target.extension.to_uppercase(), e);
-                    }
+            let display_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            // CPU 密集的渲染/排版与文件写入全部在后台线程，前台只 await 结果。
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let assets = collect_render_assets(&markdown);
+                    let bytes = render_export_with_assets(
+                        format,
+                        &markdown,
+                        &title,
+                        base_dir.as_deref(),
+                        &assets,
+                    )?;
+                    std::fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+                    Ok::<(), String>(())
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(()) => view.finish_export_status(
+                    seq,
+                    ExportStatusKind::Success,
+                    export_success_text(format, &display_name),
+                    cx,
+                ),
+                Err(err) => {
+                    eprintln!("{} 导出失败：{}", target.extension.to_uppercase(), err);
+                    view.finish_export_status(
+                        seq,
+                        ExportStatusKind::Failure,
+                        export_failure_text(format, &err),
+                        cx,
+                    );
                 }
-                Err(e) => {
-                    eprintln!("{} 导出失败：{}", target.extension.to_uppercase(), e);
-                }
-            }
+            });
         })
         .detach();
     }
@@ -6451,7 +6659,23 @@ impl Render for DocView {
             .border_color(palette.border)
             .bg(palette.subtle)
             .children(tbc);
-        // 底部状态栏：文件信息 + 行数/光标 + 常用快捷键，横跨整个窗口。
+        // D83：导出进行中/完成/失败时，状态栏右侧让出快捷键提示位展示反馈；
+        // 失败用强调色突出，其余状态用链接色，6s 后自动回到默认提示。
+        let (export_hint, export_hint_color) = match &self.export_status {
+            Some(status) => (
+                status.text.clone(),
+                if status.kind == ExportStatusKind::Failure {
+                    palette.accent
+                } else {
+                    palette.link
+                },
+            ),
+            None => (
+                "Cmd+O 打开 · Cmd+S 保存 · Cmd+F 查找替换 · Cmd+Shift+F 全工作区搜索".to_string(),
+                palette.muted,
+            ),
+        };
+        // 底部状态栏：文件信息 + 行数/光标 + 导出状态（或快捷键），横跨整个窗口。
         let status_bar = h_flex()
             .id("statusbar")
             .w_full()
@@ -6488,7 +6712,14 @@ impl Render for DocView {
                 f32::from(self.font_size),
                 self.settings.theme.label()
             )))
-            .child("Cmd+O 打开 · Cmd+S 保存 · Cmd+F 查找替换 · Cmd+Shift+F 全工作区搜索");
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(export_hint_color)
+                    .child(export_hint),
+            );
         div()
             .id("app")
             .size_full()
@@ -10673,16 +10904,19 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
         BASE, BlockStyle, CHART_VERTICAL_PAD, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos,
-        Document, ExportFormat, MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET,
-        RunStyle, SAMPLE, Settings, app_menus, block_line_px_with_mono, char_col_to_byte,
-        chart_cache_key, chart_hit_rect, chart_source_body, clipboard_markdown,
-        code_block_wrap_width, collect_inline_texes, copy_entry, dropped_link_markdown,
+        Document, ExportFormat, ExportStatus, ExportStatusKind, MATH_VERTICAL_PAD,
+        QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, SAMPLE, Settings, app_menus,
+        block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
+        chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
+        collect_render_assets, copy_entry, dropped_link_markdown, export_failure_text,
+        export_format_label, export_progress_text, export_status_should_clear, export_success_text,
         export_target, export_title, focus_line_range, footnote_jump, hide_text_runs,
         horizontal_step, inline_links, inline_reveals, is_image_path, is_markdown_file,
         join_math_body, markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom,
         nearest_cell, oblique, pdf_base_dir, plan_imports, quote_block_wrap_width,
-        render_chart_preview, render_export, render_math_preview, reveal_inline, table_arrow_step,
-        table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
+        render_chart_preview, render_chart_svg, render_export, render_export_with_assets,
+        render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
+        typewriter_scroll_y, unique_import_path,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -10860,6 +11094,67 @@ mod tests {
         let bytes = render_export(ExportFormat::Pdf, SAMPLE, "码札文档", None)
             .expect("内置示例应能直接导出 PDF");
         assert_eq!(&bytes[..5], b"%PDF-");
+    }
+
+    /// D83：状态栏文案与「按序号清理」契约（旧定时器不能清掉新导出）。
+    #[test]
+    fn export_status_texts_and_stale_clear() {
+        assert_eq!(export_format_label(ExportFormat::Pdf), "PDF");
+        assert_eq!(export_progress_text(ExportFormat::Html), "正在导出 HTML…");
+        assert_eq!(
+            export_success_text(ExportFormat::Epub, "书.epub"),
+            "已导出 EPUB：书.epub"
+        );
+        assert_eq!(
+            export_failure_text(ExportFormat::Docx, "磁盘满"),
+            "导出 DOCX 失败：磁盘满"
+        );
+
+        let status = ExportStatus {
+            seq: 7,
+            kind: ExportStatusKind::Progress,
+            text: export_progress_text(ExportFormat::Pdf),
+        };
+        assert!(export_status_should_clear(Some(&status), 7));
+        assert!(!export_status_should_clear(Some(&status), 6));
+        assert!(!export_status_should_clear(None, 7));
+    }
+
+    /// D84：桌面侧真实渲染公式/图表，产出可被导出桥接层消费的自包含 SVG。
+    #[test]
+    fn collect_render_assets_renders_math_and_chart() {
+        let src = "行内 $x^2$\n\n```mermaid\ngraph LR; A-->B;\n```\n";
+        let assets = collect_render_assets(src);
+        let math = assets.math_svg("x^2").expect("公式应渲染成功");
+        assert!(math.contains("<svg"), "{math}");
+        let chart = assets
+            .chart_svg("graph LR; A-->B;")
+            .expect("图表应渲染成功");
+        assert!(chart.contains("<svg"), "{chart}");
+    }
+
+    /// D84：HTML 导出把 SVG 以 data URI 内嵌，原 TeX/mermaid 字面不应残留。
+    #[test]
+    fn render_export_with_assets_embeds_svg_in_html() {
+        let src = "行内 $x$\n\n```mermaid\ngraph LR; A-->B;\n```\n";
+        let assets = collect_render_assets(src);
+        let bytes = render_export_with_assets(ExportFormat::Html, src, "测试", None, &assets)
+            .expect("带资产 HTML 导出");
+        let html = String::from_utf8(bytes).expect("HTML 应为 UTF-8");
+        assert_eq!(
+            html.matches("data:image/svg+xml;base64,").count(),
+            2,
+            "{html}"
+        );
+        assert!(!html.contains("$x$"), "{html}");
+        assert!(!html.contains("graph LR"), "{html}");
+    }
+
+    /// D84：非法 DSL 不产生资产，导出侧保留原字面而不是中断。
+    #[test]
+    fn render_chart_svg_rejects_invalid_dsl() {
+        assert!(!collect_render_assets("行内 $x$\n").is_empty());
+        assert!(render_chart_svg("not a mermaid diagram @@@").is_none());
     }
 
     #[test]

@@ -1395,6 +1395,7 @@ dependencies = [
 name = "mazha-export"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "docx",
  "mazha-md",
  "thiserror 1.0.69",

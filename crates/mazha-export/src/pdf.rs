@@ -14,6 +14,7 @@
 //! - 编译诊断指向**生成的 Typst 标记**而非 Markdown 源，排障时需对照 `to_typst`。
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -33,7 +34,7 @@ use typst_layout::PagedDocument;
 use typst_pdf::PdfOptions as TypstPdfOptions;
 use typst_pdf::pdf as typst_pdf_export;
 
-use crate::to_typst;
+use crate::{AssetTarget, RenderAssets, to_typst};
 
 /// PDF 导出配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,8 +286,56 @@ impl PdfExporter {
         self.compile_typst(crate::typst::to_typst_with_template(&markdown, template))
     }
 
+    /// 用桌面渲染好的 SVG 资产导出 PDF（D84）。
+    ///
+    /// 顺序很关键：先按既有规则把**真实缺图**降级，再把公式/图表替换成虚拟图片 Widget；
+    /// 若反过来，新注入的 `__mz_asset_N.svg` 会被缺图判定当成不存在的本地文件而降级。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`PdfExporter::export`]；注入的 SVG 非法时 Typst 会给出编译诊断。
+    pub fn export_with_assets(
+        &self,
+        markdown: &str,
+        assets: &RenderAssets,
+    ) -> Result<PdfDocument, PdfError> {
+        self.export_with_assets_and_template(markdown, &crate::Template::plain(), assets)
+    }
+
+    /// 带版式模板的 [`export_with_assets`](Self::export_with_assets)。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`PdfExporter::export_with_assets`]。
+    pub fn export_with_assets_and_template(
+        &self,
+        markdown: &str,
+        template: &crate::Template,
+        assets: &RenderAssets,
+    ) -> Result<PdfDocument, PdfError> {
+        // 与 `export` 同一预处理，避免带资产导出时缺图仍能令编译失败。
+        let markdown = self.sanitize_images(markdown);
+        let prepared = crate::prepare_renderables(&markdown, assets, AssetTarget::VirtualFile);
+        self.compile_typst_with_files(
+            crate::typst::to_typst_with_template(&prepared.source, template),
+            &prepared.files,
+        )
+    }
+
     /// 编译一段已经生成好的 Typst 标记为 PDF（[`export`](Self::export) 的公共内核）。
     fn compile_typst(&self, typst_source: String) -> Result<PdfDocument, PdfError> {
+        self.compile_typst_with_files(typst_source, &HashMap::new())
+    }
+
+    /// 带内存虚拟资源表的编译内核（D84）。
+    ///
+    /// `files` 的键是 Typst 虚拟路径（如 `__mz_asset_0.svg`），值为 SVG 文本；
+    /// `ExportWorld` 读文件时优先命中该表，因此无需把 SVG 写到磁盘或污染文档目录。
+    fn compile_typst_with_files(
+        &self,
+        typst_source: String,
+        files: &HashMap<String, String>,
+    ) -> Result<PdfDocument, PdfError> {
         // Markdown → Typst 标记（主文件即这段标记，无真实文件系统入口）
         let source = Source::detached(typst_source);
         let main = source.id();
@@ -294,6 +343,7 @@ impl PdfExporter {
             exporter: self,
             main,
             source,
+            assets: files,
         };
 
         let Warned { output, warnings } = typst::compile::<PagedDocument>(&world);
@@ -339,15 +389,38 @@ pub fn to_pdf_with(markdown: &str, template: &crate::Template) -> Result<PdfDocu
     PdfExporter::new().export_with(markdown, template)
 }
 
+/// 一次性导出（带桌面渲染好的公式/图表 SVG，D84）。
+///
+/// 内部新建一个 [`PdfExporter`]（含系统字体扫描），多次导出请复用导出器。
+///
+/// # Errors
+///
+/// 同 [`PdfExporter::export_with_assets`]。
+pub fn to_pdf_with_assets(markdown: &str, assets: &RenderAssets) -> Result<PdfDocument, PdfError> {
+    PdfExporter::new().export_with_assets(markdown, assets)
+}
+
 /// 一次导出对应的 Typst `World`：主文件内容即 Markdown 转出的 Typst 标记，
 /// 其余文件（图片等）从资源根目录读取。
 struct ExportWorld<'a> {
     exporter: &'a PdfExporter,
     main: FileId,
     source: Source,
+    /// D84 注入的内存 SVG 表：键为 Typst 虚拟路径（如 `__mz_asset_0.svg`）。
+    /// 命中时不访问磁盘，也不要求调用方设置 `base_dir`。
+    assets: &'a HashMap<String, String>,
 }
 
 impl ExportWorld<'_> {
+    /// 按 Typst 请求的虚拟路径查找 D84 注入的渲染资产。
+    ///
+    /// 这里先于 `resolve` 命中，保证虚拟文件即使在无资源根目录时也可用；
+    /// 路径统一用 `as_rootless_path` 归一化为正斜杠形式，与生成端键一致。
+    fn virtual_asset(&self, id: FileId) -> Option<&str> {
+        let key = id.vpath().get_without_slash();
+        self.assets.get(key).map(String::as_str)
+    }
+
     /// 把 Typst 虚拟路径解析为资源根目录下的真实路径。
     ///
     /// 未设置资源根目录、或目标位于 Typst 包（`@preview/…`，MVP 不支持）时
@@ -384,6 +457,10 @@ impl World for ExportWorld<'_> {
         if id == self.main {
             return Ok(self.source.clone());
         }
+        // D84：注入的 SVG 先于磁盘资源命中，以虚拟文件形式供 Typst `#image` 读取。
+        if let Some(svg) = self.virtual_asset(id) {
+            return Ok(Source::new(id, svg.to_string()));
+        }
         let path = self.resolve(id)?;
         let text = fs::read_to_string(&path).map_err(|err| FileError::from_io(err, &path))?;
         Ok(Source::new(id, text))
@@ -392,6 +469,10 @@ impl World for ExportWorld<'_> {
     fn file(&self, id: FileId) -> Result<Bytes, FileError> {
         if id == self.main {
             return Ok(Bytes::from_string(self.source.text().to_string()));
+        }
+        // D84：图片最终以字节读取，这里同样优先返回内存 SVG。
+        if let Some(svg) = self.virtual_asset(id) {
+            return Ok(Bytes::from_string(svg.to_string()));
         }
         let path = self.resolve(id)?;
         let data = fs::read(&path).map_err(|err| FileError::from_io(err, &path))?;
@@ -531,6 +612,15 @@ fn main() {}
         let doc = exporter.export("![图](pic.svg)\n").expect("带资源导出");
         assert!(doc.bytes.starts_with(b"%PDF-"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pdf_compiles_with_injected_virtual_svg() {
+        // D84：无 base_dir 也能由内存虚拟文件提供 SVG，公式不再落到缺图降级。
+        let mut assets = RenderAssets::new();
+        assets.insert_math("x", "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\"/></svg>");
+        let doc = to_pdf_with_assets("行内 $x$\n", &assets).expect("注入 SVG 应可编译");
+        assert!(doc.bytes.starts_with(b"%PDF-"));
     }
 
     #[test]
