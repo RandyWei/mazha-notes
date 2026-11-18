@@ -24,6 +24,11 @@
 //! 2. 中文片段在 gpui 侧被置为**透明**（仍然占位 → 排版、光标、选区都不受影响），
 //!    由本模块在 layout 阶段取出字形轮廓、自己做一次剪切后用 `paint_path` 填充。
 //!
+//! D79 优化：轮廓按 `(字符, 字号)` 缓存为本地坐标路径（不再每帧取 CoreText），
+//! 绘制原点按 gpui 原生字形的 `position.y` 微调 + 设备像素对齐校正，
+//! 消除自绘轮廓与透明占位 run 不足 1px 的错位（见 [`cached_path`] / [`place_path`] /
+//! [`snap_origin`] / [`glyph_y_for_index`]）。
+//!
 //! 剪切公式（字形空间：y 向上、基线在 y = 0）：
 //!
 //! ```text
@@ -32,9 +37,12 @@
 //!
 //! 即字形越高越往右倾，而基线仍保持水平——与真实斜体的几何一致。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
-use gpui_kit::{Hsla, Path, Pixels};
+use gpui_kit::{Hsla, Path, Pixels, Point, ShapedRun, point, px};
 
 /// 合成斜体的倾斜角（度）。
 ///
@@ -152,6 +160,81 @@ pub fn glyph_path(
     _baseline_y: Pixels,
 ) -> Option<Path<Pixels>> {
     None
+}
+
+/// 轮廓缓存键：`(字符, 字号位模式)`。
+///
+/// 字号变化必须重取轮廓（CoreText 路径按点大小生成）；用位模式作键可避免浮点比较歧义。
+type PathCacheKey = (char, u32);
+
+thread_local! {
+    /// 本地坐标轮廓缓存：与 CoreText 字体缓存同风格，线程局部即可（字形绘制在渲染线程）。
+    ///
+    /// 值为 `Arc` 以便调用方低成本持有；取轮廓失败也缓存，避免每帧重试无效字符。
+    static PATH_CACHE: RefCell<HashMap<PathCacheKey, Option<Arc<Path<Pixels>>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 取（并缓存）字符在指定字号下的**本地坐标**合成斜体轮廓。
+///
+/// 本地坐标指原点 `(0, 0)`、基线 `y = 0`，剪切已施加；调用方用 [`place_path`] 平移到
+/// 目标字形原点即可。缓存跨帧、跨块、跨文档复用；字号变动自然落到新键。
+pub fn cached_path(ch: char, font_size: f32) -> Option<Arc<Path<Pixels>>> {
+    let key = (ch, font_size.to_bits());
+    PATH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| glyph_path(ch, font_size, px(0.), px(0.)).map(Arc::new))
+            .clone()
+    })
+}
+
+/// 把本地坐标轮廓平移到绘制原点，产出可直接交给 `window.paint_path` 的路径。
+///
+/// 只改顶点与包围盒：`paint_path` 会覆写 `content_mask`，而 `Path` 的 `start`/`current`
+/// 只在构建期有意义（轮廓已三角化），平移它们不影响场景绘制。
+pub fn place_path(local: &Path<Pixels>, origin: Point<Pixels>) -> Path<Pixels> {
+    let mut placed = local.clone();
+    let (dx, dy) = (origin.x, origin.y);
+    for vertex in &mut placed.vertices {
+        vertex.xy_position.x += dx;
+        vertex.xy_position.y += dy;
+    }
+    placed.bounds.origin.x += dx;
+    placed.bounds.origin.y += dy;
+    placed
+}
+
+/// 把绘制原点对齐到设备像素栅格（与 gpui `paint_glyph` 的舍入规则一致）。
+///
+/// gpui 原生字形先把原点乘 `scale` 再做 half-toward-zero 取整；自绘路径不这样做时
+/// 会落在相邻半像素上，与透明占位 run 出现不足 1px 的错位。无效缩放原样返回。
+pub fn snap_origin(origin: Point<Pixels>, scale: f32) -> Point<Pixels> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return origin;
+    }
+    let snap = |v: Pixels| {
+        let device = f32::from(v) * scale;
+        px((device.abs() - 0.5).ceil().copysign(device) / scale)
+    };
+    point(snap(origin.x), snap(origin.y))
+}
+
+/// 取字节偏移处 gpui 已形状化字形的 y 微调。
+///
+/// 判据与 gpui `LineLayout::x_for_index` 一致：第一个 `index >= byte` 的字形即该字节处
+/// 的占位字形。原生 `paint_line` 会在基线上叠加它的 `position.y`，自绘必须同步，
+/// 否则个别字体/符号会纵向差半像素；找不到时返回 0。
+pub fn glyph_y_for_index(runs: &[ShapedRun], byte: usize) -> Pixels {
+    for run in runs {
+        for glyph in &run.glyphs {
+            if glyph.index >= byte {
+                return glyph.position.y;
+            }
+        }
+    }
+    Pixels::ZERO
 }
 
 /// macOS 专用的 CoreText 取形实现。
@@ -383,5 +466,111 @@ mod tests {
     fn cjk_fallbacks_match_italic_fallbacks() {
         assert_eq!(CJK_FALLBACKS[0], "PingFang SC");
         assert_eq!(CJK_FALLBACKS.len(), 6);
+    }
+
+    /// 轮廓缓存按 (字符, 字号) 复用同一份路径；字号变化必须重取。
+    #[test]
+    fn cached_path_reuses_outline() {
+        let first = cached_path('斜', 32.0);
+        let second = cached_path('斜', 32.0);
+        #[cfg(target_os = "macos")]
+        {
+            let (Some(first), Some(second)) = (first, second) else {
+                panic!("应能从 CJK 回退字体取到轮廓");
+            };
+            assert!(Arc::ptr_eq(&first, &second), "同字号应复用缓存路径");
+            let other = cached_path('斜', 33.0).expect("换字号仍应取到轮廓");
+            assert!(!Arc::ptr_eq(&first, &other), "字号变化必须重取轮廓");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                first.is_none() && second.is_none(),
+                "非 macOS 无 CoreText 轮廓"
+            );
+        }
+    }
+
+    /// 平移只改顶点位置与包围盒，三角形覆盖信息（st）保持不变。
+    #[test]
+    fn place_path_shifts_geometry_only() {
+        let mut local = Path::new(point(px(0.), px(0.)));
+        local.push_triangle(
+            (
+                point(px(1.), px(2.)),
+                point(px(3.), px(4.)),
+                point(px(5.), px(6.)),
+            ),
+            (point(0., 1.), point(0., 0.), point(1., 1.)),
+        );
+        let placed = place_path(&local, point(px(10.), px(-3.)));
+        assert_eq!(placed.vertices.len(), local.vertices.len());
+        for (src, dst) in local.vertices.iter().zip(&placed.vertices) {
+            assert_eq!(dst.xy_position.x - src.xy_position.x, px(10.));
+            assert_eq!(dst.xy_position.y - src.xy_position.y, px(-3.));
+            assert_eq!(dst.st_position, src.st_position);
+        }
+        assert_eq!(placed.bounds.origin.x, local.bounds.origin.x + px(10.));
+        assert_eq!(placed.bounds.origin.y, local.bounds.origin.y - px(3.));
+    }
+
+    /// 设备像素对齐复刻 gpui 的 half-toward-zero（含负坐标与 0.5 边界）。
+    #[test]
+    fn snap_origin_matches_device_pixel_grid() {
+        assert_eq!(
+            snap_origin(point(px(10.2), px(-3.3)), 1.0),
+            point(px(10.), px(-3.))
+        );
+        assert_eq!(
+            snap_origin(point(px(10.5), px(10.75)), 1.0),
+            point(px(10.), px(11.))
+        );
+        assert_eq!(
+            snap_origin(point(px(-10.5), px(-10.75)), 1.0),
+            point(px(-10.), px(-11.))
+        );
+        assert_eq!(
+            snap_origin(point(px(10.3), px(10.4)), 2.0),
+            point(px(10.5), px(10.5))
+        );
+        // 无效缩放原样返回，避免除零把 NaN 带进场景几何。
+        assert_eq!(
+            snap_origin(point(px(1.), px(2.)), 0.0),
+            point(px(1.), px(2.))
+        );
+    }
+
+    /// 字形 y 微调取第一个 `index >= byte` 的字形（与 gpui `x_for_index` 同判据）。
+    #[test]
+    fn glyph_y_for_index_matches_shaped_glyph() {
+        use gpui_kit::{FontId, GlyphId, ShapedGlyph};
+
+        let runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: vec![
+                ShapedGlyph {
+                    id: GlyphId(0),
+                    position: point(px(0.), px(1.5)),
+                    index: 0,
+                    is_emoji: false,
+                },
+                ShapedGlyph {
+                    id: GlyphId(1),
+                    position: point(px(12.), px(-0.5)),
+                    index: 3,
+                    is_emoji: false,
+                },
+                ShapedGlyph {
+                    id: GlyphId(2),
+                    position: point(px(24.), px(2.)),
+                    index: 6,
+                    is_emoji: false,
+                },
+            ],
+        }];
+        assert_eq!(glyph_y_for_index(&runs, 0), px(1.5));
+        assert_eq!(glyph_y_for_index(&runs, 2), px(-0.5)); // 落在 index=3 的汉字内
+        assert_eq!(glyph_y_for_index(&runs, 5), px(2.));
+        assert_eq!(glyph_y_for_index(&runs, 7), Pixels::ZERO);
     }
 }

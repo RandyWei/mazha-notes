@@ -10321,10 +10321,12 @@ impl Element for DocElement {
                 );
             }
             // 合成斜体：在文本绘制后填充倾斜字形。
-            // 这里现取轮廓（而非布局阶段缓存）：需要视觉行基线，而基线由 shaped 的
-            // ascent/descent 决定；放在 train 里算几何会与 paint 的坐标换算重复。
+            // 轮廓按 (字符, 字号) 缓存为本地坐标路径（D79），无需每帧逐字取 CoreText；
+            // 绘制原点按 gpui 原生字形公式校正：叠加形状化字形的 y 微调 + 设备像素对齐。
             if !block.oblique_spans.is_empty() {
                 let line_text = block.shaped.text.as_str();
+                let font_size: f32 = block.font_size.into();
+                let scale = window.scale_factor();
                 for span in &block.oblique_spans {
                     let mut byte = span.range.start;
                     while byte < span.range.end {
@@ -10338,18 +10340,20 @@ impl Element for DocElement {
                         // 形状文本内的字节偏移 = 前缀 + 行内偏移
                         let idx = block.prefix_bytes + byte;
                         if let Some(p) = block.shaped.position_for_index(idx, line_px) {
-                            // 基线：视觉行顶 + 行内垂直居中偏移 + ascent
+                            // 基线：视觉行顶 + 行内垂直居中偏移 + ascent + 字形 y 微调。
+                            // y 微调取自 shaped 中该字节处占位字形，与 gpui paint_line 一致，
+                            // 否则个别字体/符号的自绘轮廓会纵向差半像素。
                             let baseline_y = row_top
                                 + p.y
                                 + (line_px - block.shaped.ascent() - block.shaped.descent()) / 2.
-                                + block.shaped.ascent();
-                            if let Some(path) = oblique::glyph_path(
-                                ch,
-                                block.font_size.into(),
-                                text_x + p.x,
-                                baseline_y,
-                            ) {
-                                window.paint_path(path, span.color);
+                                + block.shaped.ascent()
+                                + oblique::glyph_y_for_index(block.shaped.runs(), idx);
+                            // 原生 paint_glyph 把原点对齐到整数设备像素（half toward zero）；
+                            // 自绘路径必须落同一栅格，消除与透明占位 run 不足 1px 的错位。
+                            let origin =
+                                oblique::snap_origin(point(text_x + p.x, baseline_y), scale);
+                            if let Some(local) = oblique::cached_path(ch, font_size) {
+                                window.paint_path(oblique::place_path(&local, origin), span.color);
                             }
                         }
                         byte += ch_len;
