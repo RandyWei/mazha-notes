@@ -54,7 +54,6 @@ use mazha_core::{
     commands::{set_block, toggle_inline},
     edit_table, find_all, replace_all_edit, table_cells,
 };
-use mazha_export::to_pdf;
 use mazha_md::{FootnoteIndex, MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
 use mazha_store::{DocPath, Entry, EntryKind, FileSystemProvider};
@@ -124,7 +123,7 @@ graph LR
 
 ### 其他
 
-![示例图片](assets/sample.png)
+图片支持本地路径、网络地址与内联 data URI：直接粘贴图片，或插入 `![描述](路径)` 即可预览。
 
 ---
 ";
@@ -2146,7 +2145,10 @@ enum PaletteAction {
     NewFolder,
     Save,
     SaveAs,
+    ExportHtml,
     ExportPdf,
+    ExportDocx,
+    ExportEpub,
     Find,
     WorkspaceSearch,
     ToggleTree,
@@ -2163,6 +2165,120 @@ enum PaletteAction {
     MonoFontSizeUp,
     MonoFontSizeDown,
     ResetAppearance,
+}
+
+/// 桌面可导出的目标格式（D82：对应 `mazha-export` 的四个 API）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportFormat {
+    Html,
+    Pdf,
+    Docx,
+    Epub,
+}
+
+/// 一种导出格式的对话框与文件参数（纯数据，便于无 UI 单测）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportTarget {
+    /// 保存对话框标题。
+    title: &'static str,
+    /// 文件类型过滤器名称。
+    filter_label: &'static str,
+    /// 过滤器与默认文件名使用的后缀（不含点）。
+    extension: &'static str,
+    /// 默认文件名主干。
+    default_stem: &'static str,
+}
+
+impl ExportTarget {
+    /// 拼出保存对话框的默认文件名（如 `document.html`）。
+    fn default_file_name(&self) -> String {
+        format!("{}.{}", self.default_stem, self.extension)
+    }
+}
+
+/// 纯函数：导出格式 → 对话框标题/过滤器/后缀/默认文件名（D82）。
+fn export_target(format: ExportFormat) -> ExportTarget {
+    match format {
+        ExportFormat::Html => ExportTarget {
+            title: "导出 HTML",
+            filter_label: "HTML 文件",
+            extension: "html",
+            default_stem: "document",
+        },
+        ExportFormat::Pdf => ExportTarget {
+            title: "导出 PDF",
+            filter_label: "PDF 文件",
+            extension: "pdf",
+            default_stem: "document",
+        },
+        ExportFormat::Docx => ExportTarget {
+            title: "导出 DOCX",
+            filter_label: "Word 文档",
+            extension: "docx",
+            default_stem: "document",
+        },
+        ExportFormat::Epub => ExportTarget {
+            title: "导出 EPUB",
+            filter_label: "EPUB 电子书",
+            extension: "epub",
+            default_stem: "document",
+        },
+    }
+}
+
+/// 纯函数：PDF 资源根目录取当前文档所在目录（D82）。
+///
+/// 用 `doc_path.parent()` 与图片渲染的 `resolve_image_path` 保持同一基准；
+/// 无路径（内置示例）或裸文件名（无有效父目录）返回 `None`，此时图片走导出
+/// crate 的缺图降级，而不是让 Typst 编译中断。
+fn pdf_base_dir(doc_path: Option<&Path>) -> Option<PathBuf> {
+    doc_path
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// 纯函数：HTML/EPUB 导出用的书名，取当前文件主干；内置示例用固定标题。
+fn export_title(doc_path: Option<&Path>) -> String {
+    doc_path
+        .and_then(Path::file_stem)
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "码札文档".to_string())
+}
+
+/// 把 Markdown 渲染为所选格式的字节（D82；不含对话框/文件系统写入）。
+///
+/// 各 `to_*` API 内部已做脚注规整（D69/D81），这里不重复调用 `footnotes::prepare`。
+/// PDF 用 `PdfExporter::with_options` 传 `base_dir`，保证真实文档的相对路径图片可解析；
+/// 缺图/远程图片由导出 crate 在独立副本里降级为占位文字（见 `mazha-export::pdf`）。
+fn render_export(
+    format: ExportFormat,
+    markdown: &str,
+    title: &str,
+    base_dir: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    match format {
+        ExportFormat::Html => {
+            Ok(mazha_export::to_html_document(markdown, title, None).into_bytes())
+        }
+        ExportFormat::Pdf => {
+            let options = mazha_export::PdfExportOptions {
+                base_dir: base_dir.map(Path::to_path_buf),
+                ..Default::default()
+            };
+            let pdf = mazha_export::PdfExporter::with_options(&options)
+                .export(markdown)
+                .map_err(|err| err.to_string())?;
+            // 字体回退等警告不影响成文，只写 stderr 供排障
+            for warning in &pdf.warnings {
+                eprintln!("PDF 编译警告：{warning}");
+            }
+            Ok(pdf.bytes)
+        }
+        ExportFormat::Docx => mazha_export::to_docx(markdown).map_err(|err| err.to_string()),
+        ExportFormat::Epub => mazha_export::to_epub(markdown, title).map_err(|err| err.to_string()),
+    }
 }
 
 /// 菜单命令：复用命令面板动作，并补充编辑、应用、窗口级操作。
@@ -2327,7 +2443,11 @@ fn app_menus(settings: &Settings) -> Vec<Menu> {
             MenuItem::separator(),
             menu_item("保存", Palette(Save)),
             menu_item("另存为…", Palette(SaveAs)),
+            MenuItem::separator(),
+            menu_item("导出 HTML…", Palette(ExportHtml)),
             menu_item("导出 PDF…", Palette(ExportPdf)),
+            menu_item("导出 DOCX…", Palette(ExportDocx)),
+            menu_item("导出 EPUB…", Palette(ExportEpub)),
             MenuItem::separator(),
             menu_item("关闭标签页", Palette(CloseTab)),
             menu_item("关闭全部标签页", Palette(CloseAllTabs)),
@@ -4545,18 +4665,29 @@ impl DocView {
         footnote_jump(&self.doc.footnote_index(), &run.text, src)
     }
 
-    /// 导出当前文档为 PDF 并保存到文件。
+    /// 导出当前文档为所选格式并保存到文件（D82）。
     ///
     /// 异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框嵌套泵
-    /// runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。
-    fn export_pdf(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。对话框参数与渲染全部由
+    /// 纯函数 `export_target`/`export_title`/`pdf_base_dir`/`render_export` 算出，
+    /// 这里只负责取当前视图快照、驱动异步对话框与写文件。
+    fn export_document(
+        &mut self,
+        format: ExportFormat,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.begin_dialog(cx);
+        // 先把依赖当前视图的参数算好，避免 async 闭包里借 `self`。
         let markdown = self.doc.text().to_string();
+        let title = export_title(self.path.as_deref());
+        let base_dir = pdf_base_dir(self.path.as_deref());
+        let target = export_target(format);
         cx.spawn(async move |this, cx| {
             let picked = AsyncFileDialog::new()
-                .set_title("导出 PDF")
-                .add_filter("PDF 文件", &["pdf"])
-                .set_file_name("document.pdf")
+                .set_title(target.title)
+                .add_filter(target.filter_label, &[target.extension])
+                .set_file_name(target.default_file_name())
                 .save_file()
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -4565,14 +4696,14 @@ impl DocView {
             });
             let Some(handle) = picked else { return };
             let path = handle.path().to_path_buf();
-            match to_pdf(&markdown) {
-                Ok(pdf_doc) => {
-                    if let Err(e) = std::fs::write(&path, &pdf_doc.bytes) {
-                        eprintln!("导出 PDF 失败：{}", e);
+            match render_export(format, &markdown, &title, base_dir.as_deref()) {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(&path, &bytes) {
+                        eprintln!("导出 {} 失败：{}", target.extension.to_uppercase(), e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("PDF 编译失败：{}", e);
+                    eprintln!("{} 导出失败：{}", target.extension.to_uppercase(), e);
                 }
             }
         })
@@ -4605,7 +4736,10 @@ impl DocView {
             mk("新建文件夹", "", NewFolder),
             mk("保存", "Cmd+S", Save),
             mk("另存为…", "Cmd+Shift+S", SaveAs),
+            mk("导出 HTML", "", ExportHtml),
             mk("导出 PDF", "Cmd+E", ExportPdf),
+            mk("导出 DOCX", "", ExportDocx),
+            mk("导出 EPUB", "", ExportEpub),
             mk("查找/替换", "Cmd+F", Find),
             mk("全工作区搜索", "Cmd+Shift+F", WorkspaceSearch),
             mk("切换文件树", "", ToggleTree),
@@ -4730,7 +4864,10 @@ impl DocView {
             NewFolder => self.new_folder_in_root(cx),
             Save => self.save_current(window, cx),
             SaveAs => self.save_as(window, cx),
-            ExportPdf => self.export_pdf(window, cx),
+            ExportHtml => self.export_document(ExportFormat::Html, window, cx),
+            ExportPdf => self.export_document(ExportFormat::Pdf, window, cx),
+            ExportDocx => self.export_document(ExportFormat::Docx, window, cx),
+            ExportEpub => self.export_document(ExportFormat::Epub, window, cx),
             Find => self.open_find(cx),
             WorkspaceSearch => self.open_workspace_search(cx),
             ToggleTree => {
@@ -7071,7 +7208,7 @@ fn handle_key(
                 view.apply_table(TableOp::DeleteRow, cx);
             }
             "e" if m.platform => {
-                view.export_pdf(window, cx);
+                view.export_document(ExportFormat::Pdf, window, cx);
             }
             _ => {}
         }
@@ -10536,15 +10673,16 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
         BASE, BlockStyle, CHART_VERTICAL_PAD, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos,
-        Document, MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings,
-        app_menus, block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
-        chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
-        copy_entry, dropped_link_markdown, focus_line_range, footnote_jump, hide_text_runs,
+        Document, ExportFormat, MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET,
+        RunStyle, SAMPLE, Settings, app_menus, block_line_px_with_mono, char_col_to_byte,
+        chart_cache_key, chart_hit_rect, chart_source_body, clipboard_markdown,
+        code_block_wrap_width, collect_inline_texes, copy_entry, dropped_link_markdown,
+        export_target, export_title, focus_line_range, footnote_jump, hide_text_runs,
         horizontal_step, inline_links, inline_reveals, is_image_path, is_markdown_file,
         join_math_body, markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom,
-        nearest_cell, oblique, plan_imports, quote_block_wrap_width, render_chart_preview,
-        render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
-        typewriter_scroll_y, unique_import_path,
+        nearest_cell, oblique, pdf_base_dir, plan_imports, quote_block_wrap_width,
+        render_chart_preview, render_export, render_math_preview, reveal_inline, table_arrow_step,
+        table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -10634,6 +10772,94 @@ mod tests {
             }
             _ => panic!("主题子菜单首项应为跟随系统"),
         }
+    }
+
+    /// D82：文件菜单必须列出四种导出格式（此前只有 PDF）。
+    #[test]
+    fn file_menu_lists_all_four_export_formats() {
+        let menus = app_menus(&Settings::default());
+        let file = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == "文件")
+            .expect("应有文件菜单");
+        let names: Vec<String> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["导出 HTML…", "导出 PDF…", "导出 DOCX…", "导出 EPUB…"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "缺菜单项：{expected}"
+            );
+        }
+    }
+
+    /// D82：导出目标映射给出各自的后缀、过滤器与默认文件名。
+    #[test]
+    fn export_targets_map_to_distinct_files() {
+        let cases = [
+            (ExportFormat::Html, "html", "HTML 文件", "document.html"),
+            (ExportFormat::Pdf, "pdf", "PDF 文件", "document.pdf"),
+            (ExportFormat::Docx, "docx", "Word 文档", "document.docx"),
+            (ExportFormat::Epub, "epub", "EPUB 电子书", "document.epub"),
+        ];
+        for (format, extension, filter, file_name) in cases {
+            let target = export_target(format);
+            assert_eq!(target.extension, extension);
+            assert_eq!(target.filter_label, filter);
+            assert_eq!(target.default_file_name(), file_name);
+            assert!(target.title.starts_with("导出 "));
+        }
+    }
+
+    /// D82：PDF 资源根目录取当前文档父目录；内置示例与裸文件名返回 `None`。
+    #[test]
+    fn pdf_base_dir_uses_document_parent() {
+        assert_eq!(pdf_base_dir(None), None);
+        assert_eq!(pdf_base_dir(Some(Path::new("note.md"))), None);
+        assert_eq!(
+            pdf_base_dir(Some(Path::new("/docs/book/note.md"))),
+            Some(PathBuf::from("/docs/book"))
+        );
+    }
+
+    /// D82：HTML/EPUB 书名取文件主干，内置示例用固定标题。
+    #[test]
+    fn export_title_uses_file_stem_or_fallback() {
+        assert_eq!(export_title(None), "码札文档");
+        assert_eq!(
+            export_title(Some(Path::new("/docs/我的笔记.md"))),
+            "我的笔记"
+        );
+        assert_eq!(export_title(Some(Path::new("/docs/a.b.md"))), "a.b");
+    }
+
+    /// D82：渲染分派对各格式都产出可用字节（HTML 带完整外壳，DOCX/EPUB 为 ZIP）。
+    #[test]
+    fn render_export_dispatches_to_all_formats() {
+        let md = "# 标题\n\n正文。\n";
+        let html = render_export(ExportFormat::Html, md, "测试", None).expect("HTML 导出");
+        let html = String::from_utf8(html).expect("HTML 应为 UTF-8");
+        assert!(html.contains("<h1>标题</h1>"), "{html}");
+        assert!(html.contains("<title>测试</title>"));
+
+        for format in [ExportFormat::Docx, ExportFormat::Epub] {
+            let bytes = render_export(format, md, "测试", None).expect("ZIP 格式导出");
+            assert_eq!(&bytes[..2], b"PK", "DOCX/EPUB 应为 ZIP 容器");
+        }
+    }
+
+    /// D82：内置 SAMPLE 不再引用不存在的资源，直接导出 PDF 不应失败。
+    #[test]
+    fn builtin_sample_exports_to_pdf_without_base_dir() {
+        assert!(!SAMPLE.contains("assets/sample.png"));
+        let bytes = render_export(ExportFormat::Pdf, SAMPLE, "码札文档", None)
+            .expect("内置示例应能直接导出 PDF");
+        assert_eq!(&bytes[..5], b"%PDF-");
     }
 
     #[test]

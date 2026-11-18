@@ -8,14 +8,19 @@
 //! 依赖较重（整个 Typst 编译器），只用于 PDF 导出；HTML 导出不经过本模块。
 //!
 //! 已知限制（MVP）：
-//! - 资源（图片）按 [`PdfExportOptions::base_dir`] 解析，未提供时引用相对路径
-//!   资源会编译失败；
+//! - 资源（图片）按 [`PdfExportOptions::base_dir`] 解析（D82 起由桌面传当前文档目录）；
+//!   无法解析的图片（缺文件、远程、data URI、绝对路径）在导出前降级为占位文字，
+//!   不再让整篇编译失败，但 PDF 中不会内嵌这些图片；
 //! - 编译诊断指向**生成的 Typst 标记**而非 Markdown 源，排障时需对照 `to_typst`。
 
+use std::cmp::Reverse;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::path::PathBuf;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use mazha_md::{Block, SpanKind, SpanRole, parse};
 
 use typst::diag::{FileError, Severity, SourceDiagnostic, Warned};
 use typst::foundations::{Bytes, Datetime, Duration};
@@ -94,6 +99,113 @@ impl Display for PdfError {
 
 impl Error for PdfError {}
 
+/// 把 Markdown 图片地址解析为 Typst 资源根目录（`base_dir`）下的文件路径。
+///
+/// [`ExportWorld`] 只能通过 `Project` 虚拟根读取 `base_dir` 下的**相对**路径资源：
+/// 远程地址、内联 data URI、`file://` 与宿主机绝对路径都无法由其 `resolve` 定位，
+/// 统一返回 `None` 让调用方降级为占位文字（D82）。本函数只做路径分类/拼接，
+/// **不访问文件系统**，因此可无副作用单测。
+///
+/// 边界：dest 首尾空白会被裁掉；`%20` 等百分号转义不在此解码（Typst 也不会解码，
+/// 这类路径会由文件存在性检查判为缺失并降级）。
+pub fn pdf_image_path(dest: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let dest = dest.trim();
+    if dest.is_empty() {
+        return None;
+    }
+    let lower = dest.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("file://")
+        || dest.starts_with("//")
+    {
+        return None;
+    }
+    let path = Path::new(dest);
+    // 绝对路径会被 Typst 当成虚拟文件系统的根路径（而非宿主机绝对路径）解析，
+    // 交给 base_dir.join 也得不到正确文件；直接判为不可解析。
+    if path.is_absolute() {
+        return None;
+    }
+    Some(base_dir?.join(path))
+}
+
+/// 递归收集所有图片 Widget 的源区间（含表格/列表/引用内的行内图片）。
+///
+/// 只认 `SpanKind::Widget + SpanRole::ImageMarker`：代码块/公式里的 `![...](...)`
+/// 字面量是 `CodeContent`/`Math` 文本，不会被误当成图片替换。
+fn collect_image_ranges(blocks: &[Block], out: &mut Vec<Range<usize>>) {
+    for block in blocks {
+        for span in &block.spans {
+            if span.kind == SpanKind::Widget && span.role == SpanRole::ImageMarker {
+                out.push(span.range.clone());
+            }
+        }
+        collect_image_ranges(&block.children, out);
+    }
+}
+
+/// 转义占位文字 alt 中会被 Markdown 当成行内标记的字符。
+///
+/// 占位文字要走一遍 `to_typst`（会重新解析 Markdown），若 alt 里含 `*`/`[` 等，
+/// 不转义就会被当成强调/链接标记，破坏生成的 Typst 标记。
+fn escape_placeholder_alt(alt: &str) -> String {
+    let mut out = String::with_capacity(alt.len());
+    for ch in alt.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '[' | ']' | '#' | '|') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 由图片 Widget 源文本生成占位文字（保留 alt 信息供读者辨认）。
+fn image_placeholder(raw: &str) -> String {
+    let Some((alt, _)) = crate::typst::parse_image_typst(raw) else {
+        return "（图片）".to_string();
+    };
+    let alt = alt.trim();
+    if alt.is_empty() {
+        "（图片）".to_string()
+    } else {
+        format!("（图片：{}）", escape_placeholder_alt(alt))
+    }
+}
+
+/// 把源文本中 Typst 无法加载的图片替换为占位文字，返回**导出专用**的源文本副本。
+///
+/// `is_available` 接收去空白后的图片地址，决定是否保留该图片；用回调注入
+/// 「文件是否存在」的判断，使替换本身无 I/O、可直接单测。替换按源偏移**倒序**
+/// 进行，避免先改前面片段导致后面区间失效。只改写图片 Widget，不影响编辑器
+/// OffsetMap / 源文本（导出处理的是独立字符串副本）。
+pub fn replace_unresolvable_images(source: &str, is_available: impl Fn(&str) -> bool) -> String {
+    let blocks = parse(source);
+    let mut ranges = Vec::new();
+    collect_image_ranges(&blocks, &mut ranges);
+    if ranges.is_empty() {
+        return source.to_string();
+    }
+    ranges.sort_by_key(|range| Reverse(range.start));
+    let mut out = source.to_string();
+    for range in ranges {
+        // 区间来自原始 source，倒序替换保证尚未处理的区间在两者中都有效。
+        let Some(raw) = source.get(range.clone()) else {
+            continue;
+        };
+        let Some((_, dest)) = crate::typst::parse_image_typst(raw) else {
+            continue;
+        };
+        if is_available(dest.trim()) {
+            continue;
+        }
+        out.replace_range(range, &image_placeholder(raw));
+    }
+    out
+}
+
 /// PDF 导出器：持有 Typst 标准库与字体集合，可跨多次导出复用。
 ///
 /// 系统字体扫描只在构造时执行一次，因此桌面端应启动时创建一个实例并复用，
@@ -134,14 +246,28 @@ impl PdfExporter {
         self.base_dir.as_ref()
     }
 
+    /// 导出前把无法由当前 `base_dir` 定位的图片降级为占位文字（D82）。
+    ///
+    /// 文件存在性检查放在回调里，替换算法本身保持纯函数；`base_dir` 为 `None`
+    /// 时所有本地图片都判为不可解析，`to_pdf` 因此不再因缺资源中断编译。
+    fn sanitize_images(&self, markdown: &str) -> String {
+        let base = self.base_dir.as_deref();
+        replace_unresolvable_images(markdown, |dest| {
+            pdf_image_path(dest, base).is_some_and(|path| path.is_file())
+        })
+    }
+
     /// 把 Markdown 导出为 PDF。
     ///
     /// # Errors
     ///
-    /// 返回 [`PdfError::Compile`]（Typst 编译失败，含资源缺失）或
-    /// [`PdfError::Export`]（PDF 序列化失败），均带格式化诊断信息。
+    /// 返回 [`PdfError::Compile`]（Typst 编译失败）或 [`PdfError::Export`]
+    /// （PDF 序列化失败），均带格式化诊断信息。缺图/远程图片会先降级为占位文字，
+    /// 不再作为编译错误返回。
     pub fn export(&self, markdown: &str) -> Result<PdfDocument, PdfError> {
-        self.compile_typst(to_typst(markdown))
+        // Typst 遇到缺失资源会中断整篇编译；先在独立副本里剔除不可解析的图片。
+        let markdown = self.sanitize_images(markdown);
+        self.compile_typst(to_typst(&markdown))
     }
 
     /// 用 [`crate::Template`] 版式前置导出 PDF（页面/字号等由模板决定）。
@@ -154,7 +280,9 @@ impl PdfExporter {
         markdown: &str,
         template: &crate::Template,
     ) -> Result<PdfDocument, PdfError> {
-        self.compile_typst(crate::typst::to_typst_with_template(markdown, template))
+        // 与 `export` 同一预处理，避免带模板导出时缺图仍能令编译失败。
+        let markdown = self.sanitize_images(markdown);
+        self.compile_typst(crate::typst::to_typst_with_template(&markdown, template))
     }
 
     /// 编译一段已经生成好的 Typst 标记为 PDF（[`export`](Self::export) 的公共内核）。
@@ -406,14 +534,77 @@ fn main() {}
     }
 
     #[test]
-    fn pdf_export_missing_asset_returns_error() {
-        // 未提供资源根目录时，图片资源无法解析 → 编译诊断错误
-        let err = to_pdf("![图](missing.png)\n").expect_err("缺资源应失败");
-        match &err {
-            PdfError::Compile(errors) => assert!(!errors.is_empty()),
-            PdfError::Export(errors) => panic!("应为编译错误，得到导出错误：{errors:?}"),
-        }
-        assert!(!err.to_string().is_empty());
+    fn pdf_export_missing_asset_falls_back_to_placeholder() {
+        // D82：无 base_dir 时图片无法解析，应降级为占位文字而不是让整篇编译失败
+        let doc = to_pdf("![图](missing.png)\n").expect("缺资源应降级，不应编译失败");
+        assert!(doc.bytes.starts_with(b"%PDF-"));
+        assert!(doc.pages >= 1);
+
+        // 间接验证 Typst 标记里已无 #image 引用缺失资源
+        let clean = replace_unresolvable_images("![图](missing.png)\n", |_| false);
+        let typst = crate::to_typst(&clean);
+        assert!(!typst.contains("#image("), "{typst}");
+        assert!(typst.contains("图片：图"), "{typst}");
+    }
+
+    #[test]
+    fn pdf_image_path_classifies_resources_without_fs() {
+        let base = Path::new("/docs/note");
+        assert_eq!(
+            pdf_image_path("img/a.png", Some(base)),
+            Some(PathBuf::from("/docs/note/img/a.png"))
+        );
+        assert_eq!(
+            pdf_image_path("  img/a.png  ", Some(base)),
+            Some(PathBuf::from("/docs/note/img/a.png"))
+        );
+        // Typst `ExportWorld` 无法读取远程/内联/绝对路径与包外根，统一返回 None
+        assert_eq!(pdf_image_path("/abs/a.png", Some(base)), None);
+        assert_eq!(pdf_image_path("file:///abs/a.png", Some(base)), None);
+        assert_eq!(pdf_image_path("https://x.test/a.png", Some(base)), None);
+        assert_eq!(pdf_image_path("//host/a.png", Some(base)), None);
+        assert_eq!(pdf_image_path("data:image/png;base64,xx", Some(base)), None);
+        assert_eq!(pdf_image_path("mailto:a@b.c", Some(base)), None);
+        // 没有 base_dir 时任何相对资源都不可解析
+        assert_eq!(pdf_image_path("a.png", None), None);
+        assert_eq!(pdf_image_path("   ", Some(base)), None);
+    }
+
+    #[test]
+    fn replace_unresolvable_images_keeps_available_and_skips_code_literals() {
+        let src = "甲![好图](ok.png)乙\n\n```\n![代码里的](bad.png)\n```\n\n丙![缺图](bad.png)丁\n";
+        let out = replace_unresolvable_images(src, |dest| dest == "ok.png");
+        // 可用图片原样保留（只有缺图才降级）
+        assert!(out.contains("甲![好图](ok.png)乙"), "{out}");
+        assert!(out.contains("丙（图片：缺图）丁"), "{out}");
+        // 代码块里的相同文本不是图片 Widget，必须原样保留
+        assert!(out.contains("![代码里的](bad.png)"), "{out}");
+        assert_eq!(out.matches("![好图](ok.png)").count(), 1);
+    }
+
+    #[test]
+    fn replace_unresolvable_images_escapes_alt_markup() {
+        let out = replace_unresolvable_images("![a*b_c](bad.png)\n", |_| false);
+        assert!(out.contains("（图片：a\\*b\\_c）"), "{out}");
+        // 空 alt 也要有可读占位
+        let empty = replace_unresolvable_images("![](bad.png)\n", |_| false);
+        assert!(empty.contains("（图片）"), "{empty}");
+    }
+
+    #[test]
+    fn pdf_export_mixed_existing_and_missing_images() {
+        // 真实文档场景：base_dir 下的图片保留，同篇的缺图降级，整篇仍可编译
+        let dir = temp_dir("mixed");
+        write_test_svg(&dir, "ok.svg");
+        let options = PdfExportOptions {
+            base_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let doc = PdfExporter::with_options(&options)
+            .export("![在](ok.svg)\n\n![缺](missing.svg)\n")
+            .expect("缺图应降级，整篇仍可编译");
+        assert!(doc.bytes.starts_with(b"%PDF-"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

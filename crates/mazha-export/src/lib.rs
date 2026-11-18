@@ -20,7 +20,10 @@ mod typst;
 pub use docx::{DocxError, to_docx};
 pub use epub::{EpubError, EpubMeta, to_epub, to_epub_themed, to_epub_with_meta};
 pub use html::{DEFAULT_CSS, to_html, to_html_document, to_html_themed};
-pub use pdf::{PdfDocument, PdfError, PdfExportOptions, PdfExporter, to_pdf, to_pdf_with};
+pub use pdf::{
+    PdfDocument, PdfError, PdfExportOptions, PdfExporter, pdf_image_path,
+    replace_unresolvable_images, to_pdf, to_pdf_with,
+};
 pub use theme::{Template, Theme};
 pub use typst::{to_typst, to_typst_with_template};
 

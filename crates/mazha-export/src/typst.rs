@@ -476,7 +476,10 @@ fn inline_to_typst(source: &str, spans: &[SyntaxSpan], out: &mut String) {
 }
 
 /// 从 `![alt](dest)` 源文本解析 alt 与 dest。
-fn parse_image_typst(raw: &str) -> Option<(String, String)> {
+///
+/// `pub(crate)` 供 PDF 导出前的缺图预处理复用同一套解析规则（D82），
+/// 避免两处各自实现 `![...](...)` 切分而对带空格/特殊字符的 dest 产生分歧。
+pub(crate) fn parse_image_typst(raw: &str) -> Option<(String, String)> {
     let inner = raw.strip_prefix("![")?.strip_suffix(')')?;
     let (alt, dest) = inner.split_once("](")?;
     Some((alt.to_string(), dest.to_string()))
