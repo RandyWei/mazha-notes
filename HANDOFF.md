@@ -112,7 +112,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 139 条）
 
 ```
-1b64e41 feat(desktop): 入站外部拖拽（从 Finder 拖入）（0.1.96，D74）
+4b3e9ca feat(desktop): 入站外部拖拽（从 Finder 拖入）（0.1.96，D74）
 5213bc1 feat(desktop): 拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索（0.1.95，D40/D73）
 be5f7ef feat(desktop): 文件树展开状态持久化（0.1.94，D72）
 7711d0a feat(desktop): 文件树拖拽移动 + 新建文件夹（0.1.93，D71）
@@ -200,7 +200,7 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 139（含本次）。
 
-- 2026-11-18（`1b64e41`，0.1.96）：**入站外部拖拽（从 Finder 拖入）**（D74）：根元素、侧栏标题与目录行接受 GPUI `ExternalPaths` 拖拽负载并高亮落点，与 `TreeDrag` 落点共存；拖入条目复制进目标目录（同名递增编号、目录递归、跳过符号链接），Finder 原件不动；`.md`/`.markdown` 自动打开为标签，编辑区拖入的非 Markdown 文件按当前文档目录生成相对链接（图片 `![ ]`、其它 `[ ]`）并插入所有光标。新增纯函数 `plan_imports`/`unique_import_path`/`copy_entry`/`dropped_link_markdown` 与 3 条桌面单测，`insert_text_at_cursors` 抽出供粘贴复用。桌面 fmt/clippy/test/build 全绿（55 项）；根 workspace 门禁全绿（548 项）。系统原生拖拽仍需实机验收。
+- 2026-11-18（`4b3e9ca`，0.1.96）：**入站外部拖拽（从 Finder 拖入）**（D74）：根元素、侧栏标题与目录行接受 GPUI `ExternalPaths` 拖拽负载并高亮落点，与 `TreeDrag` 落点共存；拖入条目复制进目标目录（同名递增编号、目录递归、跳过符号链接），Finder 原件不动；`.md`/`.markdown` 自动打开为标签，编辑区拖入的非 Markdown 文件按当前文档目录生成相对链接（图片 `![ ]`、其它 `[ ]`）并插入所有光标。新增纯函数 `plan_imports`/`unique_import_path`/`copy_entry`/`dropped_link_markdown` 与 3 条桌面单测，`insert_text_at_cursors` 抽出供粘贴复用。桌面 fmt/clippy/test/build 全绿（55 项）；根 workspace 门禁全绿（548 项）。系统原生拖拽仍需实机验收。
 
 - 2026-11-18（`5213bc1`，0.1.95）：**拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索**（D40/D73）：文件树目录行与侧栏标题新增 `drag_over::<TreeDrag>` 高亮（铺 `palette.selection`，非法落点由 `can_drop` 阻止），侧栏标题 `can_drop` 只接受非根层条目；目录/文件行新增 `external_drag_payload`（`ExternalDragPayload::Files`）支持拖出窗口交给系统原生文件拖拽（跨应用/Finder，待实机验收）。新增 `Cmd+Shift+F` 全工作区搜索悬浮面板：即时递归扫描工作区 Markdown，按文件分组列出命中行与上下文（命中高亮、按字符截断），`↑↓` 选择、`Enter`/点击打开并选中、`Cmd+Alt+C` 大小写、`Esc` 关闭，上限 500 条标记截断、读取失败计入跳过，命令面板/编辑菜单同步入口。新增纯函数 `collect_markdown_paths`/`search_text_lines`/`tail_chars`/`head_chars`；修复 `mazha-core::find::find_all` 大小写不敏感模式「模式比文本长」切片越界 panic（补回归断言）。桌面新增 3 条单测；桌面 fmt/clippy/test/build 全绿（52 项）。
 
