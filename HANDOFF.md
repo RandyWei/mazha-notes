@@ -113,7 +113,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 144 条）
 
 ```
-待回填 fix(desktop): 块级公式编辑态显 TeX 原文并修行内重叠（0.1.101，D76）
+ed19d00 fix(desktop): 块级公式编辑态显 TeX 原文并修行内重叠（0.1.101，D76）
 7eadc91 fix(desktop): 块级公式点击进编辑态并去装饰（0.1.100，D76）
 daa864b fix(desktop): 块级公式居左对齐正文（0.1.99，D76）
 637acda feat(desktop): 数学公式真实排版 RaTeX（0.1.98，D76）
@@ -206,7 +206,7 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 144（含本次）。
 
-- 2026-11-18（待回填，0.1.101）：**块级公式编辑态显 TeX + 行内不重叠**（D76 细化）：① 块级公式编辑态改为整块按原始源码逐行显示（含 `$$` 定界行，走 `raw_src` 通道做 1:1 字节映射），修掉「点进公式后仍看不到 TeX 原文」——根因是块 body 同为 `RunStyle::Math`，被 `inline_texes` 收进预渲染集合后又被当作行内公式透明化；新增纯函数 `collect_inline_texes` 排除块级公式行与代码块行。② 新增纯函数 `math_inline_draw_geom`：按透明占位槽起止位置算可用宽度，裁掉 RaTeX 左右各 8px 透明留白后再画，字形区宽于槽位才等比缩小，防止图像越过槽宽压到右侧普通文字。新增 2 条桌面单测（行内绘图几何边界、块级 TeX 不混入行内集合）。桌面 fmt/clippy/test/build 全绿（63 项）；根 workspace fmt/clippy/test 全绿（548 项）；实机截图确认块级点击显示含 `$$` 的完整 TeX、移开恢复公式图像、行内公式与右侧文字有间隔无重叠。
+- 2026-11-18（`ed19d00`，0.1.101）：**块级公式编辑态显 TeX + 行内不重叠**（D76 细化）：① 块级公式编辑态改为整块按原始源码逐行显示（含 `$$` 定界行，走 `raw_src` 通道做 1:1 字节映射），修掉「点进公式后仍看不到 TeX 原文」——根因是块 body 同为 `RunStyle::Math`，被 `inline_texes` 收进预渲染集合后又被当作行内公式透明化；新增纯函数 `collect_inline_texes` 排除块级公式行与代码块行。② 新增纯函数 `math_inline_draw_geom`：按透明占位槽起止位置算可用宽度，裁掉 RaTeX 左右各 8px 透明留白后再画，字形区宽于槽位才等比缩小，防止图像越过槽宽压到右侧普通文字。新增 2 条桌面单测（行内绘图几何边界、块级 TeX 不混入行内集合）。桌面 fmt/clippy/test/build 全绿（63 项）；根 workspace fmt/clippy/test 全绿（548 项）；实机截图确认块级点击显示含 `$$` 的完整 TeX、移开恢复公式图像、行内公式与右侧文字有间隔无重叠。
 
 - 2026-11-18（`7eadc91`，0.1.100）：**块级公式点击编辑 + 去装饰**（D76 细化）：渲染态 `$$…$$` 不再画背景/边框（`WidgetDecorKind::Math` 空操作）；新增纯函数 `math_hit_rect` 与 `DocLayout::math_boxes`（图像矩形 + 块源范围，矩形与 paint 绘制位置一致），`DocView::hit_source` 先按图像矩形命中并把光标落到块源范围起点，下一帧整块显示 TeX 原文（同行内公式），移开恢复渲染态；解决透明占位 run 在零高定界行旁的视觉行命中落到块外空行、点了图像却进不了编辑态的问题。新增 1 条桌面单测（命中矩形边界）。桌面 fmt/clippy/test/build 全绿（61 项）；实机截图确认点击进源码、移开恢复公式图像、无边框。
 
