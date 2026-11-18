@@ -1773,6 +1773,9 @@ struct DocLayout {
     caret_row: Option<(Pixels, Pixels)>,
     /// 任务复选框：`(窗口坐标矩形, `[ ]`/`[x]` 的源字节区间)`；点击可切换完成状态。
     task_boxes: Vec<(Bounds<Pixels>, Range<usize>)>,
+    /// 块级公式的渲染态图像矩形 + 该块的源字节区间（D76）：点击图像任意处让光标落到块内，
+    /// 触发「显示 TeX 原文」的编辑态（与行内公式一致），不依赖透明占位 run 的视觉行命中。
+    math_boxes: Vec<(Bounds<Pixels>, Range<usize>)>,
     /// 可拖动的内部列边界。
     table_resize_handles: Vec<TableResizeHandle>,
 }
@@ -4324,6 +4327,16 @@ impl DocView {
     /// 从窗口坐标命中一个**源字节偏移**（整篇命中：先算显示索引，再经 OffsetMap 映射）。
     fn hit_source(&self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout.as_ref()?;
+        // 块级公式渲染态（D76）：先按图像矩形命中。TeX 文本虽是透明占位，但图像可能比
+        // 占位文本宽/高，且定界行高度为 0，仅靠视觉行命中会落到块外空行；
+        // 这里直接把光标放进公式块，下一帧即显示 TeX 原文供编辑（同行内公式）。
+        if let Some((_, range)) = layout
+            .math_boxes
+            .iter()
+            .find(|(rect, _)| rect.contains(&position))
+        {
+            return Some(self.doc.snap_to_boundary(range.start));
+        }
         if let Some((row, col)) = layout.hit(position) {
             let block = &layout.blocks[row];
             // 渲染态的独占图片：点击左半定位到图片最前面，点击右半定位到最后面，
@@ -8068,6 +8081,21 @@ const LINE_HEIGHT: Pixels = px(24.);
 const IMAGE_VERTICAL_PAD: Pixels = px(8.);
 /// 块级公式图像与上下相邻内容的呼吸间距。
 const MATH_VERTICAL_PAD: Pixels = px(8.);
+
+/// 块级公式图像的命中矩形（窗口坐标）：与 paint 阶段绘制位置保持一致——
+/// 左缘取正文文本起点，顶边取块首视觉行顶边 + 上下呼吸间距。
+fn math_hit_rect(
+    origin: Point<Pixels>,
+    indent: Pixels,
+    row_top: Pixels,
+    image_size: Size<Pixels>,
+) -> Bounds<Pixels> {
+    bounds(
+        point(origin.x + indent, origin.y + row_top + MATH_VERTICAL_PAD),
+        image_size,
+    )
+}
+
 /// 媒体卡片与上下文字之间的呼吸间距。
 const MEDIA_VERTICAL_PAD: Pixels = px(8.);
 /// 媒体控制条高度（视频底栏/音频卡片底栏）。
@@ -9179,6 +9207,26 @@ impl Element for DocElement {
             handle.hitbox = Some(window.insert_hitbox(handle.rect, HitboxBehavior::Normal));
         }
 
+        // 块级公式命中框（D76）：矩形与 paint 阶段的绘制位置完全一致——
+        // paint 用块首视觉行顶边（`row_starts`）加 `MATH_VERTICAL_PAD`，这里同样取首行顶边。
+        // 光标进入块内后公式转为源码编辑态、命中框随之消失，点击恢复正常文本命中。
+        let math_boxes: Vec<(Bounds<Pixels>, Range<usize>)> = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, block)| {
+                let MathLineRole::Anchor(preview) = &block.math_line else {
+                    return None;
+                };
+                let rect = math_hit_rect(
+                    bounds.origin,
+                    block.indent,
+                    row_tops[row_starts[idx]],
+                    preview.size,
+                );
+                Some((rect, block.proj.source_range.clone()))
+            })
+            .collect();
+
         DocLayout {
             blocks,
             widgets,
@@ -9188,6 +9236,7 @@ impl Element for DocElement {
             row_tops,
             caret_row,
             task_boxes,
+            math_boxes,
             table_resize_handles,
         }
     }
@@ -9332,10 +9381,9 @@ impl Element for DocElement {
                             paint_corner_label(label, right, top, line_height, window, cx);
                         }
                     }
-                    // 显示公式：整体描边（公式体文字自身为斜体主题色）
-                    WidgetDecorKind::Math if !w.editing => {
-                        paint_rect_border(window, rect, palette.border, px(1.));
-                    }
+                    // 显示公式：不画背景与边框（D76 细化）——公式图像自带留白，
+                    // 去掉描边后与正文段落一样干净；渲染态/编辑态都不需要面板感。
+                    WidgetDecorKind::Math => {}
                     // 表格：弱底 + 表头带 + 外框 + 行列网格线。
                     // 网格模式下即使光标在表内也保留框线（编辑时仍要看清列边界）；
                     // 放不下而回退流式排版时，沿用旧的"编辑态隐藏装饰"行为。
@@ -10010,15 +10058,15 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
         BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
-        QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
+        MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
         copy_entry, dropped_link_markdown, footnote_jump, horizontal_step, inline_links,
         inline_reveals, is_image_path, is_markdown_file, join_math_body, markdown_image_path,
-        math_cache_key, nearest_cell, oblique, plan_imports, quote_block_wrap_width,
+        math_cache_key, math_hit_rect, nearest_cell, oblique, plan_imports, quote_block_wrap_width,
         render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
         unique_import_path,
     };
-    use super::{decode_data_image, image_resource, px, size};
+    use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
         ClipboardEntry, ClipboardItem, ExternalPaths, Image, ImageFormat, MenuItem, Resource,
     };
@@ -10396,6 +10444,21 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, out_text.len());
         assert_eq!(runs[0].color.a, 0.0, "占位字形必须透明");
+    }
+
+    /// 块级公式命中框：矩形起点与 paint 绘制位置一致，呼吸间距内不命中。
+    #[test]
+    fn math_hit_rect_covers_image_only() {
+        let origin = point(px(377.), px(140.));
+        let rect = math_hit_rect(origin, px(24.), px(800.), size(px(120.), px(48.)));
+        assert_eq!(rect.origin.x, px(401.));
+        assert_eq!(rect.origin.y, px(140.) + px(800.) + MATH_VERTICAL_PAD);
+        assert_eq!(rect.size.width, px(120.));
+        assert_eq!(rect.size.height, px(48.));
+        assert!(rect.contains(&point(px(410.), px(960.))));
+        // 上方呼吸间距仍属行盒、但不是图像本身，不应被公式命中框吃掉
+        assert!(!rect.contains(&point(px(410.), px(940.))));
+        assert!(!rect.contains(&point(px(530.), px(960.))));
     }
 
     /// 块级公式各行的 TeX 拼接：跳过 `$$` 定界行产生的空片段。
