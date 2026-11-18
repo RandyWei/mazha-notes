@@ -8,6 +8,7 @@
 //! MVP 取舍：列表一律紧凑渲染（列表项内的段落不加 `<p>`）；引用/列表可嵌套；
 //! 代码块用 `<pre><code class="language-x">`；图片解析 `![alt](dest)` 输出 `<img>`。
 
+use crate::render_assets::INLINE_MATH_ALT;
 use mazha_md::{
     Block, BlockKind, FootnoteIndex, MediaKind, SpanKind, SpanRole, SyntaxSpan, parse,
     parse_media_element,
@@ -36,6 +37,13 @@ pub(crate) fn to_xhtml_body(source: &str) -> String {
     render_body(&source, &blocks, &mut out, true);
     out
 }
+
+/// 行内公式图片的显示样式（D86）。
+///
+/// 桌面渲染的 SVG 固有尺寸按 32px 字号生成，行内公式若按原尺寸显示会明显大于正文；
+/// `max-height` 用 `em` 随正文字号缩放、宽度按宽高比自适应，不会撑破行宽；
+/// `vertical-align` 把底边略降到基线附近，观感与文字同行。块级公式/图表不加该样式。
+const INLINE_MATH_IMAGE_STYLE: &str = " style=\"max-height:1.1em;vertical-align:-0.15em\"";
 
 /// 默认内联 CSS（极简排版）。
 pub const DEFAULT_CSS: &str = r#"body{max-width:42em;margin:2em auto;padding:0 1em;
@@ -434,16 +442,29 @@ fn render_media(source: &str, out: &mut String, xhtml: bool) {
 }
 
 /// 输出图片或媒体 Widget。
+///
+/// D86：导出副本里行内公式的图片 alt 是保留标记 [`INLINE_MATH_ALT`]，这里识别后
+/// 输出 em 级 `max-height` 并把 alt 还原为「公式」，避免内部标记泄漏到 HTML/EPUB；
+/// 块级公式与 mermaid 图表保持无尺寸约束（沿用 `img{max-width:100%}` 防超宽）。
 fn render_widget(source: &str, role: SpanRole, out: &mut String, xhtml: bool) {
     if role == SpanRole::ImageMarker
         && let Some((alt, dest)) = parse_image(source)
     {
+        let inline_math = alt == INLINE_MATH_ALT;
+        let alt = if inline_math { "公式" } else { alt.as_str() };
+        let style = if inline_math {
+            INLINE_MATH_IMAGE_STYLE
+        } else {
+            ""
+        };
+        let close = if xhtml { "/" } else { "" };
         let _ = write!(
             out,
-            "<img src=\"{}\" alt=\"{}\"{}>",
+            "<img src=\"{}\" alt=\"{}\"{}{}>",
             escape_attr(&dest),
-            escape_attr(&alt),
-            if xhtml { "/" } else { "" }
+            escape_attr(alt),
+            style,
+            close
         );
     } else if role == SpanRole::MediaMarker {
         render_media(source, out, xhtml);
@@ -705,6 +726,44 @@ mod tests {
         assert_eq!(
             to_html("![图](a.png)\n"),
             "<p><img src=\"a.png\" alt=\"图\"></p>"
+        );
+    }
+
+    #[test]
+    fn inline_math_image_is_scaled_in_html_and_xhtml() {
+        // D86：行内公式的内部 alt 标记必须在两种方言都转成 em 级尺寸 + 可读 alt。
+        let src = format!("![{INLINE_MATH_ALT}](x.svg)\n");
+        let styled =
+            "<img src=\"x.svg\" alt=\"公式\" style=\"max-height:1.1em;vertical-align:-0.15em\">";
+        assert_eq!(to_html(&src), format!("<p>{styled}</p>"));
+        // XHTML 的空元素必须自闭合，样式属性本身无需改写。
+        let styled_xhtml =
+            "<img src=\"x.svg\" alt=\"公式\" style=\"max-height:1.1em;vertical-align:-0.15em\"/>";
+        assert_eq!(to_xhtml_body(&src), format!("<p>{styled_xhtml}</p>"));
+        // 普通图片（块级公式/图表）不受影响。
+        assert_eq!(
+            to_html("![图](a.png)\n"),
+            "<p><img src=\"a.png\" alt=\"图\"></p>"
+        );
+    }
+
+    #[test]
+    fn inline_math_image_with_data_uri_keeps_quotes_escaped() {
+        // data URI 中的 base64 没有引号，尺寸样式不能破坏 src 属性；dest 含引号时照常转义。
+        let src = format!("![{INLINE_MATH_ALT}](data:image/svg+xml;base64,PHN2Zz4=)\n");
+        let doc = to_html_document(&src, "标题", None);
+        assert!(
+            doc.contains("src=\"data:image/svg+xml;base64,PHN2Zz4=\""),
+            "{doc}"
+        );
+        assert!(
+            doc.contains("alt=\"公式\" style=\"max-height:1.1em"),
+            "{doc}"
+        );
+        assert!(!doc.contains(INLINE_MATH_ALT), "{doc}");
+        assert_eq!(
+            to_html("![图](a\"b.png)\n"),
+            "<p><img src=\"a&quot;b.png\" alt=\"图\"></p>"
         );
     }
 

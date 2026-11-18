@@ -6,8 +6,16 @@
 //! 关键约束：输出必须是**可编译的 Typst 标记**——可见文本里的标记特殊字符
 //! 必须转义（见 [`escape_typst`]），块与块之间必须留空行（Typst 用空行分段）。
 
+use crate::render_assets::INLINE_MATH_ALT;
 use mazha_md::{Block, BlockKind, SpanKind, SpanRole, SyntaxSpan, parse, parse_media_element};
 use std::fmt::Write as _;
+
+/// 行内公式图片的显示高度（相对当前字号，D86）。
+///
+/// 桌面渲染的 SVG 固有尺寸按 32px 字号生成，直接用会让行内公式明显大于正文，
+/// 还可能在 PDF 里因行宽不足被挤到下一行。`em` 相对正文字号、宽度按宽高比自适应，
+/// 因此既能贴近行高又不会撑破行宽；块级公式/图表不使用该约束。
+const INLINE_MATH_IMAGE_HEIGHT: &str = "1.1em";
 
 /// Typst 标记模式中具有结构含义、必须转义的字符。
 ///
@@ -355,16 +363,29 @@ fn media_to_typst(source: &str, out: &mut String) {
 }
 
 /// 图片 Widget 输出为 Typst `#image`；alt 是字符串参数而非尾随内容块。
+///
+/// D86：导出副本里行内公式的图片 alt 是保留标记 [`INLINE_MATH_ALT`]，这里识别后
+/// 按行高给出 `height: 1.1em`，同时把 alt 还原为面向读者的「公式」——保留标记
+/// 属于内部约定，不能泄漏进 PDF。块级公式与 mermaid 图表不带该标记，保持固有尺寸。
 fn image_to_typst(source: &str, out: &mut String) {
     let Some((alt, dest)) = parse_image_typst(source) else {
         return;
     };
     let dest = escape_typst_string(&dest);
+    let inline_math = alt == INLINE_MATH_ALT;
+    let alt = if inline_math { "公式" } else { alt.as_str() };
     if alt.is_empty() {
         let _ = write!(out, "#image(\"{dest}\")");
     } else {
-        let alt = escape_typst_string(&alt);
-        let _ = write!(out, "#image(\"{dest}\", alt: \"{alt}\")");
+        let alt = escape_typst_string(alt);
+        if inline_math {
+            let _ = write!(
+                out,
+                "#image(\"{dest}\", alt: \"{alt}\", height: {INLINE_MATH_IMAGE_HEIGHT})"
+            );
+        } else {
+            let _ = write!(out, "#image(\"{dest}\", alt: \"{alt}\")");
+        }
     }
 }
 
@@ -676,6 +697,30 @@ mod tests {
     fn typst_image() {
         let t = to_typst("![图](img.png)\n");
         assert!(t.contains("#image(\"img.png\", alt: \"图\")"), "{t}");
+        // 普通图片（含块级公式/图表）不加尺寸约束，保持固有尺寸（D86）。
+        assert!(!t.contains("height:"), "{t}");
+    }
+
+    #[test]
+    fn typst_inline_math_image_uses_em_height() {
+        // D86：行内公式的内部标记只在导出副本传递尺寸意图，输出必须还原为可读 alt。
+        let t = to_typst(&format!("![{INLINE_MATH_ALT}](x.svg)\n"));
+        assert!(
+            t.contains("#image(\"x.svg\", alt: \"公式\", height: 1.1em)"),
+            "{t}"
+        );
+        assert!(!t.contains(INLINE_MATH_ALT), "{t}");
+    }
+
+    #[test]
+    fn typst_inline_math_image_escapes_alt_and_dest() {
+        // 保留标记替换后仍按字符串规则转义目标路径，不能因引号破坏 Typst 语法。
+        let t = to_typst(&format!("![{INLINE_MATH_ALT}](a\"b.svg)\n"));
+        assert!(t.contains("alt: \"公式\", height: 1.1em"), "{t}");
+        assert!(t.contains("#image(\"a\\\"b.svg\""), "{t}");
+        // 普通图片 alt 中的引号同样按字符串规则转义。
+        let t = to_typst("![a\"b](img.png)\n");
+        assert!(t.contains("#image(\"img.png\", alt: \"a\\\"b\")"), "{t}");
     }
 
     #[test]

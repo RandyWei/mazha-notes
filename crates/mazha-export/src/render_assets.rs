@@ -26,6 +26,14 @@ pub enum RenderKind {
     Chart,
 }
 
+/// 行内公式导出图片的**保留 alt 标记**（D86）。
+///
+/// 桌面渲染的 SVG 按 32px 字号生成固有尺寸，行内公式若按该尺寸放置会明显大于正文，
+/// 在 PDF 中还会因行宽不足被挤到下一行。导出副本用这个内部标记把行内公式与块级
+/// 公式/图表区分开；HTML/Typst 渲染器识别后按 1.1em 缩放并还原为可读 alt「公式」。
+/// 该串只由 [`prepare_renderables`] 生成，不写回编辑器源文本。
+pub(crate) const INLINE_MATH_ALT: &str = "__mz_inline_math__";
+
 /// 一处待渲染请求：源码区间 + 归一化键（桌面按键调渲染器）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderRequest {
@@ -35,6 +43,8 @@ pub struct RenderRequest {
     pub key: String,
     /// 该内容在源文本中的字节区间（块级公式/图表覆盖整个块，含定界围栏）。
     pub range: Range<usize>,
+    /// 是否为行内内容（D86）。行内公式的图片要随行高缩放，块级公式/图表保留固有尺寸。
+    pub inline: bool,
 }
 
 /// 桌面渲染好的 SVG 资产集合（键与 [`RenderRequest::key`] 完全一致）。
@@ -206,6 +216,7 @@ fn collect_from_blocks(source: &str, blocks: &[Block], out: &mut Vec<RenderReque
                 RenderKind::Math,
                 block.range.clone(),
                 math_block_body(source, block),
+                false,
             ),
             BlockKind::CodeBlock { lang, .. }
                 if lang
@@ -217,6 +228,7 @@ fn collect_from_blocks(source: &str, blocks: &[Block], out: &mut Vec<RenderReque
                     RenderKind::Chart,
                     block.range.clone(),
                     chart_block_body(source, block),
+                    false,
                 );
             }
             _ => {
@@ -229,6 +241,7 @@ fn collect_from_blocks(source: &str, blocks: &[Block], out: &mut Vec<RenderReque
                             RenderKind::Math,
                             inline_math_range(&block.spans, i),
                             source[sp.range.clone()].to_string(),
+                            true,
                         );
                     }
                 }
@@ -239,11 +252,24 @@ fn collect_from_blocks(source: &str, blocks: &[Block], out: &mut Vec<RenderReque
 }
 
 /// 追加一条非空请求：空键（如空公式块）无从渲染，跳过。
-fn push_request(out: &mut Vec<RenderRequest>, kind: RenderKind, range: Range<usize>, key: String) {
+///
+/// `inline` 只描述**显示位置**，不改渲染键与区间；后续由导出渲染器据此施加尺寸约束。
+fn push_request(
+    out: &mut Vec<RenderRequest>,
+    kind: RenderKind,
+    range: Range<usize>,
+    key: String,
+    inline: bool,
+) {
     if key.trim().is_empty() || range.is_empty() {
         return;
     }
-    out.push(RenderRequest { kind, key, range });
+    out.push(RenderRequest {
+        kind,
+        key,
+        range,
+        inline,
+    });
 }
 
 /// 纯函数：收集 Markdown 源文本中所有需要渲染的公式/图表。
@@ -260,6 +286,7 @@ pub fn collect_render_requests(source: &str) -> Vec<RenderRequest> {
 /// 纯函数：用桌面渲染好的 SVG 在**导出副本**中替换公式/图表源码。
 ///
 /// - 有资产：替换为 `![公式](dest)` / `![图表](dest)`，交给既有图片输出通道；
+///   行内公式（D86）改用保留 alt [`INLINE_MATH_ALT`]，让渲染器按行高缩放；
 /// - 无资产：原样保留该区间（降级为字面，见 D34）；
 /// - 替换按源偏移**倒序**进行，避免先改前面的内容导致后面的区间失效。
 ///
@@ -299,9 +326,12 @@ pub fn prepare_renderables(
                 name
             }
         };
-        let alt = match request.kind {
-            RenderKind::Math => "公式",
-            RenderKind::Chart => "图表",
+        // 行内公式必须带标记才能被 HTML/Typst 渲染器识别并缩到 1.1em；
+        // 块级公式/图表保持原 alt 与固有尺寸，避免被误压缩（D86）。
+        let alt = match (request.kind, request.inline) {
+            (RenderKind::Math, true) => INLINE_MATH_ALT,
+            (RenderKind::Math, false) => "公式",
+            (RenderKind::Chart, _) => "图表",
         };
         edits.push((request.range.clone(), format!("![{alt}]({dest})")));
     }
@@ -343,6 +373,10 @@ mod tests {
         assert_eq!(requests[2].key, "graph LR\nA-->B");
         // 行内请求也覆盖整对 `$…$`（D85），与块级公式/图表一致不残留定界符。
         assert_eq!(&src[requests[0].range.clone()], "$x^2$");
+        // 只有行内公式带尺寸标记（D86）；块级公式/图表保留固有尺寸。
+        assert!(requests[0].inline);
+        assert!(!requests[1].inline);
+        assert!(!requests[2].inline);
         // 块级请求覆盖 `$$`/围栏，替换后不会残留定界符。
         assert!(src[requests[1].range.clone()].contains("$$"));
         assert!(src[requests[2].range.clone()].contains("```mermaid"));
@@ -379,6 +413,24 @@ mod tests {
         assert!(!prepared.source.contains("$x$"), "{}", prepared.source);
         assert!(!prepared.source.contains("$$b$$"), "{}", prepared.source);
         assert!(!prepared.source.contains("graph LR"), "{}", prepared.source);
+        // 行内公式带保留 alt（D86），块级公式/图表不带，避免被错误压缩。
+        assert!(
+            prepared
+                .source
+                .contains(&format!("![{INLINE_MATH_ALT}](data:")),
+            "{}",
+            prepared.source
+        );
+        assert!(
+            prepared.source.contains("![公式](data:"),
+            "{}",
+            prepared.source
+        );
+        assert!(
+            prepared.source.contains("![图表](data:"),
+            "{}",
+            prepared.source
+        );
         // base64 载荷解码后就是注入的 SVG。
         let encoded = prepared
             .source
@@ -508,6 +560,7 @@ mod tests {
         assert_eq!(requests[0].kind, RenderKind::Math);
         // 键仍为纯公式体（不含 `$`），与桌面 RaTeX 渲染键一致。
         assert_eq!(requests[0].key, "x^2");
+        assert!(requests[0].inline, "行内公式必须带尺寸标记（D86）");
         // 区间覆盖整个 `$…$`，替换后不再残留 `$`。
         assert_eq!(requests[0].range, 0..src.len());
         assert_eq!(&src[requests[0].range.clone()], "$x^2$");
@@ -515,6 +568,40 @@ mod tests {
         assets.insert_math("x^2", SVG);
         let prepared = prepare_renderables(src, &assets, AssetTarget::VirtualFile);
         assert!(!prepared.source.contains('$'), "{}", prepared.source);
+        assert_eq!(
+            prepared.source,
+            format!("![{INLINE_MATH_ALT}](__mz_asset_0.svg)")
+        );
+    }
+
+    #[test]
+    fn inline_math_and_block_images_carry_distinct_alt_markers() {
+        // 同一文档内行内公式/块级公式/图表混排：只有行内公式被标记为需缩放。
+        let src = "行内 $x$：\n\n$$b$$\n\n```mermaid\ngraph LR; A-->B\n```\n";
+        let mut assets = RenderAssets::new();
+        assets.insert_math("x", SVG);
+        assets.insert_math("b", SVG);
+        assets.insert_chart("graph LR; A-->B", SVG);
+        let prepared = prepare_renderables(src, &assets, AssetTarget::VirtualFile);
+        assert_eq!(prepared.files.len(), 3, "{:?}", prepared.files);
+        assert!(
+            prepared
+                .source
+                .contains(&format!("![{INLINE_MATH_ALT}](__mz_asset_0.svg)")),
+            "{}",
+            prepared.source
+        );
+        assert!(
+            prepared.source.contains("![公式](__mz_asset_1.svg)"),
+            "{}",
+            prepared.source
+        );
+        assert!(
+            prepared.source.contains("![图表](__mz_asset_2.svg)"),
+            "{}",
+            prepared.source
+        );
+        assert_eq!(prepared.source.matches(INLINE_MATH_ALT).count(), 1);
     }
 
     #[test]
@@ -528,7 +615,7 @@ mod tests {
         assert!(
             prepared
                 .source
-                .contains("![公式](data:image/svg+xml;base64,"),
+                .contains(&format!("![{INLINE_MATH_ALT}](data:image/svg+xml;base64,")),
             "{}",
             prepared.source
         );
@@ -558,6 +645,7 @@ mod tests {
         assert_eq!(requests[1].range, b..b + 3);
         assert_eq!(requests[0].key, "a");
         assert_eq!(requests[1].key, "b");
+        assert!(requests[0].inline && requests[1].inline);
         // 区间不重叠，也不覆盖两个公式之间的文字。
         assert!(requests[0].range.end <= requests[1].range.start);
         assert!(!requests[0].range.contains(&b));
