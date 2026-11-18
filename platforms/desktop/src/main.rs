@@ -119,7 +119,7 @@ $$
 graph LR
   A[开始] --> B{决策}
   B -->|是| C[完成]
-  B -->|否| A
+  B -->|否| D[重试]
 ```
 
 ### 其他
@@ -7507,7 +7507,16 @@ fn chart_cache_key(src: &str) -> String {
 /// [`gpui::SMOOTH_SVG_SCALE_FACTOR`]；显示时的宽度适配由 `fit_image_size` 负责。
 /// `None` 表示解析或栅格化失败（不支持的图类型、语法错误、SVG 尺寸异常）。
 fn render_chart_preview(src: &str, renderer: &gpui::SvgRenderer) -> Option<ChartPreview> {
-    let svg = mermaid_rs_renderer::render(src).ok()?;
+    // 背景透明（D77 细化）：mermaid-rs 默认在 SVG 根节点画一个白色 <rect>，深色主题下
+    // 会是突兀的白块；把 theme.background 设为 transparent，让图表融入应用编辑区底色。
+    // 其余配色仍走 modern 主题，保证节点/连线/箭头在明暗主题下都清晰。
+    let mut theme = mermaid_rs_renderer::Theme::modern();
+    theme.background = "transparent".to_string();
+    let opts = mermaid_rs_renderer::RenderOptions {
+        theme,
+        ..Default::default()
+    };
+    let svg = mermaid_rs_renderer::render_with_options(src, opts).ok()?;
     let data = renderer.render_single_frame(svg.as_bytes(), 1.0).ok()?;
     let physical = data.size(0);
     let scale = gpui::SMOOTH_SVG_SCALE_FACTOR;
@@ -9890,11 +9899,11 @@ impl Element for DocElement {
                 );
             }
 
-            // Mermaid 图表（R4 第二步）：源码已透明占位，这里把栅格化后的 SVG 画在
-            // 锚点行；弱底 + 圆角 + 描边与图片块一致，让浅色节点在深色主题下也可辨。
+            // Mermaid 图表（R4 第二步，D77 细化）：源码已透明占位，这里把栅格化后的
+            // SVG 画在锚点行。不画弱底与描边（同 D76 公式块）——SVG 背景已设为
+            // transparent，节点自带浅底/描边，外加面板底与边框只会与编辑区割裂。
             if let ChartLineRole::Anchor(preview) = &block.chart_line {
                 let rect = bounds(point(text_x, row_top + CHART_VERTICAL_PAD), preview.size);
-                window.paint_quad(fill(rect, palette.subtle));
                 let _ = window.paint_image(
                     rect,
                     rect,
@@ -9908,7 +9917,6 @@ impl Element for DocElement {
                     0,
                     false,
                 );
-                paint_rect_border(window, rect, palette.border, px(1.));
             }
 
             // 独占行音视频：视频帧/海报/占位卡片 + 底部控制条与进度。
@@ -10961,6 +10969,9 @@ mod tests {
         let pixels = preview.data.as_bytes(0).expect("图表图像应有首帧");
         let drawn = pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(drawn > 100, "图表图像不应为空白，实际不透明像素 {drawn}");
+        // 背景透明（D77 细化）：SVG 根节点白底已设 transparent，角落 padding 区
+        // 没有节点/连线，alpha 应为 0；否则深色主题下会出现突兀白块。
+        assert_eq!(pixels[3], 0, "图表背景应透明，左上角 alpha 应为 0");
         assert!(render_chart_preview("not a mermaid diagram @@@", &renderer).is_none());
     }
 
