@@ -7,11 +7,13 @@
 //!
 //! 1. `renumber`：把引用与定义头部的标签文本替换成序号（如 `[^note]` → `[^1]`）；
 //!    只改写 `SpanRole::FootnoteRef` 片段，代码块/公式等字面量不受影响。
-//! 2. `move_definitions`：把**顶层**脚注定义块整块移到文末，并按序号排序。
+//! 2. `move_definitions`：把**所有**脚注定义块（含引用/列表内的嵌套定义）整块移到
+//!    文末并按序号排序；嵌套定义先剥离容器前缀（`> `/列表标记/缩进），保证归集后
+//!    仍是合法的顶层定义块（D81）。
 //!
-//! 保留的限制（写入 SPEC D69）：
-//! - 嵌套在引用/列表里的定义块不移动（移动会破坏容器结构），但仍会重新编号；
+//! 保留的限制（写入 SPEC D69/D81）：
 //! - 重复定义的标签都改成同一序号，位置按序号稳定排序；
+//! - 嵌套定义的容器前缀只识别空格与 `>` / 列表标记，tab 或混合前缀保留原样；
 //! - 没有脚注的文档走快速路径，返回的字符串与输入逐字节相同。
 
 use mazha_md::{Block, BlockKind, FootnoteIndex, SpanKind, SpanRole, parse};
@@ -65,35 +67,27 @@ fn collect_label_spans(blocks: &[Block], out: &mut Vec<Range<usize>>) {
     }
 }
 
-/// 把顶层脚注定义块移到文末，并按序号升序排列。
+/// 把所有脚注定义块（含嵌套在引用/列表内的）移到文末，并按序号升序排列。
 ///
-/// 只处理顶层块：引用/列表内部的定义保持原位（移动会破坏容器前缀），
-/// 它们已经被 `renumber` 编号，仍按原位渲染。
+/// D81 起不再只处理顶层块：嵌套定义原先虽被 `renumber` 编号但留在容器内，无法在
+/// 统一文末脚注区阅读。这里递归收集全部定义块，剥离容器前缀后归集到文末。
 fn move_definitions(source: &str) -> String {
     let blocks = parse(source);
-    let mut defs: Vec<(usize, Range<usize>)> = blocks
-        .iter()
-        .filter_map(|block| match &block.kind {
-            BlockKind::FootnoteDef { label } => Some((
-                label.parse::<usize>().unwrap_or(usize::MAX),
-                block.range.clone(),
-            )),
-            _ => None,
-        })
-        .collect();
+    let mut defs: Vec<(usize, &Block)> = Vec::new();
+    collect_defs(&blocks, &mut defs);
     if defs.is_empty() {
         return source.to_string();
     }
 
-    // 先按序号排序取出文本（此时源文本尚未删除，区间有效）。
+    // 先按序号排序取出（已剥离前缀的）文本；此时源文本尚未删除，区间仍然有效。
     defs.sort_by_key(|(number, _)| *number);
-    let texts: Vec<&str> = defs
+    let texts: Vec<String> = defs
         .iter()
-        .filter_map(|(_, range)| source.get(range.clone()))
+        .filter_map(|(_, block)| cleaned_def_text(source, block))
         .collect();
 
     // 删除必须按**源偏移倒序**（与序号顺序无关），否则先删前面的定义会让后面区间失效。
-    let mut cuts: Vec<&Range<usize>> = defs.iter().map(|(_, range)| range).collect();
+    let mut cuts: Vec<Range<usize>> = defs.iter().map(|(_, b)| b.range.clone()).collect();
     cuts.sort_by_key(|range| std::cmp::Reverse(range.start));
     let mut body = source.to_string();
     for range in cuts {
@@ -111,6 +105,52 @@ fn move_definitions(source: &str) -> String {
     }
     out.push('\n');
     out
+}
+
+/// 深度优先收集所有脚注定义块（顶层 + 嵌套在引用/列表内的），附重编号后的序号。
+fn collect_defs<'a>(blocks: &'a [Block], out: &mut Vec<(usize, &'a Block)>) {
+    for block in blocks {
+        if let BlockKind::FootnoteDef { label } = &block.kind {
+            out.push((label.parse::<usize>().unwrap_or(usize::MAX), block));
+        }
+        collect_defs(&block.children, out);
+    }
+}
+
+/// 取定义块源文本并剥离嵌套容器前缀，使其归集后仍能被解析为顶层定义块。
+///
+/// 首行 `[^` 之前的部分即容器前缀（如 `> `、`- `、`  - ` 或纯缩进）。续行若以
+/// 同一前缀开头就整段剥掉；列表项续行只有缩进、没有列表标记，此时剥掉与前缀
+/// 等宽的前导空格。**边界**：只按字节剥空格/`>`/列表标记，tab 或混合前缀不识别，
+/// 保留原样（退化为就地渲染，不破坏结构）。
+fn cleaned_def_text(source: &str, block: &Block) -> Option<String> {
+    let text = source.get(block.range.clone())?;
+    let first_line = text.split('\n').next().unwrap_or("");
+    let prefix = first_line.get(..first_line.find("[^")?)?;
+    if prefix.is_empty() {
+        return Some(text.to_string());
+    }
+    let prefix_len = prefix.len();
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if i == 0 || line.starts_with(prefix) {
+            // 首行必带完整前缀；引用内的续行也带同样的 `> ` 前缀。
+            out.push_str(&line[prefix_len..]);
+        } else {
+            // 列表项续行只有缩进（宽度 == 列表标记宽度），剥掉同宽空格后
+            // 恰好留下脚注定义续行需要的 4 空格缩进。
+            let spaces = line
+                .bytes()
+                .take_while(|b| *b == b' ')
+                .count()
+                .min(prefix_len);
+            out.push_str(&line[spaces..]);
+        }
+    }
+    Some(out)
 }
 
 /// 行首字节偏移（`pos` 所在行）。
@@ -165,12 +205,49 @@ mod tests {
     }
 
     #[test]
-    fn nested_definition_stays_in_place_but_is_renumbered() {
-        // 引用内的定义块不移动（保结构），只改标签
+    fn nested_quote_definition_is_collected_with_prefix_stripped() {
+        // D81：引用内的定义块剥掉 `> ` 前缀后归集文末（D69 仅重编号、留在原地）
         let src = "> [^a]: A\n\n见[^a]\n";
         let out = prepare(src);
-        assert!(out.starts_with("> [^1]: A"), "{out}");
-        assert!(out.contains("见[^1]"), "{out}");
+        assert!(out.trim_start().starts_with("见[^1]"), "{out}");
+        assert!(out.trim_end().ends_with("[^1]: A"), "{out}");
+        assert!(!out.contains("> [^1]"), "{out}");
+    }
+
+    #[test]
+    fn nested_list_definition_keeps_four_space_continuation_indent() {
+        // 列表项续行只有缩进（列表标记宽度 + 4），剥掉标记宽度后须留下 4 空格定义缩进
+        let src = "- [^a]: first\n      续行\n\n见[^a]\n";
+        let out = prepare(src);
+        assert!(out.trim_end().ends_with("[^1]: first\n    续行"), "{out}");
+        assert!(!out.contains("- [^1]"), "{out}");
+    }
+
+    #[test]
+    fn nested_and_top_level_definitions_are_sorted_by_number() {
+        // 引用顺序 b → a；一个嵌套、一个顶层，归集后按序号统一排序
+        let src = "> [^b]: B\n\n见[^b]与[^a]。\n\n[^a]: A\n";
+        let out = prepare(src);
+        assert!(out.trim_end().ends_with("[^1]: B\n\n[^2]: A"), "{out}");
+        assert!(!out.contains("> [^1]"), "{out}");
+    }
+
+    #[test]
+    fn cleaned_def_text_handles_quote_and_plain_prefixes() {
+        // 纯函数：引用前缀与续行剥离、顶层缩进剥离
+        let mk = |range: Range<usize>| {
+            Block::leaf(BlockKind::FootnoteDef { label: "1".into() }, range, vec![])
+        };
+        let src = "> [^1]: A\n>     cont\n";
+        let block = mk(0..src.len());
+        assert_eq!(
+            cleaned_def_text(src, &block).as_deref(),
+            Some("[^1]: A\n    cont\n")
+        );
+
+        let src = "  [^1]: B\n";
+        let block = mk(0..src.len());
+        assert_eq!(cleaned_def_text(src, &block).as_deref(), Some("[^1]: B\n"));
     }
 
     #[test]

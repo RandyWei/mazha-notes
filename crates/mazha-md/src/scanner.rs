@@ -978,8 +978,10 @@ fn build_list_item(
         {
             break;
         }
-        // 续行：保留其余部分（缩进已在 content 中被后续扫描处理）
-        let stripped = indent(nrest).min(nl.content + marker.len);
+        // 续行：只剥掉与列表标记等宽的缩进，多余缩进留给子块（脚注定义续行需要 ≥4 空格）。
+        // 这里 indent() 是相对 nl.content 的，不能再加 nl.content（绝对偏移），否则会把
+        // 续行全部空白剥光，导致引用/列表内脚注定义的续行不被吸进定义块（D81）。
+        let stripped = indent(nrest).min(marker.len);
         let content = (nl.content + stripped).min(nl.end);
         inner.push(Line {
             start: nl.start,
@@ -2097,6 +2099,19 @@ mod footnote_tests {
         let def = &item.children[0];
         assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
         assert_eq!(visible_text(src, def), "1 note");
+    }
+
+    #[test]
+    fn footnote_def_in_list_absorbs_indented_continuation() {
+        // D81：列表项续行只剥列表标记宽度（2），保留脚注定义续行需要的 4 空格缩进，
+        // 否则续行会被误拆成同级段落、归集时与定义头分离。
+        let src = "- [^1]: first\n      续行\n";
+        let list = block(src);
+        let item = &list.children[0];
+        assert_eq!(item.children.len(), 1, "{:#?}", item.children);
+        let def = &item.children[0];
+        assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
+        assert_eq!(visible_text(src, def), "1 first续行");
     }
 
     #[test]

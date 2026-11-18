@@ -9,7 +9,8 @@
 //! 代码块用 `<pre><code class="language-x">`；图片解析 `![alt](dest)` 输出 `<img>`。
 
 use mazha_md::{
-    Block, BlockKind, MediaKind, SpanKind, SpanRole, SyntaxSpan, parse, parse_media_element,
+    Block, BlockKind, FootnoteIndex, MediaKind, SpanKind, SpanRole, SyntaxSpan, parse,
+    parse_media_element,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -55,6 +56,7 @@ div.math{margin:1em 0;padding:.5em 0;text-align:center}
 span.math{font-style:italic}
 .fnref{font-size:.75em;vertical-align:super;color:#57606a;padding:0 .1em}
 .fnref a{color:inherit;text-decoration:none}
+.fnback{font-size:.8em;color:#0969da;text-decoration:none;padding-left:.3em}
 .footnotes{margin-top:2em;padding-top:1em;border-top:1px solid #d0d7de;font-size:.9em;color:#57606a}
 .footnotes ol{padding-left:1.6em}
 .footnotes li{margin:.3em 0}
@@ -95,7 +97,10 @@ pub fn to_html_themed(source: &str, title: &str, theme: &crate::Theme) -> String
 /// `<section class="footnotes"><ol>`，让导出结果有统一的"脚注"区块。
 /// 嵌套在引用/列表里的定义仍由 [`render_block`] 按块内 `<div class="footnote">` 渲染。
 fn render_body(source: &str, blocks: &[Block], out: &mut String, xhtml: bool) {
-    // `prepare` 已把顶层定义移到末尾，正常情况下只开一次小节；
+    // D81：回链需要「定义 → 首个引用」的偏移，索引基于 prepare 后的源文本构建，
+    // 只在渲染阶段读一次，不写回 Markdown、也不影响 WYSIWYG 的 1:1 偏移映射。
+    let footnote_index = FootnoteIndex::new(source, blocks);
+    // `prepare` 已把定义移到末尾，正常情况下只开一次小节；
     // 这里仍按"遇到定义就开、遇到普通块就关"处理，避免出现 `<ol>` 里夹段落的非法结构。
     let mut section_open = false;
     for block in blocks {
@@ -104,7 +109,7 @@ fn render_body(source: &str, blocks: &[Block], out: &mut String, xhtml: bool) {
                 out.push_str("<section class=\"footnotes\">\n<ol>\n");
                 section_open = true;
             }
-            render_footnote_item(source, block, out, xhtml);
+            render_footnote_item(source, block, out, xhtml, &footnote_index);
         } else {
             if section_open {
                 out.push_str("</ol>\n</section>");
@@ -118,11 +123,17 @@ fn render_body(source: &str, blocks: &[Block], out: &mut String, xhtml: bool) {
     }
 }
 
-/// 渲染文末脚注列表中的一项：`<li>` + 定义正文。
+/// 渲染文末脚注列表中的一项：`<li>` + 定义正文 + 回到首个引用的 `↩` 回链。
 ///
 /// 序号已经由 `prepare` 写进标签（并作为 `<li id="fn-N">` 的锚点），
 /// 因此跳过定义头部的标签片段，避免正文里再出现一次上标序号。
-fn render_footnote_item(source: &str, block: &Block, out: &mut String, xhtml: bool) {
+fn render_footnote_item(
+    source: &str,
+    block: &Block,
+    out: &mut String,
+    xhtml: bool,
+    index: &FootnoteIndex,
+) {
     let BlockKind::FootnoteDef { label } = &block.kind else {
         return;
     };
@@ -133,7 +144,22 @@ fn render_footnote_item(source: &str, block: &Block, out: &mut String, xhtml: bo
         .position(|s| s.kind == SpanKind::Text && s.role == SpanRole::FootnoteRef)
         .map_or(0, |i| i + 1);
     render_inline(source, &block.spans[body_start..], out, xhtml);
+    push_backlink(label, index, out);
     out.push_str("</li>\n");
+}
+
+/// 输出文末定义 → 首个正文引用的回链（D81）。
+///
+/// 多次引用只回跳第一个，与桌面 `footnote_jump` 的定义→首个引用语义一致；
+/// 未被引用（无锚点）的定义不输出回链。
+fn push_backlink(label: &str, index: &FootnoteIndex, out: &mut String) {
+    if let Some(first) = index.get(label).and_then(|e| e.references.first()) {
+        let _ = write!(
+            out,
+            "<a class=\"fnback\" href=\"#fnref-{}\">↩</a>",
+            first.start
+        );
+    }
 }
 
 /// 渲染一组块；`tight` 为真时不给段落包 `<p>`（用于列表项），`xhtml` 为真时空元素自闭合。
@@ -562,13 +588,15 @@ impl InlineState {
     }
 }
 
-/// 输出行内脚注引用（D69）：序号（`prepare` 已把标签重编号）包 `<sup class="fnref">`，
-/// 并链接到文末定义 `<li id="fn-N">`。
+/// 输出行内脚注引用（D69/D81）：序号（`prepare` 已把标签重编号）包 `<sup class="fnref">`，
+/// 链接到文末定义 `<li id="fn-N">`，同时以**重编号后源文本字节偏移**作唯一锚点
+/// `fnref-{偏移}`，供定义侧 `↩` 回链定位（多次引用各自有独立锚点）。
 fn push_footnote_ref(source: &str, sp: &SyntaxSpan, out: &mut String) {
     let label = &source[sp.range.clone()];
     let _ = write!(
         out,
-        "<sup class=\"fnref\"><a href=\"#fn-{}\">{}</a></sup>",
+        "<sup class=\"fnref\"><a id=\"fnref-{}\" href=\"#fn-{}\">{}</a></sup>",
+        sp.range.start,
         escape_attr(label),
         escape_text(label)
     );
@@ -931,16 +959,17 @@ mod tests {
 
     #[test]
     fn html_footnote_ref_is_linked_sup() {
-        // 引用：`[^`/`]` 隐藏；标签重编号为上标，并链接到文末定义锚点
+        // 引用：`[^`/`]` 隐藏；标签重编号为上标，链接到文末定义并带唯一回链锚点（D81）
         assert_eq!(
             to_html("见[^1]处\n"),
-            "<p>见<sup class=\"fnref\"><a href=\"#fn-1\">1</a></sup>处</p>"
+            "<p>见<sup class=\"fnref\"><a id=\"fnref-5\" href=\"#fn-1\">1</a></sup>处</p>"
         );
     }
 
     #[test]
     fn html_footnote_def_is_collected_at_end() {
         // 定义：`[^label]:` 隐藏，整块归集到文末 `<section class="footnotes"><ol>`
+        // 该定义未被引用，D81 的 `↩` 回链不输出
         assert_eq!(
             to_html("[^1]: note\n"),
             "<section class=\"footnotes\">\n<ol>\n<li id=\"fn-1\"> note</li>\n</ol>\n</section>"
@@ -949,15 +978,15 @@ mod tests {
 
     #[test]
     fn html_footnotes_are_numbered_by_reference_order() {
-        // 引用顺序 b → a：b 为 1、a 为 2；文末定义也按序号排序
+        // 引用顺序 b → a：b 为 1、a 为 2；文末定义按序号排序，各带回链（D81）
         let html = to_html("见[^b]与[^a]。\n\n[^a]: A\n[^b]: B\n");
         assert_eq!(
             html,
-            "<p>见<sup class=\"fnref\"><a href=\"#fn-1\">1</a></sup>与\
-             <sup class=\"fnref\"><a href=\"#fn-2\">2</a></sup>。</p>\
+            "<p>见<sup class=\"fnref\"><a id=\"fnref-5\" href=\"#fn-1\">1</a></sup>与\
+             <sup class=\"fnref\"><a id=\"fnref-12\" href=\"#fn-2\">2</a></sup>。</p>\
              <section class=\"footnotes\">\n<ol>\n\
-             <li id=\"fn-1\"> B</li>\n\
-             <li id=\"fn-2\"> A</li>\n\
+             <li id=\"fn-1\"> B<a class=\"fnback\" href=\"#fnref-5\">↩</a></li>\n\
+             <li id=\"fn-2\"> A<a class=\"fnback\" href=\"#fnref-12\">↩</a></li>\n\
              </ol>\n</section>"
         );
     }
@@ -965,16 +994,29 @@ mod tests {
     #[test]
     fn html_unreferenced_footnote_is_collected_after_referenced() {
         let html = to_html("见[^a]\n\n[^a]: A\n[^b]: B\n");
-        assert!(html.contains("<a href=\"#fn-1\">1</a>"), "{html}");
-        assert!(html.contains("<li id=\"fn-1\"> A</li>"), "{html}");
+        assert!(
+            html.contains("<a id=\"fnref-5\" href=\"#fn-1\">1</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<li id=\"fn-1\"> A<a class=\"fnback\" href=\"#fnref-5\">↩</a></li>"),
+            "{html}"
+        );
+        // 未被引用：无回链
         assert!(html.contains("<li id=\"fn-2\"> B</li>"), "{html}");
     }
 
     #[test]
-    fn html_repeated_reference_shares_number() {
+    fn html_repeated_reference_shares_number_but_has_unique_anchors() {
         let html = to_html("甲[^note]乙[^note]\n\n[^note]: N\n");
         assert_eq!(html.matches("href=\"#fn-1\"").count(), 2, "{html}");
         assert_eq!(html.matches("<li id=\"fn-1\">").count(), 1, "{html}");
+        // 多次引用各自有唯一锚点；定义回链只指向第一个（与桌面 footnote_jump 一致）
+        assert!(html.contains("id=\"fnref-5\""), "{html}");
+        assert!(html.contains("id=\"fnref-12\""), "{html}");
+        assert_eq!(html.matches("class=\"fnback\"").count(), 1, "{html}");
+        assert!(html.contains("href=\"#fnref-5\""), "{html}");
+        assert!(!html.contains("href=\"#fnref-12\""), "{html}");
     }
 
     #[test]
@@ -986,9 +1028,23 @@ mod tests {
     }
 
     #[test]
+    fn html_nested_definition_is_collected_with_backlink() {
+        // D81：引用内定义剥 `> ` 前缀归集文末，作为顶层 <li> 输出并带回链
+        let html = to_html("> [^a]: A\n\n见[^a]\n");
+        assert!(html.contains("<p>见<sup class=\"fnref\">"), "{html}");
+        assert!(
+            html.contains("<li id=\"fn-1\"> A<a class=\"fnback\""),
+            "{html}"
+        );
+        assert!(!html.contains("<blockquote>"), "{html}");
+        assert!(!html.contains("div class=\"footnote\""), "{html}");
+    }
+
+    #[test]
     fn html_footnote_default_css_has_rules() {
         let doc = to_html_document("见[^1]处\n\n[^1]: note\n", "t", None);
         assert!(doc.contains(".fnref"), "{doc}");
+        assert!(doc.contains(".fnback"), "{doc}");
         assert!(doc.contains(".footnotes"), "{doc}");
         assert!(doc.contains("div.footnote"), "{doc}");
     }

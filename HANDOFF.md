@@ -6,7 +6,7 @@
 - 最近更新：2026-11-18
 - 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + **文件树层级化（目录展开折叠/目录内新建，D70）** + **文件树拖拽移动/新建文件夹（D71）** + **展开状态持久化（D72）** + **拖拽落点高亮/跨应用拖拽（D73）** + **入站外部拖拽（从 Finder 拖入，D74）** + **侧栏标题固定（D75）** + **数学公式真实排版 RaTeX（D76，块级公式居左/点击编辑/无边框/编辑态显 TeX，行内不重叠）** + **Mermaid 图表真实渲染（D77，R4 第二步，mermaid-rs → SVG → GPUI 栅格化）** + **全工作区搜索 Cmd+Shift+F（D40）** + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39（**已移至右侧独立面板 D70**）+ 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68 + 脚注双向跳转与导出编号/文末归集 D69，源码模式已修复任务列表/引用块渲染装饰残留）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.106**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.107**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -27,10 +27,10 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | crate | 状态 | 能力面（要点） | 待办 |
 |-------|------|----------------|------|
 | `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/块缓存+投影缓存**双增量**维护/`apply_and_sync`）、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`WidgetKind::{Image,Media}`/`RunStyle` + **块级 widget** `BlockWidget{source_range,line_range,kind}`、`BlockWidgetKind::{Code{lang,fenced},Table{align},Rule,Math,Chart{lang},Image{alt,dest}}` + `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标**（`DocPos`/`LineDisplayRange`/`source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`selection_display_ranges`）、显示列↔字节换算（软换行用）、`commands`、`IntentMapper`、`table::edit_table`、`highlight::Highlighter`（syntect）、`find::{find_all,replace_all,replace_all_edit}`、导航（行范围/CJK 词范围）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接 | `DocId` |
-| `mazha-md` | ✅ Phase 1 完成（方言全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏/缩进代码、引用、列表/任务、GFM 表格、Callout、Front-matter、**`$$…$$` 显示公式**、**`[^label]: body` 脚注定义**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/wiki-link/tags/`$…$` 行内公式/**`[^label]` 脚注引用**/转义/**内联 HTML 标签与 `<font>` 颜色/`<br>` 剥离**，D56；**单行 `<video>`/`<audio>` 媒体元素**，D64）、`serialize_source`/`to_md`（前缀穿线，逐字节往返 + 幂等）、`reparse`（脏块增量 + 裁切点安全校验）、`FootnoteIndex`（引用首次出现顺序编号 + 引用/定义区间查询，D69） | HTML 块、惰性续行、多段落脚注（见 SPEC §9.1/§15） |
+| `mazha-md` | ✅ Phase 1 完成（方言全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏/缩进代码、引用、列表/任务、GFM 表格、Callout、Front-matter、**`$$…$$` 显示公式**、**`[^label]: body` 脚注定义**）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/wiki-link/tags/`$…$` 行内公式/**`[^label]` 脚注引用**/转义/**内联 HTML 标签与 `<font>` 颜色/`<br>` 剥离**，D56；**单行 `<video>`/`<audio>` 媒体元素**，D64）、`serialize_source`/`to_md`（前缀穿线，逐字节往返 + 幂等）、`reparse`（脏块增量 + 裁切点安全校验）、`FootnoteIndex`（引用首次出现顺序编号 + 引用/定义区间查询，D69）；列表项续行只剥标记宽度缩进（D81 修正，嵌套脚注定义续行不再脱离定义块） | HTML 块、惰性续行、多段落脚注（见 SPEC §9.1/§15） |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text`，字符↔字节）、insert/delete/replace/push、状态向量 + 增量更新（Yjs v1）、`apply_update`、`fork`、`snapshot`、并发收敛、落盘（`save_crdt`/`load_crdt`） | 多文档名册 |
-| `mazha-export` | ✅ HTML + PDF + DOCX + EPUB + 主题/模板 | `to_html*`（完整外壳 + 默认 CSS + 主题）、`to_typst*` + `to_pdf*`（`ExportWorld` 实现 `typst::World` → `typst::compile` + `typst_pdf`；`PdfDocument{bytes,warnings,pages}`；真实文档回归 `tests/pdf_real_doc.rs`）、`to_docx*`（docx-rs 1.1 直出 OOXML）、`to_epub*`（Zip + XHTML，EPUB 3，输出确定）、`Theme`/`Template`；**脚注导出前规整**（`footnotes::prepare`：按引用顺序编号 + 顶层定义归集文末，HTML/EPUB 带 `<sup class="fnref">`/`<section class="footnotes"><ol>` 锚点，Typst/DOCX 纯文本编号，D69）；块/行内特性与编辑器同源（含公式、脚注；媒体在 HTML/EPUB 保留可播放标签，PDF/DOCX 输出占位） | 字体子集（Web，Phase 7） |
+| `mazha-export` | ✅ HTML + PDF + DOCX + EPUB + 主题/模板 | `to_html*`（完整外壳 + 默认 CSS + 主题）、`to_typst*` + `to_pdf*`（`ExportWorld` 实现 `typst::World` → `typst::compile` + `typst_pdf`；`PdfDocument{bytes,warnings,pages}`；真实文档回归 `tests/pdf_real_doc.rs`）、`to_docx*`（docx-rs 1.1 直出 OOXML）、`to_epub*`（Zip + XHTML，EPUB 3，输出确定）、`Theme`/`Template`；**脚注导出前规整**（`footnotes::prepare`：按引用顺序编号 + **所有**定义含嵌套归集文末并剥容器前缀，HTML/EPUB 带 `<sup class="fnref">` 唯一锚点 + `<section class="footnotes"><ol>` + 定义侧 `↩` 回链，Typst/DOCX 纯文本编号，D69/D81）；块/行内特性与编辑器同源（含公式、脚注；媒体在 HTML/EPUB 保留可播放标签，PDF/DOCX 输出占位） | 字体子集（Web，Phase 7） |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权（Phase 5） |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（Phase 6） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -49,11 +49,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 | crate | 数量 |
 |-------|------|
 | `mazha-core` | 204 |
-| `mazha-md` | 176 |
-| `mazha-export` | 139 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
+| `mazha-md` | 177 |
+| `mazha-export` | 143 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
-| 合计 | **548**（其余含 store 与占位 crate 测试） |
-| `platforms/desktop`（独立 workspace） | 81（不计入上面的 548） |
+| 合计 | **553**（其余含 store 与占位 crate 测试） |
+| `platforms/desktop`（独立 workspace） | 81（不计入上面的 553） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -89,6 +89,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 - **D78**：**专注段落粒度 + 打字机中心带细化**——专注范围由「当前单个逻辑行」改为「光标所在段落」：块级 widget 整块高亮，普通行向上下扩展连续文本行（空行/标题/列表/任务/引用/代码块/表格/分割线/块 widget 行截断），标题等带块级语义的行只高亮自身（桌面纯函数 `focus_line_range` + 单测）；打字机滚动由「每次强制居中」改为「中心带」：光标中心落在视口中间 50% 内不滚动、越出才滚回带边缘（纯函数 `typewriter_scroll_y` + 单测，滚动上界 clamp 仍把正偏移截到 0、内容不上移露白）；大纲/查找跳转置顶（D59）不变。核心/导出/源码模式不改。
 - **D79**：**中文斜体合成优化（D43 遗留）**——轮廓按 `(字符, 字号)` 缓存为本地坐标路径（`oblique::cached_path` / `place_path`），paint 阶段只平移顶点与包围盒，不再逐字取 CoreText；绘制原点按 gpui 原生字形公式校正：叠加形状化字形 `position.y` 微调（`glyph_y_for_index`）+ 按 DPR half-toward-zero 设备像素对齐（`snap_origin`），消除与透明占位 run 不足 1px 的错位。不做 Metal 着色器（风险高）。核心/导出/其它平台不改；抗锯齿算法差异仍存在。
 - **D80**：**合成斜体中文发虚根治**——查 gpui-pre 0.3.9 确认路径着色器的解析式 AA 因 `build_path` 写死 `st=(0,1)` 而失效，只剩 ≤4× MSAA、无灰阶 AA/字干加粗，1px 字干发虚。macOS 改由 CoreText `CTFontDrawGlyphs` + 剪切文本矩阵直接栅格化倾斜字形到 DPR 分辨率位图（`oblique::cached_glyph`），读 alpha 配 span 颜色烘成 `RenderImage` 交 `paint_image` 1:1 叠加；位图几何抽纯函数 `shear_ink_bounds`/`raster_geometry`/`raster_placement`，宽高/原点都取整数设备像素避免二次采样模糊；CJK 透明占位 advance 不变（OffsetMap/光标/选区映射不受影响）。按 `(字符, 字号, DPR, 颜色)` 缓存（含失败缓存 + 容量上限），栅格化失败回退 D79 轮廓路径；非 macOS 仍无合成斜体。核心/导出/其它平台不改，已由用户实机验收通过。
+- **D81**：**脚注增强（D69 遗留）**——HTML/EPUB 引用输出唯一锚点 `fnref-{源字节偏移}`（多次引用各自独立），文末 `<li id="fn-N">` 追加 `↩` 回链到首个引用（与桌面 `footnote_jump` 一致）；`footnotes::prepare` 递归收集**所有** `FootnoteDef`（含引用/列表内嵌套），剥离容器前缀后统一归集文末；`mazha-md` 修正列表项续行缩进解析以支持嵌套定义续行。桌面/核心/其它平台不改。A（软换行横向滚动）评估为高风险坐标体系重构未选，记入 SPEC D81。
 - **R8**（PDF 真实文档回归）/ **R10**（`platforms/*` 独立 workspace，须单独门禁 + 同步独立 `Cargo.lock`）：见 SPEC §13。
 
 ## 依赖方向（不可违反）
@@ -110,13 +111,14 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 1. **Phase 4 余项**：**文件树层级化（D70）、拖拽移动/新建文件夹（D71）、展开状态持久化（D72）、拖拽落点高亮/跨应用拖拽（D73）、全工作区搜索 `Cmd+Shift+F`（D40）均已完成**；**当前文档查找/替换** `Cmd+F` 已于 0.1.49 实现。跨应用拖拽（出站）已于 2026-11-18 实机验收通过：把条目拖出窗口交给系统原生拖拽，落入目标目录时**复制文件**到该目录（原条目保留）；**入站**外部拖拽（从 Finder 拖文件进窗口）已于 0.1.96 落地（D74），Finder→窗口入站拖拽亦已实机验收通过。专注/打字机/源码（代码）模式已于 0.1.90 落地（D68）；**0.1.104 完成首轮打磨（D78）**：专注改段落粒度、打字机改中心带；源码模式下表格/媒体已按源码行显示（预览渲染在 `raw_src` 分支被抑制），剩余为交互细节打磨（如源码模式下列表标记/引用装饰的彻底抑制已由 0.1.90 修复，可继续实机找茬）。
 2. ~~**中文斜体合成仍不完美**（D43 遗留）~~ **已于 0.1.105 完成首轮优化（D79），0.1.106 完成抗锯齿根治（D80）**：轮廓缓存/原点校正（D79）保留为回退；主路径改为 CoreText 直接栅格化 12° 剪切字形出 DPR 位图（`oblique::cached_glyph` + `paint_image`），消除 gpui 路径仅 ≤4× MSAA、无灰阶 AA/字干加粗造成的「发虚」；新增 7 条桌面单测（剪切墨迹范围/整数设备像素几何/无效几何回退/DPR 放置/位图缓存键/灰阶 AA 覆盖/顶部右倾）。**剩余风险**：CoreText 对剪切矩阵可能关闭部分 hinting，与原生直立字面仍不可能逐像素一致；`CJK_FALLBACKS` 固定顺序可能与 CoreText 级联字面不同；本机截图已能取到窗口（暗色主题下斜体 CJK 行有 181 级灰阶、ASCII 目测顶部右倾且无重影），**已由用户实机验收通过**（Metal 自定义着色器仍需重写 gpui 场景管线，风险高不选）。
-3. **渲染层深化**（R4）：**数学排版已于 0.1.98 完成并在 0.1.99/0.1.100/0.1.101 细化块级公式居左/点击编辑/去装饰/编辑态显 TeX、行内不重叠（D76：`ratex-gpui` 块级/行内公式真实栅格化，已实机截图验收）**；**Mermaid 图表真实渲染已于 0.1.102 完成并在 0.1.103 按实机反馈细化（D77：`mermaid-rs-renderer` → SVG → GPUI 栅格化，替换块级占位面板；透明背景去弱底/描边、内置示例改无回边分叉；已据实机反馈修正待复验）**；R4 剩余为**渲染质量跟踪**（mermaid-rs 早期，观感未完全对齐 mermaid-cli；回边流程图菱形端口/标签偏离连线属上游缺陷、应用层无法改布局算法，用户文档含回边仍会复现，失败已回退占位）；脚注点击跳转/自动编号/文末归集已于 0.1.91 完成（D69，后续可补定义→引用回链、嵌套定义归集）；软换行**横向滚动**（D33 已知限制）。
+3. **渲染层深化**（R4）：**数学排版已于 0.1.98 完成并在 0.1.99/0.1.100/0.1.101 细化块级公式居左/点击编辑/去装饰/编辑态显 TeX、行内不重叠（D76：`ratex-gpui` 块级/行内公式真实栅格化，已实机截图验收）**；**Mermaid 图表真实渲染已于 0.1.102 完成并在 0.1.103 按实机反馈细化（D77：`mermaid-rs-renderer` → SVG → GPUI 栅格化，替换块级占位面板；透明背景去弱底/描边、内置示例改无回边分叉；已据实机反馈修正待复验）**；R4 剩余为**渲染质量跟踪**（mermaid-rs 早期，观感未完全对齐 mermaid-cli；回边流程图菱形端口/标签偏离连线属上游缺陷、应用层无法改布局算法，用户文档含回边仍会复现，失败已回退占位）；脚注点击跳转/自动编号/文末归集已于 0.1.91 完成（D69）；**导出反向回链与嵌套定义归集已于 0.1.107 完成（D81）**，剩余为多引用逐个回跳/复杂容器前缀等打磨；软换行**横向滚动**（D33 已知限制，0.1.107 评估为高风险坐标体系重构未选，见 D81）。
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 149 条）
+## 提交历史（近期，共 150 条）
 
 ```
+PENDING feat(md/export): 脚注导出反向回链与嵌套定义归集（0.1.107，D81）
 a5f7b6b feat(desktop): CoreText 直接栅格化倾斜字形根治合成斜体发虚（0.1.106，D80）
 dfe036b feat(desktop): 中文斜体合成优化，缓存轮廓并校正绘制原点（0.1.105，D79）
 2b5efe3 feat(desktop): 专注段落粒度与打字机中心带（0.1.104，D78）
@@ -213,7 +215,9 @@ e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线�
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 ```
 
-> 更早提交见 `git log`；历史累计 = 148（含本次）。
+> 更早提交见 `git log`；历史累计 = 149（含本次）。
+
+- 2026-11-18（`PENDING`，0.1.107）：**脚注增强：导出反向回链 + 嵌套定义归集（D81，D69 遗留）**：① **方案选择**——先评估两项候选：A「软换行横向滚动（D33）」需给 `DocLayout` 的 paint/命中/光标/选区/IME/块级装饰/数学图表图片叠加层统一补 x 偏移并扩展内容宽度，属高风险坐标体系重构，**不选**；B「脚注增强」主要改核心纯逻辑、可单测，风险低，选 B 并在 SPEC D81 记录理由。② **反向回链**——HTML/EPUB 引用输出 `<sup class="fnref"><a id="fnref-{源字节偏移}" href="#fn-N">N</a></sup>` 唯一锚点（多次引用各自独立，避免把序号状态贯穿渲染器各层），文末 `<li id="fn-N">` 追加 `<a class="fnback" href="#fnref-{首个引用偏移}">↩</a>`（多次引用只回跳首个，与桌面 `footnote_jump` 一致）；`DEFAULT_CSS` 增 `.fnback`。③ **嵌套归集**——`footnotes::prepare` 的 `move_definitions` 由「仅顶层」改为递归收集**所有** `FootnoteDef`，按首行 `[^` 前的容器前缀逐行剥离（`> `/列表标记/缩进，续行保留 4 空格定义缩进），按序号排序统一归集文末，原块按源偏移倒序整行裁切。④ **解析修正**——`mazha-md` 列表项续行原 `min(indent(nrest), nl.content + marker.len)` 混用相对缩进与绝对偏移，把续行空白剥光致嵌套定义续行脱离定义块，改为 `min(indent, marker.len)` 并补回归单测。⑤ **验证**——桌面已有定义→首个引用 `Cmd+点击` 跳转（D69）不变，`mazha-core`/其它平台不改；新增纯函数单测（前缀剥离、嵌套归集与排序、续行、回链、多次引用唯一锚点），根 workspace fmt/clippy/test 全绿（**553** 项：md 177、export 143+3、core 204 等），桌面 fmt/clippy/test/build 全绿（**81** 项不变）；待用户实机验收（HTML/EPUB 回链跳转、嵌套定义归集观感）。
 
 - 2026-11-18（`a5f7b6b`，0.1.106）：**合成斜体中文发虚根治（D80，实机反馈）**：① **根因调查**——用户实机确认英文斜体、普通中文均清晰，仅合成斜体中文发虚；查 gpui-pre 0.3.9 源码发现 `PathBuilder::build_path` 给所有三角形写入常量 `st=(0,1)`，路径着色器 `fs_path_rasterization` 因 `dpdx(st)=0` 落入 `alpha=1` 分支，**解析式 AA 实际未生效**，边缘只剩路径离屏纹理的 ≤4× MSAA（5 级覆盖），没有 CoreText 的 8bit 灰阶 AA / LCD 亚像素 / 字体平滑（字干加粗），1px 字干呈半透明灰即「发虚」；D79 的轮廓缓存与原点对齐只解决位置，不解决质量。② **方案**——macOS 改由 CoreText `CTFontDrawGlyphs` + `CGContextSetTextMatrix(CGAffineTransform(1,0,k,1,0,0))` 把 12° 剪切交给 CoreText 自身栅格器，按字号×DPR 出 `CGBitmapContext`，读 alpha 作覆盖率、配 span 颜色烘成直 alpha RGBA `RenderImage`，由 `window.paint_image` 1:1 叠加（位图宽高与原点到边缘均取整数设备像素，避免线性采样二次模糊）。③ **布局安全**——CJK 透明占位 run 的 advance 一字未动；`snap_origin` / `glyph_y_for_index` 原点公式沿用 D79；纯函数 `shear_ink_bounds`/`raster_geometry`/`raster_placement` 承担全部几何计算并配单测。④ **缓存/降级**——按 `(字符, 字号, DPR, 颜色)` 线程局部缓存（含失败缓存 + 4096 条上限），栅格化失败回退 D79 `paint_path`（不缺字），非 macOS 仍无合成斜体；D79 轮廓路径保留为兜底。⑤ **验证**——核心 / `mazha-md` / 导出 / 其它平台不改；根 workspace fmt/clippy/test 全绿（548 项），桌面 fmt/clippy/test/build 全绿（**81 项**，新增 7 条：剪切墨迹范围、整数像素几何、无效几何回退、DPR 放置、位图缓存键、灰阶 AA 覆盖、顶部右倾）；macOS 真机栅格化单测确认位图非空、含 0<A<255 的灰阶边缘、且顶部 alpha 质心明显右于底部（剪切生效）。本机截图可用（`screencapture` 取窗口成功，暗色主题下斜体 CJK 行统计 181 级灰阶、ASCII 目测无重影），**已由用户实机验收通过**；不采用 Metal 自定义着色器/重写 gpui 场景管线（风险高）。
 
