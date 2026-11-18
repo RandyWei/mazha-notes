@@ -34,6 +34,14 @@ pub enum RenderKind {
 /// 该串只由 [`prepare_renderables`] 生成，不写回编辑器源文本。
 pub(crate) const INLINE_MATH_ALT: &str = "__mz_inline_math__";
 
+/// 块级公式导出图片的**保留 alt 标记**（D87）。
+///
+/// D86 之后行内公式有 1.1em 约束、块级公式与 mermaid 图表都按 32px 固有尺寸落地；
+/// 用户实机反馈「图表大小保持、块级公式缩小一点」，渲染器需要第三种 alt 才能区分
+/// 块级公式与图表。该串只由 [`prepare_renderables`] 对「Math 且 !inline」生成，
+/// HTML/Typst 识别后施加 2em 尺寸约束并还原为可读 alt「公式」，不写回编辑器源文本。
+pub(crate) const BLOCK_MATH_ALT: &str = "__mz_block_math__";
+
 /// 一处待渲染请求：源码区间 + 归一化键（桌面按键调渲染器）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderRequest {
@@ -43,7 +51,7 @@ pub struct RenderRequest {
     pub key: String,
     /// 该内容在源文本中的字节区间（块级公式/图表覆盖整个块，含定界围栏）。
     pub range: Range<usize>,
-    /// 是否为行内内容（D86）。行内公式的图片要随行高缩放，块级公式/图表保留固有尺寸。
+    /// 是否为行内内容（D86/D87）。行内公式按行高缩放，块级公式适度缩小，图表保留固有尺寸。
     pub inline: bool,
 }
 
@@ -286,7 +294,8 @@ pub fn collect_render_requests(source: &str) -> Vec<RenderRequest> {
 /// 纯函数：用桌面渲染好的 SVG 在**导出副本**中替换公式/图表源码。
 ///
 /// - 有资产：替换为 `![公式](dest)` / `![图表](dest)`，交给既有图片输出通道；
-///   行内公式（D86）改用保留 alt [`INLINE_MATH_ALT`]，让渲染器按行高缩放；
+///   行内公式（D86）改用保留 alt [`INLINE_MATH_ALT`] 按行高缩放，
+///   块级公式（D87）改用保留 alt [`BLOCK_MATH_ALT`] 适度缩小，图表仍为普通 alt；
 /// - 无资产：原样保留该区间（降级为字面，见 D34）；
 /// - 替换按源偏移**倒序**进行，避免先改前面的内容导致后面的区间失效。
 ///
@@ -326,11 +335,12 @@ pub fn prepare_renderables(
                 name
             }
         };
-        // 行内公式必须带标记才能被 HTML/Typst 渲染器识别并缩到 1.1em；
-        // 块级公式/图表保持原 alt 与固有尺寸，避免被误压缩（D86）。
+        // 保留 alt 是导出副本内部的尺寸意图标记，三类图片互不相同（D86/D87）：
+        // 行内公式缩到 1.1em、块级公式缩到 2em；图表与普通图片保持固有尺寸，
+        // 因此块级公式可单独缩小而不会误伤用户实机已验收 OK 的 mermaid 图表。
         let alt = match (request.kind, request.inline) {
             (RenderKind::Math, true) => INLINE_MATH_ALT,
-            (RenderKind::Math, false) => "公式",
+            (RenderKind::Math, false) => BLOCK_MATH_ALT,
             (RenderKind::Chart, _) => "图表",
         };
         edits.push((request.range.clone(), format!("![{alt}]({dest})")));
@@ -373,7 +383,7 @@ mod tests {
         assert_eq!(requests[2].key, "graph LR\nA-->B");
         // 行内请求也覆盖整对 `$…$`（D85），与块级公式/图表一致不残留定界符。
         assert_eq!(&src[requests[0].range.clone()], "$x^2$");
-        // 只有行内公式带尺寸标记（D86）；块级公式/图表保留固有尺寸。
+        // 只有行内公式标记为行内（D86/D87）；块级公式与图表均为块级展示。
         assert!(requests[0].inline);
         assert!(!requests[1].inline);
         assert!(!requests[2].inline);
@@ -413,7 +423,7 @@ mod tests {
         assert!(!prepared.source.contains("$x$"), "{}", prepared.source);
         assert!(!prepared.source.contains("$$b$$"), "{}", prepared.source);
         assert!(!prepared.source.contains("graph LR"), "{}", prepared.source);
-        // 行内公式带保留 alt（D86），块级公式/图表不带，避免被错误压缩。
+        // 行内/块级公式各带互斥的保留 alt（D86/D87），图表保持普通 alt。
         assert!(
             prepared
                 .source
@@ -422,7 +432,9 @@ mod tests {
             prepared.source
         );
         assert!(
-            prepared.source.contains("![公式](data:"),
+            prepared
+                .source
+                .contains(&format!("![{BLOCK_MATH_ALT}](data:")),
             "{}",
             prepared.source
         );
@@ -452,7 +464,9 @@ mod tests {
         let prepared = prepare_renderables(src, &assets, AssetTarget::VirtualFile);
         assert_eq!(prepared.files.len(), 2, "{:?}", prepared.files);
         assert!(
-            prepared.source.contains("![公式](__mz_asset_0.svg)"),
+            prepared
+                .source
+                .contains(&format!("![{BLOCK_MATH_ALT}](__mz_asset_0.svg)")),
             "{}",
             prepared.source
         );
@@ -576,7 +590,11 @@ mod tests {
 
     #[test]
     fn inline_math_and_block_images_carry_distinct_alt_markers() {
-        // 同一文档内行内公式/块级公式/图表混排：只有行内公式被标记为需缩放。
+        // 同一文档内行内公式/块级公式/图表混排：三类 alt 必须互不相同（D86/D87），
+        // 渲染器才能只对公式施加尺寸约束、图表维持固有尺寸。
+        assert_ne!(INLINE_MATH_ALT, BLOCK_MATH_ALT);
+        assert_ne!(INLINE_MATH_ALT, "图表");
+        assert_ne!(BLOCK_MATH_ALT, "图表");
         let src = "行内 $x$：\n\n$$b$$\n\n```mermaid\ngraph LR; A-->B\n```\n";
         let mut assets = RenderAssets::new();
         assets.insert_math("x", SVG);
@@ -592,16 +610,41 @@ mod tests {
             prepared.source
         );
         assert!(
-            prepared.source.contains("![公式](__mz_asset_1.svg)"),
+            prepared
+                .source
+                .contains(&format!("![{BLOCK_MATH_ALT}](__mz_asset_1.svg)")),
             "{}",
             prepared.source
         );
+        // 图表 alt 仍是面向读者的普通「图表」，不带任何尺寸标记（D87）。
         assert!(
             prepared.source.contains("![图表](__mz_asset_2.svg)"),
             "{}",
             prepared.source
         );
         assert_eq!(prepared.source.matches(INLINE_MATH_ALT).count(), 1);
+        assert_eq!(prepared.source.matches(BLOCK_MATH_ALT).count(), 1);
+        assert!(!prepared.source.contains("![公式]("), "{}", prepared.source);
+    }
+
+    #[test]
+    fn standalone_block_math_and_chart_use_different_alts() {
+        // 单独一个块级公式必须带新标记，单独一个 mermaid 图表必须保持普通 alt（D87）。
+        let mut assets = RenderAssets::new();
+        assets.insert_math("b", SVG);
+        assets.insert_chart("graph LR; A-->B", SVG);
+        let math = prepare_renderables("$$b$$\n", &assets, AssetTarget::VirtualFile);
+        assert_eq!(
+            math.source,
+            format!("![{BLOCK_MATH_ALT}](__mz_asset_0.svg)\n")
+        );
+        let chart = prepare_renderables(
+            "```mermaid\ngraph LR; A-->B\n```\n",
+            &assets,
+            AssetTarget::VirtualFile,
+        );
+        assert_eq!(chart.source, "![图表](__mz_asset_0.svg)\n");
+        assert!(!chart.source.contains(BLOCK_MATH_ALT));
     }
 
     #[test]

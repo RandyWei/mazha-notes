@@ -2188,45 +2188,47 @@ struct ExportTarget {
     filter_label: &'static str,
     /// 过滤器与默认文件名使用的后缀（不含点）。
     extension: &'static str,
-    /// 默认文件名主干。
-    default_stem: &'static str,
 }
 
-impl ExportTarget {
-    /// 拼出保存对话框的默认文件名（如 `document.html`）。
-    fn default_file_name(&self) -> String {
-        format!("{}.{}", self.default_stem, self.extension)
-    }
-}
-
-/// 纯函数：导出格式 → 对话框标题/过滤器/后缀/默认文件名（D82）。
+/// 纯函数：导出格式 → 对话框标题/过滤器/后缀（D82）。
 fn export_target(format: ExportFormat) -> ExportTarget {
     match format {
         ExportFormat::Html => ExportTarget {
             title: "导出 HTML",
             filter_label: "HTML 文件",
             extension: "html",
-            default_stem: "document",
         },
         ExportFormat::Pdf => ExportTarget {
             title: "导出 PDF",
             filter_label: "PDF 文件",
             extension: "pdf",
-            default_stem: "document",
         },
         ExportFormat::Docx => ExportTarget {
             title: "导出 DOCX",
             filter_label: "Word 文档",
             extension: "docx",
-            default_stem: "document",
         },
         ExportFormat::Epub => ExportTarget {
             title: "导出 EPUB",
             filter_label: "EPUB 电子书",
             extension: "epub",
-            default_stem: "document",
         },
     }
+}
+
+/// 纯函数：保存对话框默认文件名取当前 Markdown 主干 + 目标后缀（D87）。
+///
+/// 有路径时沿用 `file_stem()`（与 [`export_title`] 取主干的规则一致，但不复用其
+/// 「码札文档」兜底：那只是 HTML/EPUB 的文档内标题，用作文件名会与文件脱节）；
+/// 无路径或空主干时回退 ASCII `document.{ext}`，避免保存对话框出现中文兜底名。
+/// 用户在对话框里仍可自由改名，本函数只提供默认值。
+fn export_default_file_name(doc_path: Option<&Path>, target: &ExportTarget) -> String {
+    let stem = doc_path
+        .and_then(Path::file_stem)
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "document".to_string());
+    format!("{stem}.{}", target.extension)
 }
 
 /// 纯函数：PDF 资源根目录取当前文档所在目录（D82）。
@@ -4861,11 +4863,13 @@ impl DocView {
         let title = export_title(self.path.as_deref());
         let base_dir = pdf_base_dir(self.path.as_deref());
         let target = export_target(format);
+        // D87：在 async 闭包外算好默认文件名，避免闭包里再借 `self.path`。
+        let file_name = export_default_file_name(self.path.as_deref(), &target);
         cx.spawn(async move |this, cx| {
             let picked = AsyncFileDialog::new()
                 .set_title(target.title)
                 .add_filter(target.filter_label, &[target.extension])
-                .set_file_name(target.default_file_name())
+                .set_file_name(file_name)
                 .save_file()
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -10908,15 +10912,15 @@ mod tests {
         QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, SAMPLE, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
         chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
-        collect_render_assets, copy_entry, dropped_link_markdown, export_failure_text,
-        export_format_label, export_progress_text, export_status_should_clear, export_success_text,
-        export_target, export_title, focus_line_range, footnote_jump, hide_text_runs,
-        horizontal_step, inline_links, inline_reveals, is_image_path, is_markdown_file,
-        join_math_body, markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom,
-        nearest_cell, oblique, pdf_base_dir, plan_imports, quote_block_wrap_width,
-        render_chart_preview, render_chart_svg, render_export, render_export_with_assets,
-        render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
-        typewriter_scroll_y, unique_import_path,
+        collect_render_assets, copy_entry, dropped_link_markdown, export_default_file_name,
+        export_failure_text, export_format_label, export_progress_text, export_status_should_clear,
+        export_success_text, export_target, export_title, focus_line_range, footnote_jump,
+        hide_text_runs, horizontal_step, inline_links, inline_reveals, is_image_path,
+        is_markdown_file, join_math_body, markdown_image_path, math_cache_key, math_hit_rect,
+        math_inline_draw_geom, nearest_cell, oblique, pdf_base_dir, plan_imports,
+        quote_block_wrap_width, render_chart_preview, render_chart_svg, render_export,
+        render_export_with_assets, render_math_preview, reveal_inline, table_arrow_step,
+        table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -11032,7 +11036,7 @@ mod tests {
         }
     }
 
-    /// D82：导出目标映射给出各自的后缀、过滤器与默认文件名。
+    /// D82/D87：导出目标映射给出各自的后缀与过滤器；无路径时默认文件名回退 document。
     #[test]
     fn export_targets_map_to_distinct_files() {
         let cases = [
@@ -11045,9 +11049,37 @@ mod tests {
             let target = export_target(format);
             assert_eq!(target.extension, extension);
             assert_eq!(target.filter_label, filter);
-            assert_eq!(target.default_file_name(), file_name);
             assert!(target.title.starts_with("导出 "));
+            assert_eq!(export_default_file_name(None, &target), file_name);
         }
+    }
+
+    /// D87：导出默认文件名跟随 Markdown 主干，缺路径时回退 document。
+    #[test]
+    fn export_default_file_name_uses_stem_or_fallback() {
+        let html = export_target(ExportFormat::Html);
+        let pdf = export_target(ExportFormat::Pdf);
+        let docx = export_target(ExportFormat::Docx);
+        let epub = export_target(ExportFormat::Epub);
+
+        assert_eq!(
+            export_default_file_name(Some(Path::new("/docs/我的笔记.md")), &html),
+            "我的笔记.html"
+        );
+        assert_eq!(
+            export_default_file_name(Some(Path::new("/docs/a.b.md")), &pdf),
+            "a.b.pdf"
+        );
+        assert_eq!(
+            export_default_file_name(Some(Path::new("/docs/带 空格.md")), &docx),
+            "带 空格.docx"
+        );
+        // 裸文件名同样可取主干（不依赖父目录是否有效）。
+        assert_eq!(
+            export_default_file_name(Some(Path::new("note.markdown")), &epub),
+            "note.epub"
+        );
+        assert_eq!(export_default_file_name(None, &pdf), "document.pdf");
     }
 
     /// D82：PDF 资源根目录取当前文档父目录；内置示例与裸文件名返回 `None`。
