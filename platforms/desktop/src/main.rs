@@ -113,6 +113,15 @@ $$
 \\int_0^1 x^2 \\, dx = \\frac{1}{3}
 $$
 
+### 图表
+
+```mermaid
+graph LR
+  A[开始] --> B{决策}
+  B -->|是| C[完成]
+  B -->|否| A
+```
+
 ### 其他
 
 ![示例图片](assets/sample.png)
@@ -560,6 +569,20 @@ struct MathPreview {
     size: Size<Pixels>,
 }
 
+/// Mermaid 图表的渲染态数据：mermaid-rs 产出的 SVG 经 GPUI `SvgRenderer` 栅格化后的图像。
+///
+/// SVG 由 `mermaid_rs_renderer::render` 生成（纯 Rust，无浏览器），再用 GPUI 自带的
+/// resvg/usvg 光栅化：`render_single_frame(..., 1.0)` 固定按 2 倍尺寸出图
+/// （[`gpui::SMOOTH_SVG_SCALE_FACTOR`]），故逻辑尺寸需除以该系数；缩放显示由
+/// `fit_image_size` 负责（不放大）。
+#[derive(Clone)]
+struct ChartPreview {
+    /// 栅格化后的图表图像（按源码去重缓存复用）。
+    data: Arc<RenderImage>,
+    /// SVG 的自然逻辑尺寸（px，未适配正文宽度）。
+    size: Size<Pixels>,
+}
+
 /// 行内公式的叠加层：公式图像 + 其 TeX 在形状文本内的字节范围。
 ///
 /// TeX 文本在 gpui 侧为透明占位（保留排版/光标/选区），真实字形在 paint 阶段按该范围定位。
@@ -624,6 +647,17 @@ enum MathLineRole {
     /// 锚点行：隐藏 TeX 文本、显示公式图像，行高跟随图像。
     Anchor(MathPreview),
     /// 同一公式块内的非锚点行：隐藏文本、高度归零（定界行本就显示为空）。
+    Collapsed,
+}
+
+/// mermaid 围栏块在某一投影行的渲染角色（R4 第二步，参照 [`MathLineRole`]）。
+#[derive(Clone)]
+enum ChartLineRole {
+    /// 普通行 / 编辑态 / 源码模式 / 渲染失败：照常显示 Mermaid 源文本（占位面板兜底）。
+    None,
+    /// 锚点行：隐藏源码文本、显示图表图像，行高跟随图像。
+    Anchor(ChartPreview),
+    /// 同一图表块内的其它行：隐藏源码文本、高度归零（围栏行本就显示为空）。
     Collapsed,
 }
 
@@ -1051,6 +1085,8 @@ struct BlockGeom {
     math_line: MathLineRole,
     /// 行内公式（`$…$`）的图像叠加层（TeX 文本在 gpui 侧透明占位）。
     math_spans: Vec<MathSpanOverlay>,
+    /// mermaid 块在本行的角色（`None` = 普通行；见 [`ChartLineRole`]）。
+    chart_line: ChartLineRole,
     /// 表格行的网格几何（`None` = 非表格行，或该表放不下/含合成斜体而回退流式排版）。
     table: Option<TableRowGeom>,
 }
@@ -1821,6 +1857,9 @@ struct DocLayout {
     /// 块级公式的渲染态图像矩形 + 该块的源字节区间（D76）：点击图像任意处让光标落到块内，
     /// 触发「显示 TeX 原文」的编辑态（与行内公式一致），不依赖透明占位 run 的视觉行命中。
     math_boxes: Vec<(Bounds<Pixels>, Range<usize>)>,
+    /// Mermaid 图表渲染态的图像矩形 + 该块的源字节区间（R4 第二步）：点击图像把光标
+    /// 放进围栏块，下一帧显示 DSL 原文；与公式的 `math_boxes` 同理。
+    chart_boxes: Vec<(Bounds<Pixels>, Range<usize>)>,
     /// 可拖动的内部列边界。
     table_resize_handles: Vec<TableResizeHandle>,
 }
@@ -2539,6 +2578,11 @@ struct DocView {
     /// RaTeX 栅格化要经 解析→排版→PNG→解码，较贵；按公式去重跨帧复用。
     /// 值为 `None` 表示渲染失败，同样缓存以免每帧重试非法 TeX。
     math_cache: HashMap<String, Option<MathPreview>>,
+    /// Mermaid 图表渲染缓存：键为图表 DSL 源码（见 [`chart_cache_key`]）。
+    ///
+    /// mermaid-rs 要经 解析→布局→SVG→usvg 解析→栅格化，较贵；按源码去重跨帧复用。
+    /// 值为 `None` 表示失败（不支持的图类型/语法错误），同样缓存以免每帧重试。
+    chart_cache: HashMap<String, Option<ChartPreview>>,
     /// 当前文档会话内的表格列宽（键为表格源起点，不写入 Markdown）。
     table_column_widths: HashMap<usize, Vec<Pixels>>,
     /// 当前文档会话内的表格行高（键为行源起点，不写入 Markdown）。
@@ -2672,6 +2716,7 @@ impl DocView {
             dialog_open: false,
             media: HashMap::new(),
             math_cache: HashMap::new(),
+            chart_cache: HashMap::new(),
             table_column_widths: HashMap::new(),
             table_row_heights: HashMap::new(),
             table_resizing: None,
@@ -4377,6 +4422,14 @@ impl DocView {
         // 这里直接把光标放进公式块，下一帧即显示 TeX 原文供编辑（同行内公式）。
         if let Some((_, range)) = layout
             .math_boxes
+            .iter()
+            .find(|(rect, _)| rect.contains(&position))
+        {
+            return Some(self.doc.snap_to_boundary(range.start));
+        }
+        // Mermaid 图表渲染态（R4 第二步）：点图像任意处把光标放进围栏块，切回 DSL 原文。
+        if let Some((_, range)) = layout
+            .chart_boxes
             .iter()
             .find(|(rect, _)| rect.contains(&position))
         {
@@ -7428,6 +7481,69 @@ impl DocView {
     }
 }
 
+/// 从 mermaid 围栏块的投影可见行里提取图表 DSL 正文（R4 第二步）。
+///
+/// 投影已剥掉引用/列表容器前缀与围栏标记，故这里只需丢掉空行并按行拼接；
+/// 保留原有换行对 mermaid 的 `graph` / `subgraph` 等分行语法更稳妥。
+fn chart_source_body(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 图表渲染缓存键：图表 DSL 源码本身即唯一标识（渲染配色固定为 mermaid 主题，与
+/// 应用主题/字号无关），故无需像公式那样纳入 DPR/颜色。
+fn chart_cache_key(src: &str) -> String {
+    format!("mermaid\0{src}")
+}
+
+/// 把 Mermaid DSL 渲染成可绘制的 GPUI 图像。
+///
+/// 两段纯 Rust 管线：mermaid-rs 解析/排版出 SVG → GPUI 自带 `SvgRenderer`（resvg/usvg）
+/// 光栅化。`render_single_frame(_, 1.0)` 内部按 2 倍尺寸出图以抗锯齿，故逻辑尺寸要除回
+/// [`gpui::SMOOTH_SVG_SCALE_FACTOR`]；显示时的宽度适配由 `fit_image_size` 负责。
+/// `None` 表示解析或栅格化失败（不支持的图类型、语法错误、SVG 尺寸异常）。
+fn render_chart_preview(src: &str, renderer: &gpui::SvgRenderer) -> Option<ChartPreview> {
+    let svg = mermaid_rs_renderer::render(src).ok()?;
+    let data = renderer.render_single_frame(svg.as_bytes(), 1.0).ok()?;
+    let physical = data.size(0);
+    let scale = gpui::SMOOTH_SVG_SCALE_FACTOR;
+    let size = size(
+        px(physical.width.0 as f32 / scale),
+        px(physical.height.0 as f32 / scale),
+    );
+    // 防御异常尺寸：0 宽/高的图像会让行高与命中矩形一起塌掉。
+    if size.width <= px(0.) || size.height <= px(0.) {
+        return None;
+    }
+    Some(ChartPreview { data, size })
+}
+
+impl DocView {
+    /// 取（或惰性渲染）图表图像；失败结果也入缓存，避免每帧重试非法 DSL。
+    fn chart_image(&mut self, src: &str, renderer: &gpui::SvgRenderer) -> Option<ChartPreview> {
+        let key = chart_cache_key(src);
+        if let Some(hit) = self.chart_cache.get(&key) {
+            return hit.clone();
+        }
+        let rendered = render_chart_preview(src, renderer);
+        self.chart_cache.insert(key, rendered.clone());
+        rendered
+    }
+}
+
+/// 把渲染态源码文本藏起来（透明占位）：保留文本长度供 OffsetMap/光标/选区换算，
+/// 但清掉等宽行的弱底色，让图表图像独占该块（与公式块的透明占位同理）。
+fn hide_text_runs(runs: &mut [gpui::TextRun]) {
+    for run in runs {
+        run.color.a = 0.0;
+        run.background_color = None;
+    }
+}
+
 /// 把一个 core [`TextRun`]（片段 + 样式）转成 gpui 的 [`gpui::TextRun`]（字形级样式）。
 ///
 /// 对中文斜体：仅 CJK 字符需自绘合成，其他字符走 gpui 正常渲染；
@@ -8153,6 +8269,22 @@ const LINE_HEIGHT: Pixels = px(24.);
 const IMAGE_VERTICAL_PAD: Pixels = px(8.);
 /// 块级公式图像与上下相邻内容的呼吸间距。
 const MATH_VERTICAL_PAD: Pixels = px(8.);
+/// 图表图像与上下相邻内容的呼吸间距。
+const CHART_VERTICAL_PAD: Pixels = px(8.);
+
+/// 图表图像的命中矩形（窗口坐标）：与 paint 阶段绘制位置一致——左缘取正文文本起点，
+/// 顶边取块首视觉行顶边 + 呼吸间距。
+fn chart_hit_rect(
+    origin: Point<Pixels>,
+    indent: Pixels,
+    row_top: Pixels,
+    image_size: Size<Pixels>,
+) -> Bounds<Pixels> {
+    bounds(
+        point(origin.x + indent, origin.y + row_top + CHART_VERTICAL_PAD),
+        image_size,
+    )
+}
 
 /// 块级公式图像的命中矩形（窗口坐标）：与 paint 阶段绘制位置保持一致——
 /// 左缘取正文文本起点，顶边取块首视觉行顶边 + 上下呼吸间距。
@@ -8366,6 +8498,70 @@ impl Element for DocElement {
                     }
                 }
                 (roles, images, math_edit_texts)
+            })
+        };
+
+        // 预渲染 Mermaid 图表（R4 第二步）：与公式一样单独一次 update，避免与主布局
+        // 闭包里 `projection` 的可变借用冲突。光标在块内时跳过渲染，块体照常显示 DSL
+        // 原文（围栏行由 `fence_texts` 显示），移开后恢复图像；渲染失败保留占位面板兜底。
+        let chart_block_roles: HashMap<usize, ChartLineRole> = if source_mode {
+            HashMap::new()
+        } else {
+            self.view.update(cx, |view, cx| {
+                let renderer = cx.svg_renderer();
+                let jobs: Vec<(String, Range<usize>, usize)> = {
+                    let p = view.doc.projection();
+                    let caret_lines: Vec<usize> = view
+                        .cursors
+                        .iter()
+                        .map(|c| p.line_of_source(c.caret))
+                        .collect();
+                    p.block_widgets()
+                        .iter()
+                        .filter(|w| {
+                            matches!(&w.kind, BlockWidgetKind::Chart { lang } if lang == "mermaid")
+                        })
+                        .filter(|w| !caret_lines.iter().any(|&l| w.line_range.contains(&l)))
+                        .filter_map(|w| {
+                            let parts: Vec<String> = w
+                                .line_range
+                                .clone()
+                                .filter_map(|i| p.lines.get(i).map(|l| l.display_text()))
+                                .collect();
+                            let src = chart_source_body(&parts);
+                            if src.is_empty() {
+                                return None;
+                            }
+                            // 锚点取第一条有正文的行（围栏行投影为空）。
+                            let anchor = w
+                                .line_range
+                                .clone()
+                                .find(|&i| {
+                                    p.lines
+                                        .get(i)
+                                        .is_some_and(|l| !l.display_text().trim().is_empty())
+                                })
+                                .unwrap_or(w.line_range.start);
+                            Some((src, w.line_range.clone(), anchor))
+                        })
+                        .collect()
+                };
+                let mut roles: HashMap<usize, ChartLineRole> = HashMap::new();
+                for (src, range, anchor) in jobs {
+                    if let Some(preview) = view.chart_image(&src, &renderer) {
+                        for i in range {
+                            roles.insert(
+                                i,
+                                if i == anchor {
+                                    ChartLineRole::Anchor(preview.clone())
+                                } else {
+                                    ChartLineRole::Collapsed
+                                },
+                            );
+                        }
+                    }
+                }
+                roles
             })
         };
 
@@ -8671,6 +8867,22 @@ impl Element for DocElement {
                         .get(&idx)
                         .cloned()
                         .unwrap_or(MathLineRole::None);
+                    // mermaid 图表角色（R4 第二步）：锚点行显示图像、其余行高度归零；
+                    // 图像的宽度适配要等本行缩进确定后再做（缓存里保留自然尺寸）。
+                    let mut chart_line = chart_block_roles
+                        .get(&idx)
+                        .cloned()
+                        .unwrap_or(ChartLineRole::None);
+                    if let ChartLineRole::Anchor(preview) = &chart_line {
+                        let max_width =
+                            (content_width_total - block_indent(line, indent_base) - BASE)
+                                .max(px(48.));
+                        chart_line = ChartLineRole::Anchor(ChartPreview {
+                            data: preview.data.clone(),
+                            size: fit_image_size(preview.size, max_width),
+                        });
+                    }
+                    let hide_chart_text = !matches!(chart_line, ChartLineRole::None);
                     // 围栏行/独占图片行：光标进入时显示整行源码，并做 1:1 字节映射。
                     // 源码模式（D68）：整行按原始 Markdown 源码显示与编辑。
                     let raw_src: Option<SharedString> = if source_mode {
@@ -8742,44 +8954,50 @@ impl Element for DocElement {
                             && inline_math
                                 .iter()
                                 .all(|(_, tex)| math_inline_images.contains_key(tex)));
-                    let (text, runs, oblique_spans, math_spans_raw) = if let Some(src) = &raw_src {
-                        // 源码模式显示原文（等宽、正文色）；围栏编辑态沿用弱化色。
-                        let mut color = if source_mode {
-                            palette.foreground
+                    let (text, mut runs, oblique_spans, math_spans_raw) =
+                        if let Some(src) = &raw_src {
+                            // 源码模式显示原文（等宽、正文色）；围栏编辑态沿用弱化色。
+                            let mut color = if source_mode {
+                                palette.foreground
+                            } else {
+                                palette.muted
+                            };
+                            if dim {
+                                color.a *= 0.28;
+                            }
+                            let run = gpui::TextRun {
+                                len: src.len(),
+                                font: mono_font.clone(),
+                                color,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            (src.clone(), vec![run], Vec::new(), Vec::new())
                         } else {
-                            palette.muted
-                        };
-                        if dim {
-                            color.a *= 0.28;
-                        }
-                        let run = gpui::TextRun {
-                            len: src.len(),
-                            font: mono_font.clone(),
-                            color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        (src.clone(), vec![run], Vec::new(), Vec::new())
-                    } else {
-                        let mut built = build_line_runs(
-                            line,
-                            &base_font,
-                            &mono_font,
-                            &palette,
-                            code_hl[idx].as_deref(),
-                            render_inline_math,
-                        );
-                        if dim {
-                            for run in &mut built.1 {
-                                run.color.a *= 0.28;
-                                if let Some(bg) = &mut run.background_color {
-                                    bg.a *= 0.28;
+                            let mut built = build_line_runs(
+                                line,
+                                &base_font,
+                                &mono_font,
+                                &palette,
+                                code_hl[idx].as_deref(),
+                                render_inline_math,
+                            );
+                            if dim {
+                                for run in &mut built.1 {
+                                    run.color.a *= 0.28;
+                                    if let Some(bg) = &mut run.background_color {
+                                        bg.a *= 0.28;
+                                    }
                                 }
                             }
-                        }
-                        built
-                    };
+                            built
+                        };
+                    // mermaid 渲染态：图表源码转透明占位（不带弱底），由图像替代显示。
+                    // 文本本身保留，OffsetMap/光标/选区映射与编辑态完全一致。
+                    if hide_chart_text && raw_src.is_none() {
+                        hide_text_runs(&mut runs);
+                    }
                     // 行内公式叠加层：`math_spans_raw` 与 `inline_math` 同序（按 run 收集）。
                     let math_spans: Vec<MathSpanOverlay> = math_spans_raw
                         .iter()
@@ -8980,6 +9198,14 @@ impl Element for DocElement {
                         }
                         MathLineRole::Collapsed => line_px = Pixels::ZERO,
                         MathLineRole::None => {}
+                    }
+                    // mermaid 图表（R4 第二步）：锚点行高跟随图像，块内其余行归零。
+                    match &chart_line {
+                        ChartLineRole::Anchor(preview) => {
+                            line_px = preview.size.height + CHART_VERTICAL_PAD * 2.;
+                        }
+                        ChartLineRole::Collapsed => line_px = Pixels::ZERO,
+                        ChartLineRole::None => {}
                     }
                     // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
                     // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
@@ -9182,6 +9408,7 @@ impl Element for DocElement {
                         media: media_preview,
                         math_line,
                         math_spans,
+                        chart_line,
                         table: table_row,
                     });
                 }
@@ -9320,6 +9547,25 @@ impl Element for DocElement {
             })
             .collect();
 
+        // Mermaid 图表命中框（R4 第二步）：与 paint 的绘制矩形一致；点击图像即把光标
+        // 放进围栏块，下一帧显示 DSL 原文可编辑（同行代码块，围栏行由 fence_texts 显示）。
+        let chart_boxes: Vec<(Bounds<Pixels>, Range<usize>)> = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, block)| {
+                let ChartLineRole::Anchor(preview) = &block.chart_line else {
+                    return None;
+                };
+                let rect = chart_hit_rect(
+                    bounds.origin,
+                    block.indent,
+                    row_tops[row_starts[idx]],
+                    preview.size,
+                );
+                Some((rect, block.proj.source_range.clone()))
+            })
+            .collect();
+
         DocLayout {
             blocks,
             widgets,
@@ -9330,6 +9576,7 @@ impl Element for DocElement {
             caret_row,
             task_boxes,
             math_boxes,
+            chart_boxes,
             table_resize_handles,
         }
     }
@@ -9465,13 +9712,20 @@ impl Element for DocElement {
                             }
                         }
                     }
-                    // 图表块：弱底 + 外框 + 右上角语言标签（真渲染留渲染层，R4）
+                    // 图表块（R4 第二步）：真渲染成功时不画占位面板——图像在逐块绘制
+                    // 阶段叠加（同图片/公式）；解析失败或不支持的图类型才回退旧的弱底面板。
                     WidgetDecorKind::Chart { label } if !w.editing => {
-                        window.paint_quad(fill(rect, palette.subtle));
-                        paint_rect_border(window, rect, palette.border, px(1.));
-                        if let Some(label) = label {
-                            let line_height = layout.block_line_height(w.line_range.start);
-                            paint_corner_label(label, right, top, line_height, window, cx);
+                        let rendered = layout
+                            .blocks
+                            .get(w.line_range.start)
+                            .is_some_and(|b| matches!(&b.chart_line, ChartLineRole::Anchor(_)));
+                        if !rendered {
+                            window.paint_quad(fill(rect, palette.subtle));
+                            paint_rect_border(window, rect, palette.border, px(1.));
+                            if let Some(label) = label {
+                                let line_height = layout.block_line_height(w.line_range.start);
+                                paint_corner_label(label, right, top, line_height, window, cx);
+                            }
                         }
                     }
                     // 显示公式：不画背景与边框（D76 细化）——公式图像自带留白，
@@ -9634,6 +9888,27 @@ impl Element for DocElement {
                     0,
                     false,
                 );
+            }
+
+            // Mermaid 图表（R4 第二步）：源码已透明占位，这里把栅格化后的 SVG 画在
+            // 锚点行；弱底 + 圆角 + 描边与图片块一致，让浅色节点在深色主题下也可辨。
+            if let ChartLineRole::Anchor(preview) = &block.chart_line {
+                let rect = bounds(point(text_x, row_top + CHART_VERTICAL_PAD), preview.size);
+                window.paint_quad(fill(rect, palette.subtle));
+                let _ = window.paint_image(
+                    rect,
+                    rect,
+                    Corners {
+                        top_left: IMAGE_CORNER_RADIUS,
+                        top_right: IMAGE_CORNER_RADIUS,
+                        bottom_right: IMAGE_CORNER_RADIUS,
+                        bottom_left: IMAGE_CORNER_RADIUS,
+                    },
+                    preview.data.clone(),
+                    0,
+                    false,
+                );
+                paint_rect_border(window, rect, palette.border, px(1.));
             }
 
             // 独占行音视频：视频帧/海报/占位卡片 + 底部控制条与进度。
@@ -10161,14 +10436,15 @@ fn main() {
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
-        BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
-        MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
-        block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
-        collect_inline_texes, copy_entry, dropped_link_markdown, footnote_jump, horizontal_step,
+        BASE, BlockStyle, CHART_VERTICAL_PAD, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos,
+        Document, MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings,
+        app_menus, block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
+        chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
+        copy_entry, dropped_link_markdown, footnote_jump, hide_text_runs, horizontal_step,
         inline_links, inline_reveals, is_image_path, is_markdown_file, join_math_body,
         markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom, nearest_cell,
-        oblique, plan_imports, quote_block_wrap_width, render_math_preview, reveal_inline,
-        table_arrow_step, table_entry_snap, to_gpui_runs, unique_import_path,
+        oblique, plan_imports, quote_block_wrap_width, render_chart_preview, render_math_preview,
+        reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs, unique_import_path,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -10645,6 +10921,81 @@ mod tests {
             .expect("合法 TeX 应当渲染成功");
         assert!(preview.size.width > px(0.));
         assert!(preview.size.height > px(0.));
+    }
+
+    /// 图表 DSL 提取：投影行的围栏/空行已不产生可见文本，这里再兜底去空白并按行拼接。
+    #[test]
+    fn chart_source_body_keeps_indentation_structure() {
+        let parts = vec![
+            "graph TD".to_string(),
+            "  A-->B".to_string(),
+            "".to_string(),
+            "  B-->C".to_string(),
+        ];
+        assert_eq!(chart_source_body(&parts), "graph TD\nA-->B\nB-->C");
+        assert_eq!(chart_source_body(&["  ".to_string()]), "");
+    }
+
+    /// 图表缓存键：同源码复用、不同源码隔离（DSL 是唯一渲染输入）。
+    #[test]
+    fn chart_cache_key_tracks_source() {
+        assert_eq!(
+            chart_cache_key("graph TD; A-->B"),
+            chart_cache_key("graph TD; A-->B")
+        );
+        assert_ne!(
+            chart_cache_key("graph TD; A-->B"),
+            chart_cache_key("graph LR; A-->B")
+        );
+    }
+
+    /// mermaid-rs → GPUI SVG 光栅化：合法图表 DSL 应产出非空图像，非法 DSL 返回 None。
+    #[test]
+    fn render_chart_preview_produces_image() {
+        let renderer = gpui_kit::SvgRenderer::new(std::sync::Arc::new(()));
+        let preview = render_chart_preview("graph TD; A-->B;", &renderer)
+            .expect("合法 mermaid DSL 应渲染成功");
+        assert!(preview.size.width > px(0.) && preview.size.width < px(4000.));
+        assert!(preview.size.height > px(0.) && preview.size.height < px(4000.));
+        // 栅格化后必须有实际字形/线条像素，避免「SVG 解析成功但图像全透明」的假成功。
+        let pixels = preview.data.as_bytes(0).expect("图表图像应有首帧");
+        let drawn = pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(drawn > 100, "图表图像不应为空白，实际不透明像素 {drawn}");
+        assert!(render_chart_preview("not a mermaid diagram @@@", &renderer).is_none());
+    }
+
+    /// 图表命中框只覆盖图像本身，不含上下呼吸间距。
+    #[test]
+    fn chart_hit_rect_covers_image_only() {
+        let origin = point(px(377.), px(140.));
+        let rect = chart_hit_rect(origin, px(24.), px(800.), size(px(120.), px(48.)));
+        assert_eq!(rect.origin.x, px(401.));
+        assert_eq!(rect.origin.y, px(140.) + px(800.) + CHART_VERTICAL_PAD);
+        assert_eq!(rect.size, size(px(120.), px(48.)));
+        assert!(rect.contains(&point(px(410.), px(960.))));
+        assert!(!rect.contains(&point(px(410.), px(940.))));
+        assert!(!rect.contains(&point(px(530.), px(960.))));
+    }
+
+    /// 渲染态图表源码必须透明且去掉代码块弱底，否则会与图像重叠。
+    #[test]
+    fn hide_text_runs_removes_color_and_background() {
+        let base = gpui_kit::Font {
+            family: ".SystemUIFont".into(),
+            ..Default::default()
+        };
+        let palette = super::Palette::default_for_test();
+        let mut runs = vec![gpui_kit::TextRun {
+            len: 4,
+            font: base,
+            color: palette.foreground,
+            background_color: Some(palette.subtle),
+            underline: None,
+            strikethrough: None,
+        }];
+        hide_text_runs(&mut runs);
+        assert_eq!(runs[0].color.a, 0.0);
+        assert!(runs[0].background_color.is_none());
     }
 
     /// 行内公式只在渲染态透明占位；编辑态保持可见 TeX 原文。

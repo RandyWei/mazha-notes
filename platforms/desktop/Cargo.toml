@@ -33,6 +33,9 @@ image = { version = "0.25", default-features = false }
 # 数学公式排版（R4）：RaTeX → GPUI RenderImage；render-only，不引入结构化编辑器；
 # 依赖 gpui-pre 0.3（与 gpui-kit 0.7 锁同一版本，避免两份 GPUI 类型不兼容）。
 ratex-gpui = { version = "0.4", default-features = false }
+# Mermaid 图表真实渲染（R4 第二步）：纯 Rust 解析/排版 → SVG；关掉 CLI 与内置 PNG
+# 光栅化（resvg 0.47），SVG → GPUI RenderImage 复用 gpui-pre 自带的 resvg/usvg。
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 smallvec = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
