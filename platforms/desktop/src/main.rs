@@ -9482,11 +9482,9 @@ impl Element for DocElement {
             }
 
             // 块级公式（`$$…$$`）：TeX 文本已在布局阶段置为透明占位，这里绘制排版图像。
-            // 居中于正文可用宽度；保留 Math widget 的外框（见 widget 装饰绘制）。
+            // 居左对齐正文文本起点（同图片块）；RaTeX 图像自带四周留白，不会紧贴 widget 外框。
             if let MathLineRole::Anchor(preview) = &block.math_line {
-                let avail = (element_bounds.size.width - block.indent - BASE * 2.).max(px(1.));
-                let x = text_x + (avail - preview.size.width).max(Pixels::ZERO) / 2.;
-                let rect = bounds(point(x, row_top + MATH_VERTICAL_PAD), preview.size);
+                let rect = bounds(point(text_x, row_top + MATH_VERTICAL_PAD), preview.size);
                 let _ = window.paint_image(
                     rect,
                     rect,
