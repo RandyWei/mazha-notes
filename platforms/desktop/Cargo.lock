@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "ab_glyph"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "owned_ttf_parser",
+]
+
+[[package]]
+name = "ab_glyph_rasterizer"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
+
+[[package]]
 name = "accesskit"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,6 +1932,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3801,6 +3828,7 @@ dependencies = [
  "qoi",
  "ravif",
  "rayon",
+ "rgb",
  "tiff",
  "zune-core 0.5.3",
  "zune-jpeg 0.5.15",
@@ -4503,6 +4531,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
+ "ratex-gpui",
  "rfd",
  "serde",
  "serde_json",
@@ -5429,6 +5458,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "owned_ttf_parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
+dependencies = [
+ "ttf-parser",
+]
+
+[[package]]
 name = "palette"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6139,6 +6177,147 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
 
 [[package]]
+name = "ratex-font"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c3599bafdf0e0637d1bb9cf97c01528eaa46fab0c6810c3959c2da5f66b2242"
+dependencies = [
+ "phf 0.13.1",
+ "ratex-types",
+]
+
+[[package]]
+name = "ratex-font-loader"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81c91c7c9f70754d505f1073e79531ebc3cdc7d9b77e2e8709b59cd7ba9b8995"
+dependencies = [
+ "ab_glyph",
+ "ratex-font",
+ "ratex-katex-fonts",
+ "ratex-types",
+ "ratex-unicode-font",
+]
+
+[[package]]
+name = "ratex-gpui"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6c77adea70179bc9f7619dba84302f4da3870b142cf435d9c2c67f077c18757"
+dependencies = [
+ "gpui-pre",
+ "image",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-render",
+ "ratex-svg",
+]
+
+[[package]]
+name = "ratex-katex-fonts"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "575eb89e2ab455fe9618b5f06d1838dff40064642d8ec454fedf14852d2ed0a3"
+
+[[package]]
+name = "ratex-layout"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f0b07c558d07d77c53208d90a5bd1918cbe5f76c1c36f3547bf08bc3d625a"
+dependencies = [
+ "ratex-font",
+ "ratex-parser",
+ "ratex-types",
+ "serde_json",
+]
+
+[[package]]
+name = "ratex-lexer"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d0fb77ea76a6f650f382f9660949cddc8afd695901f1c9293f92175a3d9e62f"
+dependencies = [
+ "ratex-types",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ratex-parser"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dbc57077b89566bde9fc17f468b83d6b17df90930874f8a3d0e7ef988f1ae9c"
+dependencies = [
+ "fancy-regex 0.20.2",
+ "ratex-font",
+ "ratex-lexer",
+ "ratex-types",
+ "regex",
+ "regex-lite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "ratex-render"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4432c7cde8e7b7b4fe3005fe42a886cd1f794bc251b4eeab6ab53f0c81245e76"
+dependencies = [
+ "ab_glyph",
+ "png 0.17.16",
+ "ratex-font",
+ "ratex-font-loader",
+ "ratex-katex-fonts",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-types",
+ "ratex-unicode-font",
+ "serde_json",
+ "tiny-skia 0.11.4",
+ "ttf-parser",
+]
+
+[[package]]
+name = "ratex-svg"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4b27a22f977b0a1bd63d0e24f5b2d94d45baad4ae4e5534a1cd03835cb84561"
+dependencies = [
+ "ab_glyph",
+ "base64 0.22.1",
+ "ratex-font",
+ "ratex-font-loader",
+ "ratex-katex-fonts",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-types",
+ "ratex-unicode-font",
+]
+
+[[package]]
+name = "ratex-types"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74b856c4a2c1d4b9669a10f03b207f97e16a53119bf607501732b97b5c87007f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "ratex-unicode-font"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b6ff8cf7f5e091b741bad835485932287f47edbdff21bed6b1b6f575ac1bd72"
+dependencies = [
+ "fontdb",
+ "system-fonts",
+ "ttf-parser",
+]
+
+[[package]]
 name = "rav1e"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6345,6 +6524,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -7508,7 +7693,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "656b45c05d95a5704399aeef6bd0ddec7b2b3531b7c9e900abbf7c4d2190c925"
 dependencies = [
  "bincode",
- "fancy-regex",
+ "fancy-regex 0.16.2",
  "flate2",
  "fnv",
  "once_cell",
@@ -7564,6 +7749,17 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "system-fonts"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46ba78ea149d4bb0626dacad10aa789eedc83395889890a0e6e7ec69a4577442"
+dependencies = [
+ "fontdb",
+ "sys-locale",
+ "web-sys",
 ]
 
 [[package]]

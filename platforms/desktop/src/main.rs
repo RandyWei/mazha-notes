@@ -105,6 +105,14 @@ fn main() {
 }
 ```
 
+### 数学公式
+
+行内公式 $E=mc^2$ 与独立公式块均由 RaTeX 真实排版：
+
+$$
+\\int_0^1 x^2 \\, dx = \\frac{1}{3}
+$$
+
 ### 其他
 
 ![示例图片](assets/sample.png)
@@ -378,7 +386,12 @@ fn inline_reveals(line_src: &str) -> Vec<InlineReveal> {
         let role = span.role;
         if !matches!(
             role,
-            SpanRole::Strong | SpanRole::Emphasis | SpanRole::Strikethrough | SpanRole::InlineCode
+            SpanRole::Strong
+                | SpanRole::Emphasis
+                | SpanRole::Strikethrough
+                | SpanRole::InlineCode
+                // 行内公式 `$…$`：光标进入时恢复定界符，露出可编辑的 `$tex$`（D76）
+                | SpanRole::MathMarker
         ) {
             continue;
         }
@@ -402,7 +415,11 @@ fn inline_reveals(line_src: &str) -> Vec<InlineReveal> {
         let role = s.role;
         if !matches!(
             role,
-            SpanRole::Strong | SpanRole::Emphasis | SpanRole::Strikethrough | SpanRole::InlineCode
+            SpanRole::Strong
+                | SpanRole::Emphasis
+                | SpanRole::Strikethrough
+                | SpanRole::InlineCode
+                | SpanRole::MathMarker
         ) {
             continue;
         }
@@ -530,6 +547,39 @@ struct ImagePreview {
     data: Arc<RenderImage>,
     /// 适配正文宽度后的显示尺寸（不放大）。
     size: Size<Pixels>,
+}
+
+/// 数学公式的渲染态数据：RaTeX 栅格化后的 GPUI 图像 + 逻辑尺寸（pre-DPR px）。
+///
+/// RaTeX 输出透明底、字形着色的图像，尺寸已含四周 `PAD` 留白，故可直接按 `size` 绘制。
+#[derive(Clone)]
+struct MathPreview {
+    /// 渲染好的公式图像（按 tex + 字号 + DPR + 颜色缓存复用）。
+    data: Arc<RenderImage>,
+    /// 逻辑显示尺寸（宽高，px）。
+    size: Size<Pixels>,
+}
+
+/// 行内公式的叠加层：公式图像 + 其 TeX 在形状文本内的字节范围。
+///
+/// TeX 文本在 gpui 侧为透明占位（保留排版/光标/选区），真实字形在 paint 阶段按该范围定位。
+#[derive(Clone)]
+struct MathSpanOverlay {
+    /// TeX 文本在形状化文本内的字节范围（含引用前缀）。
+    display: Range<usize>,
+    /// 渲染好的公式图像。
+    preview: MathPreview,
+}
+
+/// 块级公式（`$$…$$`）在某一投影行的渲染角色（D76）。
+#[derive(Clone)]
+enum MathLineRole {
+    /// 普通行 / 编辑态（光标在块内、源码模式）：照常显示 TeX 文本。
+    None,
+    /// 锚点行：隐藏 TeX 文本、显示公式图像，行高跟随图像。
+    Anchor(MathPreview),
+    /// 同一公式块内的非锚点行：隐藏文本、高度归零（定界行本就显示为空）。
+    Collapsed,
 }
 
 /// 独占行音视频的渲染态几何：卡片矩形、控制条文字与进度条命中区。
@@ -952,6 +1002,10 @@ struct BlockGeom {
     image: Option<ImagePreview>,
     /// 音视频独占行在渲染态下的卡片/播放控件。
     media: Option<MediaPreview>,
+    /// 块级公式在本行的角色（`None` = 普通行；见 [`MathLineRole`]）。
+    math_line: MathLineRole,
+    /// 行内公式（`$…$`）的图像叠加层（TeX 文本在 gpui 侧透明占位）。
+    math_spans: Vec<MathSpanOverlay>,
     /// 表格行的网格几何（`None` = 非表格行，或该表放不下/含合成斜体而回退流式排版）。
     table: Option<TableRowGeom>,
 }
@@ -1535,7 +1589,9 @@ fn build_table_grids(
             let Some(cells) = line.table_cells.clone() else {
                 continue;
             };
-            let (text, runs, oblique) = build_line_runs(line, base_font, mono_font, palette, None);
+            // 表格网格排版不走公式 overlay：行内公式按字面 TeX 显示（避免逐单元格叠加定位）。
+            let (text, runs, oblique, _) =
+                build_line_runs(line, base_font, mono_font, palette, None, false);
             // 中文合成斜体需要逐字现取轮廓，网格路径暂不支持：整表回退流式排版。
             if !oblique.is_empty() {
                 bail = true;
@@ -2430,6 +2486,11 @@ struct DocView {
     dialog_open: bool,
     /// 音视频播放状态；键为 `kind:src`，仅保留当前文档仍引用的媒体。
     media: HashMap<String, MediaPlayback>,
+    /// 数学公式渲染缓存：键为 `(tex, 字号, DPR, 颜色)`（见 [`math_cache_key`]）。
+    ///
+    /// RaTeX 栅格化要经 解析→排版→PNG→解码，较贵；按公式去重跨帧复用。
+    /// 值为 `None` 表示渲染失败，同样缓存以免每帧重试非法 TeX。
+    math_cache: HashMap<String, Option<MathPreview>>,
     /// 当前文档会话内的表格列宽（键为表格源起点，不写入 Markdown）。
     table_column_widths: HashMap<usize, Vec<Pixels>>,
     /// 当前文档会话内的表格行高（键为行源起点，不写入 Markdown）。
@@ -2562,6 +2623,7 @@ impl DocView {
             renaming: None,
             dialog_open: false,
             media: HashMap::new(),
+            math_cache: HashMap::new(),
             table_column_widths: HashMap::new(),
             table_row_heights: HashMap::new(),
             table_resizing: None,
@@ -2588,6 +2650,8 @@ impl DocView {
         self.layout = None;
         self.highlighter = None;
         self.caret_scroll_key = None;
+        // 公式图像按颜色着色：主题/字号变了必须重渲，否则会残留旧配色的位图。
+        self.math_cache.clear();
         cx.notify();
     }
 
@@ -7226,6 +7290,59 @@ fn italic_fallbacks() -> gpui_kit::FontFallbacks {
     ])
 }
 
+/// 把 TeX 源码栅格化为可绘制的公式图像。
+///
+/// `font_size` 为 px/em，`dpr` 为设备像素比，`color` 为字形颜色；
+/// RaTeX 输出透明底 + 着色字形，`None` 表示解析/排版/栅格化失败（调用方回退字面 TeX）。
+fn render_math_preview(tex: &str, font_size: f32, dpr: f32, color: Hsla) -> Option<MathPreview> {
+    let out = ratex_gpui::render::render_latex(tex, font_size, dpr, color)?;
+    Some(MathPreview {
+        data: out.image,
+        size: size(px(out.width), px(out.height)),
+    })
+}
+
+/// 公式渲染缓存键：纳入所有影响位图的参数，避免主题/字号/缩放变化后复用旧图。
+fn math_cache_key(tex: &str, font_size: f32, dpr: f32, color: Hsla) -> String {
+    // 颜色先转 RGBA（Hsla 无 r/g/b 字段），只取 RGB 压成 24 位十六进制做键。
+    let rgb_color: gpui::Rgba = color.into();
+    let rgb = ((rgb_color.r * 255.0).round() as u32) << 16
+        | ((rgb_color.g * 255.0).round() as u32) << 8
+        | (rgb_color.b * 255.0).round() as u32;
+    format!("{tex}\u{0}{font_size}\u{0}{dpr}\u{0}{rgb:06x}")
+}
+
+/// 把块级公式各投影行的可见 TeX 片段拼成一条公式源码。
+///
+/// `$$` 定界行投影为空，故跳过空片段；多行体以换行连接（RaTeX 视换行如空白）。
+fn join_math_body(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl DocView {
+    /// 取（或惰性渲染）公式图像。失败结果也入缓存，避免每帧重试非法 TeX。
+    fn math_image(
+        &mut self,
+        tex: &str,
+        font_size: f32,
+        dpr: f32,
+        color: Hsla,
+    ) -> Option<MathPreview> {
+        let key = math_cache_key(tex, font_size, dpr, color);
+        if let Some(hit) = self.math_cache.get(&key) {
+            return hit.clone();
+        }
+        let rendered = render_math_preview(tex, font_size, dpr, color);
+        self.math_cache.insert(key, rendered.clone());
+        rendered
+    }
+}
+
 /// 把一个 core [`TextRun`]（片段 + 样式）转成 gpui 的 [`gpui::TextRun`]（字形级样式）。
 ///
 /// 对中文斜体：仅 CJK 字符需自绘合成，其他字符走 gpui 正常渲染；
@@ -7235,7 +7352,13 @@ fn to_gpui_runs(
     base_font: &Font,
     mono_font: &Font,
     palette: &Palette,
-) -> (String, Vec<gpui::TextRun>, Vec<oblique::ObliqueSpan>) {
+    render_math: bool,
+) -> (
+    String,
+    Vec<gpui::TextRun>,
+    Vec<oblique::ObliqueSpan>,
+    Vec<Range<usize>>,
+) {
     // 默认按正文样式；代码块整体覆盖为等宽字体（字号统一在 shape_line 时按块应用）
     let mut font = base_font.clone();
     let mut color = run.color.map(rgb_to_hsla).unwrap_or(palette.foreground);
@@ -7284,6 +7407,25 @@ fn to_gpui_runs(
 
     let text = run.text.clone();
 
+    // 行内公式渲染态（D76）：TeX 文本置为透明占位以保留排版/光标/选区映射，
+    // 真实字形由 paint 阶段的 overlay 绘制；返回该占位在片段文本内的字节范围。
+    // 编辑态（光标进入）与源码模式不走此分支，照常显示斜体主题色 TeX 原文。
+    if run.style == RunStyle::Math && render_math {
+        let span = 0..text.len();
+        let placeholder = gpui::TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: Hsla {
+                a: 0.0,
+                ..palette.foreground
+            },
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        return (text, vec![placeholder], Vec::new(), vec![span]);
+    }
+
     if matches!(run.style, RunStyle::Emphasis | RunStyle::Math) {
         let base_family = font.family.as_ref();
         let mut runs_out: Vec<gpui::TextRun> = Vec::new();
@@ -7321,7 +7463,7 @@ fn to_gpui_runs(
             pos += seg.len();
         }
         if !runs_out.is_empty() {
-            return (text, runs_out, oblique_list);
+            return (text, runs_out, oblique_list, Vec::new());
         }
     }
 
@@ -7333,13 +7475,14 @@ fn to_gpui_runs(
         underline,
         strikethrough,
     };
-    (run.text.clone(), vec![gpui_run], Vec::new())
+    (run.text.clone(), vec![gpui_run], Vec::new(), Vec::new())
 }
 
 /// 把一整块投影行（引用前缀 + 可见片段）拼成一条不换行的可见文本 + 对应 gpui 样式段。
 ///
-/// 返回 `(完整可见文本, gpui_runs, oblique_spans)`。引用前缀 `> ` 用 muted 色，其余用片段自身样式。
+/// 返回 `(完整可见文本, gpui_runs, oblique_spans, math_spans)`。引用前缀 `> ` 用 muted 色，其余用片段自身样式。
 /// `highlight` 为代码块行的语法高亮片段（相对该行显示文本；`None` = 不高亮）。
+/// `render_math` 为真时行内公式的 TeX 变为透明占位，`math_spans` 给出其在完整文本内的字节区间。
 ///
 /// 块级样式（标题整块加粗、已完成任务删除线 + 弱化）在这里逐 run 施加。
 fn build_line_runs(
@@ -7348,10 +7491,17 @@ fn build_line_runs(
     mono_font: &Font,
     palette: &Palette,
     highlight: Option<&[ColoredRun]>,
-) -> (SharedString, Vec<gpui::TextRun>, Vec<oblique::ObliqueSpan>) {
+    render_math: bool,
+) -> (
+    SharedString,
+    Vec<gpui::TextRun>,
+    Vec<oblique::ObliqueSpan>,
+    Vec<Range<usize>>,
+) {
     let mut text = String::new();
     let mut runs: Vec<gpui::TextRun> = Vec::new();
     let mut oblique_spans: Vec<oblique::ObliqueSpan> = Vec::new();
+    let mut math_spans: Vec<Range<usize>> = Vec::new();
 
     // 引用块：为每个嵌套深度补一个 muted 的 "> " 前缀段
     for _ in 0..line.block.quote_depth {
@@ -7406,12 +7556,16 @@ fn build_line_runs(
                 runs.push(gp_run);
                 continue;
             }
-            let (seg_text, seg_runs, seg_obs) = to_gpui_runs(run, base_font, mono_font, palette);
+            let (seg_text, seg_runs, seg_obs, seg_math) =
+                to_gpui_runs(run, base_font, mono_font, palette, render_math);
             for obs in seg_obs {
                 oblique_spans.push(oblique::ObliqueSpan {
                     range: (text.len() + obs.range.start)..(text.len() + obs.range.end),
                     color: obs.color,
                 });
+            }
+            for span in seg_math {
+                math_spans.push((text.len() + span.start)..(text.len() + span.end));
             }
             text.push_str(&seg_text);
             runs.extend(seg_runs);
@@ -7430,20 +7584,23 @@ fn build_line_runs(
             r.font = r.font.clone().bold();
         }
     }
-    // 已完成任务：整行删除线 + 弱化色，一眼区分"做完的待办"
+    // 已完成任务：整行删除线 + 弱化色，一眼区分"做完的待办"。
+    // 行内公式的透明占位（alpha=0）不能被改成不透明，否则 TeX 原文会重新露出。
     if line.block.task == Some(true) {
         for r in &mut runs {
-            r.color = palette.muted;
-            r.strikethrough = Some(StrikethroughStyle {
-                thickness: px(1.),
-                color: Some(palette.muted),
-            });
+            if r.color.a > 0.0 {
+                r.color = palette.muted;
+                r.strikethrough = Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(palette.muted),
+                });
+            }
         }
     }
 
     // 分割线：不在此处画字符，改由 `paint` 依块级 widget 画一条真实细线（SPEC §11.5、D30）。
 
-    (text.into(), runs, oblique_spans)
+    (text.into(), runs, oblique_spans, math_spans)
 }
 
 /// 把 `(r, g, b)`（syntect 前景色）转成 gpui 的 [`Hsla`]。
@@ -7909,6 +8066,8 @@ const LINE_HEIGHT: Pixels = px(24.);
 
 /// 图片与上下相邻内容的呼吸间距。
 const IMAGE_VERTICAL_PAD: Pixels = px(8.);
+/// 块级公式图像与上下相邻内容的呼吸间距。
+const MATH_VERTICAL_PAD: Pixels = px(8.);
 /// 媒体卡片与上下文字之间的呼吸间距。
 const MEDIA_VERTICAL_PAD: Pixels = px(8.);
 /// 媒体控制条高度（视频底栏/音频卡片底栏）。
@@ -7994,6 +8153,105 @@ impl Element for DocElement {
             )
         };
         let indent_base = BASE;
+
+        // 预渲染公式（D76）：单独一次 update，避免与主布局闭包里 `projection` 的可变借用冲突。
+        // 块级公式按块拼接 TeX、行内公式按 run 收集；结果都是拥有所有权的数据，主闭包只读。
+        let math_dpr = window.scale_factor();
+        let (math_block_roles, math_inline_images): (
+            HashMap<usize, MathLineRole>,
+            HashMap<String, MathPreview>,
+        ) = if source_mode {
+            // 源码模式（D68）不做任何 WYSIWYG 公式预览。
+            (HashMap::new(), HashMap::new())
+        } else {
+            self.view.update(cx, |view, _| {
+                // 光标所在逻辑行：光标在公式块内时显示源码，不渲染预览。
+                let caret_lines: Vec<usize> = {
+                    let p = view.doc.projection();
+                    view.cursors
+                        .iter()
+                        .map(|c| p.line_of_source(c.caret))
+                        .collect()
+                };
+                // 块级公式：TeX 由块内各投影行的可见文本拼成（定界行投影为空）。
+                let jobs: Vec<(String, Range<usize>, usize, f32)> = {
+                    let p = view.doc.projection();
+                    p.block_widgets()
+                        .iter()
+                        .filter(|w| matches!(w.kind, BlockWidgetKind::Math))
+                        .filter(|w| !caret_lines.iter().any(|&l| w.line_range.contains(&l)))
+                        .filter_map(|w| {
+                            let bodies: Vec<String> = w
+                                .line_range
+                                .clone()
+                                .filter_map(|i| {
+                                    p.lines.get(i).map(|l| l.display_text().trim().to_string())
+                                })
+                                .collect();
+                            let tex = join_math_body(
+                                &bodies.iter().map(String::as_str).collect::<Vec<_>>(),
+                            );
+                            if tex.is_empty() {
+                                return None;
+                            }
+                            // 锚点取第一条有公式体的行（跳过 `$$` 定界行）。
+                            let anchor = w
+                                .line_range
+                                .clone()
+                                .find(|&i| {
+                                    p.lines
+                                        .get(i)
+                                        .is_some_and(|l| !l.display_text().trim().is_empty())
+                                })
+                                .unwrap_or(w.line_range.start);
+                            let font_size = p.lines.get(anchor).map_or(f32::from(base_size), |l| {
+                                f32::from(block_font_size(&l.block, base_size, mono_size))
+                            });
+                            Some((tex, w.line_range.clone(), anchor, font_size))
+                        })
+                        .collect()
+                };
+                // 行内公式：按 TeX 文本去重渲染（字号统一用正文字号）。
+                let inline_texes: Vec<String> = {
+                    let p = view.doc.projection();
+                    let mut out: Vec<String> = Vec::new();
+                    for line in &p.lines {
+                        if line.block.code_block {
+                            continue;
+                        }
+                        for r in &line.runs {
+                            if r.style == RunStyle::Math && !out.contains(&r.text) {
+                                out.push(r.text.clone());
+                            }
+                        }
+                    }
+                    out
+                };
+                let mut roles: HashMap<usize, MathLineRole> = HashMap::new();
+                for (tex, range, anchor, font_size) in jobs {
+                    if let Some(preview) =
+                        view.math_image(&tex, font_size, math_dpr, palette.foreground)
+                    {
+                        for i in range {
+                            if i == anchor {
+                                roles.insert(i, MathLineRole::Anchor(preview.clone()));
+                            } else {
+                                roles.insert(i, MathLineRole::Collapsed);
+                            }
+                        }
+                    }
+                }
+                let mut images: HashMap<String, MathPreview> = HashMap::new();
+                for tex in inline_texes {
+                    if let Some(preview) =
+                        view.math_image(&tex, f32::from(base_size), math_dpr, palette.foreground)
+                    {
+                        images.insert(tex, preview);
+                    }
+                }
+                (roles, images)
+            })
+        };
 
         // update 提供 &mut DocView（投影缓存需惰性建立），闭包返回几何数据避免借用越界
         let content_width_total = bounds.size.width;
@@ -8292,6 +8550,11 @@ impl Element for DocElement {
                     };
                     let is_revealed = revealed_line.is_some();
                     let line = revealed_line.as_ref().unwrap_or(line);
+                    // 块级公式角色（D76）：光标在块内/源码模式时预渲染结果为空，照常显示 TeX。
+                    let math_line = math_block_roles
+                        .get(&idx)
+                        .cloned()
+                        .unwrap_or(MathLineRole::None);
                     // 围栏行/独占图片行：光标进入时显示整行源码，并做 1:1 字节映射。
                     // 源码模式（D68）：整行按原始 Markdown 源码显示与编辑。
                     let raw_src: Option<SharedString> = if source_mode {
@@ -8334,7 +8597,31 @@ impl Element for DocElement {
                     // 本行若属于网格化表格，复用预排好的单元格几何
                     let table_row = table_rows.get(idx).cloned().flatten();
                     let dim = focus_range.as_ref().is_some_and(|r| !r.contains(&idx));
-                    let (text, runs, oblique_spans) = if let Some(src) = &raw_src {
+                    // 行内公式：TeX 在显示文本内的字节区间 = 引用前缀 + 前面 run 的长度。
+                    // 仅当整行的公式都成功渲染、且不在编辑态/块公式行时才透明占位 + 叠加。
+                    let mut math_cursor = 2usize * line.block.quote_depth as usize;
+                    let mut inline_math: Vec<(Range<usize>, String)> = Vec::new();
+                    if raw_src.is_none()
+                        && !is_revealed
+                        && !line.block.code_block
+                        && matches!(math_line, MathLineRole::None)
+                    {
+                        for run in &line.runs {
+                            if run.style == RunStyle::Math {
+                                inline_math.push((
+                                    math_cursor..math_cursor + run.text.len(),
+                                    run.text.clone(),
+                                ));
+                            }
+                            math_cursor += run.text.len();
+                        }
+                    }
+                    let render_inline_math = !matches!(math_line, MathLineRole::None)
+                        || (!inline_math.is_empty()
+                            && inline_math
+                                .iter()
+                                .all(|(_, tex)| math_inline_images.contains_key(tex)));
+                    let (text, runs, oblique_spans, math_spans_raw) = if let Some(src) = &raw_src {
                         // 源码模式显示原文（等宽、正文色）；围栏编辑态沿用弱化色。
                         let mut color = if source_mode {
                             palette.foreground
@@ -8352,7 +8639,7 @@ impl Element for DocElement {
                             underline: None,
                             strikethrough: None,
                         };
-                        (src.clone(), vec![run], Vec::new())
+                        (src.clone(), vec![run], Vec::new(), Vec::new())
                     } else {
                         let mut built = build_line_runs(
                             line,
@@ -8360,6 +8647,7 @@ impl Element for DocElement {
                             &mono_font,
                             &palette,
                             code_hl[idx].as_deref(),
+                            render_inline_math,
                         );
                         if dim {
                             for run in &mut built.1 {
@@ -8371,6 +8659,17 @@ impl Element for DocElement {
                         }
                         built
                     };
+                    // 行内公式叠加层：`math_spans_raw` 与 `inline_math` 同序（按 run 收集）。
+                    let math_spans: Vec<MathSpanOverlay> = math_spans_raw
+                        .iter()
+                        .zip(inline_math.iter())
+                        .filter_map(|(span, (_, tex))| {
+                            math_inline_images.get(tex).map(|preview| MathSpanOverlay {
+                                display: span.clone(),
+                                preview: preview.clone(),
+                            })
+                        })
+                        .collect();
                     // 前缀字节数 = 形状文本长度 - 投影显示文本长度（引用 "> " 等投影外文本）
                     // 围栏源码是整行原文，没有额外前缀
                     let prefix_bytes = if raw_src.is_some() {
@@ -8551,6 +8850,15 @@ impl Element for DocElement {
                     }
                     if let Some(media) = &media_preview {
                         line_px = media.rect.size.height + MEDIA_VERTICAL_PAD * 2.;
+                    }
+                    // 块级公式（D76）：锚点行高跟随图像（含上下呼吸间距），
+                    // 块内其余行（多为 `$$` 定界行）在渲染态高度归零，避免留白。
+                    match &math_line {
+                        MathLineRole::Anchor(preview) => {
+                            line_px = preview.size.height + MATH_VERTICAL_PAD * 2.;
+                        }
+                        MathLineRole::Collapsed => line_px = Pixels::ZERO,
+                        MathLineRole::None => {}
                     }
                     // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
                     // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
@@ -8751,6 +9059,8 @@ impl Element for DocElement {
                         raw_src,
                         image: image_preview,
                         media: media_preview,
+                        math_line,
+                        math_spans,
                         table: table_row,
                     });
                 }
@@ -9171,6 +9481,22 @@ impl Element for DocElement {
                 paint_rect_border(window, rect, palette.border, px(1.));
             }
 
+            // 块级公式（`$$…$$`）：TeX 文本已在布局阶段置为透明占位，这里绘制排版图像。
+            // 居中于正文可用宽度；保留 Math widget 的外框（见 widget 装饰绘制）。
+            if let MathLineRole::Anchor(preview) = &block.math_line {
+                let avail = (element_bounds.size.width - block.indent - BASE * 2.).max(px(1.));
+                let x = text_x + (avail - preview.size.width).max(Pixels::ZERO) / 2.;
+                let rect = bounds(point(x, row_top + MATH_VERTICAL_PAD), preview.size);
+                let _ = window.paint_image(
+                    rect,
+                    rect,
+                    Corners::default(),
+                    preview.data.clone(),
+                    0,
+                    false,
+                );
+            }
+
             // 独占行音视频：视频帧/海报/占位卡片 + 底部控制条与进度。
             if let Some(media) = &block.media {
                 let rect = media.rect;
@@ -9539,6 +9865,27 @@ impl Element for DocElement {
                 }
             }
 
+            // 行内公式：TeX 文本在布局阶段已透明占位，这里按其显示字节区间定位并叠加图像。
+            // 垂直方向以视觉行中线对齐；占位本身保留原排版宽度，故光标/选区映射不变。
+            for span in &block.math_spans {
+                let Some(p) = block.shaped.position_for_index(span.display.start, line_px) else {
+                    continue;
+                };
+                let size = span.preview.size;
+                let rect = bounds(
+                    point(text_x + p.x, row_top + p.y + (line_px - size.height) / 2.),
+                    size,
+                );
+                let _ = window.paint_image(
+                    rect,
+                    rect,
+                    Corners::default(),
+                    span.preview.data.clone(),
+                    0,
+                    false,
+                );
+            }
+
             // 光标竖线：仅在焦点在编辑区且处于闪烁可见相位时绘制。
             let (cursor_visible, focused) = {
                 let view = self.view.read(cx);
@@ -9668,9 +10015,10 @@ mod tests {
         QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
         copy_entry, dropped_link_markdown, footnote_jump, horizontal_step, inline_links,
-        inline_reveals, is_image_path, is_markdown_file, markdown_image_path, nearest_cell,
-        oblique, plan_imports, quote_block_wrap_width, reveal_inline, table_arrow_step,
-        table_entry_snap, unique_import_path,
+        inline_reveals, is_image_path, is_markdown_file, join_math_body, markdown_image_path,
+        math_cache_key, nearest_cell, oblique, plan_imports, quote_block_wrap_width,
+        render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
+        unique_import_path,
     };
     use super::{decode_data_image, image_resource, px, size};
     use gpui_kit::{
@@ -10041,7 +10389,8 @@ mod tests {
         };
         let mono = base.clone();
         let palette = super::Palette::default_for_test();
-        let (out_text, runs, spans) = super::to_gpui_runs(emphasis, &base, &mono, &palette);
+        let (out_text, runs, spans, _) =
+            super::to_gpui_runs(emphasis, &base, &mono, &palette, false);
         assert_eq!(out_text, "中文斜体");
         // 整段都是 CJK：应被拆成透明占位 run + 对应的合成斜体区间
         assert_eq!(spans.len(), 1);
@@ -10049,6 +10398,76 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, out_text.len());
         assert_eq!(runs[0].color.a, 0.0, "占位字形必须透明");
+    }
+
+    /// 块级公式各行的 TeX 拼接：跳过 `$$` 定界行产生的空片段。
+    #[test]
+    fn join_math_body_skips_empty_delimiters() {
+        assert_eq!(join_math_body(&["", "E=mc^2", ""]), "E=mc^2");
+        assert_eq!(join_math_body(&["  a  ", "\tb"]), "a\nb");
+        assert_eq!(join_math_body(&["", "   "]), "");
+        assert_eq!(join_math_body(&[]), "");
+    }
+
+    /// 公式缓存键必须区分所有影响位图的参数，否则主题/字号变化会显示旧位图。
+    #[test]
+    fn math_cache_key_includes_render_params() {
+        let palette = super::Palette::default_for_test();
+        let color = palette.foreground;
+        let key = math_cache_key("x^2", 16.0, 2.0, color);
+        assert_eq!(key, math_cache_key("x^2", 16.0, 2.0, color));
+        assert_ne!(key, math_cache_key("y^2", 16.0, 2.0, color));
+        assert_ne!(key, math_cache_key("x^2", 20.0, 2.0, color));
+        assert_ne!(key, math_cache_key("x^2", 16.0, 1.0, color));
+        let other = super::Hsla {
+            h: 0.5,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        assert_ne!(key, math_cache_key("x^2", 16.0, 2.0, other));
+    }
+
+    /// RaTeX 能把合法 TeX 栅格化为非空图像（且尺寸是 pre-DPR 逻辑像素）。
+    #[test]
+    fn render_math_preview_produces_image() {
+        let color = super::Palette::default_for_test().foreground;
+        let preview = render_math_preview(r"\frac{1}{2}+x^2", 16.0, 2.0, color)
+            .expect("合法 TeX 应当渲染成功");
+        assert!(preview.size.width > px(0.));
+        assert!(preview.size.height > px(0.));
+    }
+
+    /// 行内公式只在渲染态透明占位；编辑态保持可见 TeX 原文。
+    #[test]
+    fn math_run_transparent_only_in_render_mode() {
+        let mut doc = Document::new("a $x^2$ b");
+        let line = &doc.projection().lines[0];
+        let math = line
+            .runs
+            .iter()
+            .find(|r| r.style == RunStyle::Math)
+            .expect("投影应产出 Math 片段");
+        let base = gpui_kit::Font {
+            family: ".SystemUIFont".into(),
+            ..Default::default()
+        };
+        let palette = super::Palette::default_for_test();
+        let (_, runs, _, spans) = to_gpui_runs(math, &base, &base, &palette, true);
+        assert_eq!(spans, vec![0..math.text.len()], "透明占位应报告字节范围");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].color.a, 0.0);
+        let (_, runs, _, spans) = to_gpui_runs(math, &base, &base, &palette, false);
+        assert!(spans.is_empty(), "编辑态不产生 overlay");
+        assert!(runs[0].color.a > 0.0, "编辑态 TeX 原文可见");
+    }
+
+    /// 行内公式的 `$` 定界符纳入展开：光标进入时露出可编辑的 `$tex$`。
+    #[test]
+    fn inline_math_markers_are_revealed() {
+        let reveals = inline_reveals("a $x$ b");
+        assert_eq!(reveals.len(), 1);
+        assert_eq!(reveals[0].range, 2..5);
     }
 
     /// CoreText 侧能真的取到中文轮廓（否则自绘阶段会静默跳过，斜体仍不生效）。
