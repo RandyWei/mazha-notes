@@ -571,6 +571,51 @@ struct MathSpanOverlay {
     preview: MathPreview,
 }
 
+/// 行内公式叠加层的绘制几何（窗口坐标）。
+///
+/// `dest` 为最终落笔矩形，`image_bounds` 交给 [`gpui::Window::paint_image`] 用来
+/// 裁掉 RaTeX 左右各 [`ratex_gpui::render::PAD`] 的透明留白。
+#[derive(Clone, Debug)]
+struct MathDrawGeom {
+    dest: Bounds<Pixels>,
+    image_bounds: Bounds<Pixels>,
+}
+
+/// 计算行内公式图像的绘制几何，使其**不越过 TeX 透明占位的槽宽**。
+///
+/// 背景：占位 run 的 advance 来自 TeX 源文本，而 RaTeX 图像在字形两侧各带
+/// `PAD`（8px）透明留白，按原尺寸画会超出槽宽、压到右侧普通文字。
+/// 这里裁掉左右留白只画字形区；仅当字形区真的比槽宽时才等比缩小，
+/// 短公式因此不会被压扁；垂直方向沿用原有「行内居中、可略微出格」的行为。
+fn math_inline_draw_geom(
+    slot_x: Pixels,
+    slot_w: Pixels,
+    image: Size<Pixels>,
+    line_top: Pixels,
+    line_h: Pixels,
+) -> MathDrawGeom {
+    let pad = ratex_gpui::render::PAD;
+    // 字形区宽度 = 图像宽 - 左右 padding；防御异常图像宽度，至少留 1px。
+    let glyph_w = (f32::from(image.width) - 2.0 * pad).max(1.0);
+    let slot_w = f32::from(slot_w).max(1.0);
+    // 只在字形区宽于槽位时缩小；否则保持 1:1，避免 `$x$` 这类短公式变得极小。
+    let scale = (slot_w / glyph_w).min(1.0);
+    let draw_w = glyph_w * scale;
+    let draw_h = (f32::from(image.height) * scale).max(1.0);
+    let pad_scaled = pad * scale;
+    // 在槽内水平居中（槽宽通常略大于字形区，视觉上更贴合周围文字）。
+    let x = f32::from(slot_x) + (slot_w - draw_w) / 2.0;
+    let y = f32::from(line_top) + (f32::from(line_h) - draw_h) / 2.0;
+    let dest = bounds(point(px(x), px(y)), size(px(draw_w), px(draw_h)));
+    // image_bounds 比 dest 左右各外扩 PAD*scale：paint_image 按它与 tile 的比例
+    // 取中间字形区，再拉伸进 dest（见 gpui::Window::paint_image 的 sub_tile 计算）。
+    let image_bounds = bounds(
+        point(px(x - pad_scaled), px(y)),
+        size(px(draw_w + 2.0 * pad_scaled), px(draw_h)),
+    );
+    MathDrawGeom { dest, image_bounds }
+}
+
 /// 块级公式（`$$…$$`）在某一投影行的渲染角色（D76）。
 #[derive(Clone)]
 enum MathLineRole {
@@ -7337,6 +7382,33 @@ fn join_math_body(parts: &[&str]) -> String {
         .join("\n")
 }
 
+/// 收集需要预渲染的**行内**公式 TeX（按文本去重，字号统一用正文字号）。
+///
+/// 必须排除两类行（D76）：
+/// - 代码块：等宽代码里出现 `$…$` 不渲染；
+/// - 块级公式 `$$…$$`：其 body 同样是 `RunStyle::Math`，若混进来，光标进入块内
+///   （`math_line=None`）时会被误当作行内公式透明化，导致看不到 TeX 原文。
+fn collect_inline_texes(projection: &Projection) -> Vec<String> {
+    let math_lines: HashSet<usize> = projection
+        .block_widgets()
+        .iter()
+        .filter(|w| matches!(w.kind, BlockWidgetKind::Math))
+        .flat_map(|w| w.line_range.clone())
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, line) in projection.lines.iter().enumerate() {
+        if line.block.code_block || math_lines.contains(&i) {
+            continue;
+        }
+        for r in &line.runs {
+            if r.style == RunStyle::Math && !out.contains(&r.text) {
+                out.push(r.text.clone());
+            }
+        }
+    }
+    out
+}
+
 impl DocView {
     /// 取（或惰性渲染）公式图像。失败结果也入缓存，避免每帧重试非法 TeX。
     fn math_image(
@@ -8185,22 +8257,49 @@ impl Element for DocElement {
         // 预渲染公式（D76）：单独一次 update，避免与主布局闭包里 `projection` 的可变借用冲突。
         // 块级公式按块拼接 TeX、行内公式按 run 收集；结果都是拥有所有权的数据，主闭包只读。
         let math_dpr = window.scale_factor();
-        let (math_block_roles, math_inline_images): (
+        let (math_block_roles, math_inline_images, math_edit_texts): (
             HashMap<usize, MathLineRole>,
             HashMap<String, MathPreview>,
+            HashMap<usize, String>,
         ) = if source_mode {
             // 源码模式（D68）不做任何 WYSIWYG 公式预览。
-            (HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new())
         } else {
             self.view.update(cx, |view, _| {
-                // 光标所在逻辑行：光标在公式块内时显示源码，不渲染预览。
-                let caret_lines: Vec<usize> = {
+                // 光标所在逻辑行：光标在公式块内时显示源码，不渲染预览；
+                // 同时收集该公式块全部行的源码区间，编辑态整块显示 TeX 原文（含 `$$`）。
+                let (caret_lines, math_edit_sources): (Vec<usize>, Vec<(usize, Range<usize>)>) = {
                     let p = view.doc.projection();
-                    view.cursors
+                    let lines: Vec<usize> = view
+                        .cursors
                         .iter()
                         .map(|c| p.line_of_source(c.caret))
-                        .collect()
+                        .collect();
+                    let mut sources = Vec::new();
+                    for w in p
+                        .block_widgets()
+                        .iter()
+                        .filter(|w| matches!(w.kind, BlockWidgetKind::Math))
+                    {
+                        if !lines.iter().any(|&l| w.line_range.contains(&l)) {
+                            continue;
+                        }
+                        for i in w.line_range.clone() {
+                            if let Some(line) = p.lines.get(i) {
+                                sources.push((i, line.source_range.clone()));
+                            }
+                        }
+                    }
+                    (lines, sources)
                 };
+                // 投影借用结束后再切源码（slice 为 &self，避免与 projection 的 &mut 冲突）。
+                let math_edit_texts: HashMap<usize, String> = math_edit_sources
+                    .into_iter()
+                    .map(|(i, range)| {
+                        let src = view.doc.slice(range).into_owned();
+                        (i, src.trim_end_matches(['\n', '\r']).to_string())
+                    })
+                    .collect();
                 // 块级公式：TeX 由块内各投影行的可见文本拼成（定界行投影为空）。
                 let jobs: Vec<(String, Range<usize>, usize, f32)> = {
                     let p = view.doc.projection();
@@ -8239,21 +8338,10 @@ impl Element for DocElement {
                         })
                         .collect()
                 };
-                // 行内公式：按 TeX 文本去重渲染（字号统一用正文字号）。
+                // 行内公式：只收真正的行内 TeX（排除代码块与块级公式行）。
                 let inline_texes: Vec<String> = {
                     let p = view.doc.projection();
-                    let mut out: Vec<String> = Vec::new();
-                    for line in &p.lines {
-                        if line.block.code_block {
-                            continue;
-                        }
-                        for r in &line.runs {
-                            if r.style == RunStyle::Math && !out.contains(&r.text) {
-                                out.push(r.text.clone());
-                            }
-                        }
-                    }
-                    out
+                    collect_inline_texes(p)
                 };
                 let mut roles: HashMap<usize, MathLineRole> = HashMap::new();
                 for (tex, range, anchor, font_size) in jobs {
@@ -8277,7 +8365,7 @@ impl Element for DocElement {
                         images.insert(tex, preview);
                     }
                 }
-                (roles, images)
+                (roles, images, math_edit_texts)
             })
         };
 
@@ -8594,6 +8682,11 @@ impl Element for DocElement {
                             .iter()
                             .find(|(i, _)| *i == idx)
                             .map(|(_, src)| src.clone().into())
+                            .or_else(|| {
+                                // 光标进入块级公式：整块按原始源码显示（含 `$$` 定界行），
+                                // 1:1 字节映射可直接编辑 TeX；移开后恢复公式图像。
+                                math_edit_texts.get(&idx).map(|src| src.clone().into())
+                            })
                             .or_else(|| {
                                 (caret_pos.line == idx
                                     && (standalone_image_dest(line).is_some()
@@ -9912,19 +10005,30 @@ impl Element for DocElement {
             }
 
             // 行内公式：TeX 文本在布局阶段已透明占位，这里按其显示字节区间定位并叠加图像。
-            // 垂直方向以视觉行中线对齐；占位本身保留原排版宽度，故光标/选区映射不变。
+            // 用占位槽的起止位置算出可用宽度，裁掉 RaTeX 的透明留白后再画，
+            // 保证右侧普通文字不被图像覆盖；光标/选区映射仍走原占位文本，不受影响。
             for span in &block.math_spans {
-                let Some(p) = block.shaped.position_for_index(span.display.start, line_px) else {
+                let Some(start) = block.shaped.position_for_index(span.display.start, line_px)
+                else {
                     continue;
                 };
-                let size = span.preview.size;
-                let rect = bounds(
-                    point(text_x + p.x, row_top + p.y + (line_px - size.height) / 2.),
-                    size,
+                let Some(end) = block.shaped.position_for_index(span.display.end, line_px) else {
+                    continue;
+                };
+                let slot_w = end.x - start.x;
+                if slot_w <= Pixels::ZERO {
+                    continue;
+                }
+                let geom = math_inline_draw_geom(
+                    text_x + start.x,
+                    slot_w,
+                    span.preview.size,
+                    row_top + start.y,
+                    line_px,
                 );
                 let _ = window.paint_image(
-                    rect,
-                    rect,
+                    geom.dest,
+                    geom.image_bounds,
                     Corners::default(),
                     span.preview.data.clone(),
                     0,
@@ -10060,11 +10164,11 @@ mod tests {
         BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
         MATH_VERTICAL_PAD, QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
-        copy_entry, dropped_link_markdown, footnote_jump, horizontal_step, inline_links,
-        inline_reveals, is_image_path, is_markdown_file, join_math_body, markdown_image_path,
-        math_cache_key, math_hit_rect, nearest_cell, oblique, plan_imports, quote_block_wrap_width,
-        render_math_preview, reveal_inline, table_arrow_step, table_entry_snap, to_gpui_runs,
-        unique_import_path,
+        collect_inline_texes, copy_entry, dropped_link_markdown, footnote_jump, horizontal_step,
+        inline_links, inline_reveals, is_image_path, is_markdown_file, join_math_body,
+        markdown_image_path, math_cache_key, math_hit_rect, math_inline_draw_geom, nearest_cell,
+        oblique, plan_imports, quote_block_wrap_width, render_math_preview, reveal_inline,
+        table_arrow_step, table_entry_snap, to_gpui_runs, unique_import_path,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -10444,6 +10548,50 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, out_text.len());
         assert_eq!(runs[0].color.a, 0.0, "占位字形必须透明");
+    }
+
+    /// 行内公式绘图几何：裁掉 RaTeX 的左右透明留白后，落笔矩形不得越过占位槽宽，
+    /// 否则会压到右侧普通文字；槽位充裕时保持字形原尺寸（短公式不被压扁）。
+    #[test]
+    fn inline_math_draw_geom_stays_within_slot() {
+        let slot_x = px(100.);
+        let line_top = px(0.);
+        let line_h = px(24.);
+        let image = size(px(60.), px(32.)); // 字形 44px + 左右各 8px PAD
+
+        // 槽位比字形区宽：1:1 绘制，居中落在槽位内。
+        let wide = math_inline_draw_geom(slot_x, px(50.), image, line_top, line_h);
+        assert_eq!(wide.dest.size.width, px(44.));
+        assert_eq!(wide.dest.size.height, px(32.));
+        assert!(wide.dest.origin.x >= slot_x);
+        assert!(wide.dest.origin.x + wide.dest.size.width <= slot_x + px(50.));
+        // image_bounds 左右各外扩 PAD，供 paint_image 裁出中间字形区。
+        assert_eq!(wide.image_bounds.origin.x, wide.dest.origin.x - px(8.));
+        assert_eq!(wide.image_bounds.size.width, px(60.));
+
+        // 槽位比字形区窄：等比缩小到恰好等于槽宽，右缘不越界。
+        let narrow = math_inline_draw_geom(slot_x, px(22.), image, line_top, line_h);
+        assert_eq!(narrow.dest.size.width, px(22.));
+        assert_eq!(narrow.dest.size.height, px(16.));
+        assert_eq!(narrow.dest.origin.x, slot_x);
+        assert_eq!(
+            narrow.dest.origin.x + narrow.dest.size.width,
+            slot_x + px(22.)
+        );
+    }
+
+    /// 行内公式预渲染集合必须排除块级公式行：否则光标进入块内时，
+    /// 块 body 的 `RunStyle::Math` 会被当作行内公式透明化，看不到 TeX 原文。
+    #[test]
+    fn inline_texes_exclude_math_block_body() {
+        let mut doc = Document::new("行内 $x^2$ 与块 $$\n\\frac{1}{2}\n$$ 结束");
+        let p = doc.projection();
+        let texes = collect_inline_texes(&p);
+        assert!(texes.contains(&"x^2".to_string()));
+        assert!(
+            !texes.iter().any(|t| t.contains("frac")),
+            "块级公式 body 不得进入行内预渲染集合：{texes:?}"
+        );
     }
 
     /// 块级公式命中框：矩形起点与 paint 绘制位置一致，呼吸间距内不命中。
