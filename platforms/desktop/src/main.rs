@@ -5617,79 +5617,77 @@ impl Render for DocView {
             None
         };
 
-        // 左侧文件树（只显示文件/目录，不再混入大纲）
+        // 左侧文件树（只显示文件/目录，不再混入大纲）。
+        // 标题栏 `sb-h` 单独作为 sidebar 的直接子节点固定在顶部（D75）：
+        // 只有下面的条目列表进入滚动容器，标题与「＋文件/＋文件夹」不随列表卷走。
+        let sb_header = div()
+            .id("sb-h")
+            .px_2()
+            .h(px(28.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(palette.border)
+            // 侧栏标题也是「拖到根目录」的落点（根目录恒展开，rel 为空串）。
+            .on_drop(cx.listener(|view, drag: &TreeDrag, _w, cx| {
+                if let Some(root) = view.workspace_root.clone() {
+                    let from = root.join(&drag.rel);
+                    view.move_entry(from, root, cx);
+                }
+            }))
+            // 根目录落点不接受「本来就在根目录」的条目（移动无变化）；外部文件拖入恒接受。
+            .can_drop(|drag, _w, _cx| {
+                if let Some(d) = drag.downcast_ref::<TreeDrag>() {
+                    return d.rel.contains('/');
+                }
+                drag.is::<ExternalPaths>()
+            })
+            // 拖到根目录标题时整行铺强调底色，明确当前落点（D73/D74）。
+            .drag_over::<TreeDrag>(move |style, _drag, _w, _cx| style.bg(palette.selection))
+            // 系统拖入的文件落到工作区根目录（D74）。
+            .drag_over::<ExternalPaths>(move |style, _drag, _w, _cx| style.bg(palette.selection))
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _w, cx| {
+                let root = view.workspace_root.clone();
+                view.import_external_paths(paths.paths(), root, false, cx);
+            }))
+            .child("资源管理器")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("sb-new-file")
+                            .cursor_pointer()
+                            .text_xs()
+                            .hover(|d| d.text_color(palette.foreground))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, _ev, _w, cx| {
+                                    view.new_markdown_in_root(cx);
+                                }),
+                            )
+                            .child("＋文件"),
+                    )
+                    .child(
+                        div()
+                            .id("sb-new-folder")
+                            .cursor_pointer()
+                            .text_xs()
+                            .hover(|d| d.text_color(palette.foreground))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, _ev, _w, cx| {
+                                    view.new_folder_in_root(cx);
+                                }),
+                            )
+                            .child("＋文件夹"),
+                    ),
+            );
         let mut sb: Vec<gpui::AnyElement> = Vec::new();
-        sb.push(
-            div()
-                .id("sb-h")
-                .px_2()
-                .h(px(28.))
-                .flex()
-                .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(palette.border)
-                // 侧栏标题也是「拖到根目录」的落点（根目录恒展开，rel 为空串）。
-                .on_drop(cx.listener(|view, drag: &TreeDrag, _w, cx| {
-                    if let Some(root) = view.workspace_root.clone() {
-                        let from = root.join(&drag.rel);
-                        view.move_entry(from, root, cx);
-                    }
-                }))
-                // 根目录落点不接受「本来就在根目录」的条目（移动无变化）；外部文件拖入恒接受。
-                .can_drop(|drag, _w, _cx| {
-                    if let Some(d) = drag.downcast_ref::<TreeDrag>() {
-                        return d.rel.contains('/');
-                    }
-                    drag.is::<ExternalPaths>()
-                })
-                // 拖到根目录标题时整行铺强调底色，明确当前落点（D73/D74）。
-                .drag_over::<TreeDrag>(move |style, _drag, _w, _cx| style.bg(palette.selection))
-                // 系统拖入的文件落到工作区根目录（D74）。
-                .drag_over::<ExternalPaths>(move |style, _drag, _w, _cx| {
-                    style.bg(palette.selection)
-                })
-                .on_drop(cx.listener(|view, paths: &ExternalPaths, _w, cx| {
-                    let root = view.workspace_root.clone();
-                    view.import_external_paths(paths.paths(), root, false, cx);
-                }))
-                .child("资源管理器")
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id("sb-new-file")
-                                .cursor_pointer()
-                                .text_xs()
-                                .hover(|d| d.text_color(palette.foreground))
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|view, _ev, _w, cx| {
-                                        view.new_markdown_in_root(cx);
-                                    }),
-                                )
-                                .child("＋文件"),
-                        )
-                        .child(
-                            div()
-                                .id("sb-new-folder")
-                                .cursor_pointer()
-                                .text_xs()
-                                .hover(|d| d.text_color(palette.foreground))
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|view, _ev, _w, cx| {
-                                        view.new_folder_in_root(cx);
-                                    }),
-                                )
-                                .child("＋文件夹"),
-                        ),
-                )
-                .into_any_element(),
-        );
         if self.tree_open
             && let Some(ref root) = self.workspace_root
         {
@@ -6036,8 +6034,17 @@ impl Render for DocView {
             .bg(palette.subtle)
             .flex()
             .flex_col()
-            .overflow_y_scroll()
-            .children(sb);
+            // 标题栏固定；列表单独滚动。`min_h(0)` 让 flex 子项可收缩到内容高以下，
+            // 否则 flex 项默认按内容高度撑开，滚动容器永远不出现（D75）。
+            .child(sb_header)
+            .child(
+                div()
+                    .id("sidebar-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(sb),
+            );
         // 侧栏分隔条：按下后由 `#app` 的 move/up 监听统一改宽度，避免鼠标快速移出
         // 4px 手柄后丢失拖拽（D58）。
         let sidebar_resize = div()
