@@ -114,7 +114,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 145 条）
 
 ```
-@@HASH@@ feat(desktop): Mermaid 图表真实渲染，替换块级占位面板（0.1.102，D77）
+9b6af0c feat(desktop): Mermaid 图表真实渲染，替换块级占位面板（0.1.102，D77）
 ed19d00 fix(desktop): 块级公式编辑态显 TeX 原文并修行内重叠（0.1.101，D76）
 7eadc91 fix(desktop): 块级公式点击进编辑态并去装饰（0.1.100，D76）
 daa864b fix(desktop): 块级公式居左对齐正文（0.1.99，D76）
@@ -208,7 +208,7 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 145（含本次）。
 
-- 2026-11-18（`@@HASH@@`，0.1.102）：**桌面 Mermaid 图表真实渲染（R4 第二步，D77）**：桌面新增 `mermaid-rs-renderer 0.3.1`（render-only，纯 Rust `render(src)` 产 SVG，关 CLI/内置 PNG），SVG 经 GPUI `SvgRenderer::render_single_frame` 栅格化（逻辑尺寸除 `SMOOTH_SVG_SCALE_FACTOR`）；`DocView` 按 DSL 源码缓存（含失败缓存，与主题/DPR 无关）。渲染态 mermaid 块源码转透明占位、锚点行显示图像（弱底 + 圆角 + 描边，按正文宽等比适配）其余行归零；`DocLayout::chart_boxes` 命中图像把光标放进围栏块显示 DSL 原文，移开恢复；失败/不支持语法回退弱底 + 语言标签占位面板。内置 `SAMPLE` 增加 mermaid 示例。核心/导出不改，导出仍按字面量。桌面新增 DSL 提取/缓存键/SVG 栅格化出图/命中框/文本透明化 5 条单测（68 项）；根 workspace 548 项门禁全绿。截图环境不可用（`screencapture` 取窗口空/全黑），未做实机目视验收，由渲染管线单测（非空像素断言）验证。
+- 2026-11-18（`9b6af0c`，0.1.102）：**桌面 Mermaid 图表真实渲染（R4 第二步，D77）**：桌面新增 `mermaid-rs-renderer 0.3.1`（render-only，纯 Rust `render(src)` 产 SVG，关 CLI/内置 PNG），SVG 经 GPUI `SvgRenderer::render_single_frame` 栅格化（逻辑尺寸除 `SMOOTH_SVG_SCALE_FACTOR`）；`DocView` 按 DSL 源码缓存（含失败缓存，与主题/DPR 无关）。渲染态 mermaid 块源码转透明占位、锚点行显示图像（弱底 + 圆角 + 描边，按正文宽等比适配）其余行归零；`DocLayout::chart_boxes` 命中图像把光标放进围栏块显示 DSL 原文，移开恢复；失败/不支持语法回退弱底 + 语言标签占位面板。内置 `SAMPLE` 增加 mermaid 示例。核心/导出不改，导出仍按字面量。桌面新增 DSL 提取/缓存键/SVG 栅格化出图/命中框/文本透明化 5 条单测（68 项）；根 workspace 548 项门禁全绿。截图环境不可用（`screencapture` 取窗口空/全黑），未做实机目视验收，由渲染管线单测（非空像素断言）验证。
 
 - 2026-11-18（`ed19d00`，0.1.101）：**块级公式编辑态显 TeX + 行内不重叠**（D76 细化）：① 块级公式编辑态改为整块按原始源码逐行显示（含 `$$` 定界行，走 `raw_src` 通道做 1:1 字节映射），修掉「点进公式后仍看不到 TeX 原文」——根因是块 body 同为 `RunStyle::Math`，被 `inline_texes` 收进预渲染集合后又被当作行内公式透明化；新增纯函数 `collect_inline_texes` 排除块级公式行与代码块行。② 新增纯函数 `math_inline_draw_geom`：按透明占位槽起止位置算可用宽度，裁掉 RaTeX 左右各 8px 透明留白后再画，字形区宽于槽位才等比缩小，防止图像越过槽宽压到右侧普通文字。新增 2 条桌面单测（行内绘图几何边界、块级 TeX 不混入行内集合）。桌面 fmt/clippy/test/build 全绿（63 项）；根 workspace fmt/clippy/test 全绿（548 项）；实机截图确认块级点击显示含 `$$` 的完整 TeX、移开恢复公式图像、行内公式与右侧文字有间隔无重叠。
 
