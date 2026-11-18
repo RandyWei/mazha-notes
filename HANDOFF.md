@@ -112,6 +112,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 138 条）
 
 ```
+5213bc1 feat(desktop): 拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索（0.1.95，D40/D73）
+be5f7ef feat(desktop): 文件树展开状态持久化（0.1.94，D72）
+7711d0a feat(desktop): 文件树拖拽移动 + 新建文件夹（0.1.93，D71）
+608c7b2 feat(desktop): 文件树层级化 + 大纲移至右侧面板（0.1.92，D70）
+997c3b3 feat(md/export/desktop): 脚注双向跳转与导出编号/文末归集（0.1.91，D69）
 9db3c61 fix(desktop): 源码模式隐藏列表与引用渲染装饰（0.1.90）
 ddb185e feat(desktop): 专注/打字机/源码模式（0.1.90，D68）
 d487082 feat(desktop): 图片点击边界定位与整图删除（0.1.89）
@@ -194,15 +199,15 @@ d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 
 > 更早提交见 `git log`；历史累计 = 138（含本次）。
 
-- 2026-11-18（本次提交，0.1.95）：**拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索**（D40/D73）：文件树目录行与侧栏标题新增 `drag_over::<TreeDrag>` 高亮（铺 `palette.selection`，非法落点由 `can_drop` 阻止），侧栏标题 `can_drop` 只接受非根层条目；目录/文件行新增 `external_drag_payload`（`ExternalDragPayload::Files`）支持拖出窗口交给系统原生文件拖拽（跨应用/Finder，待实机验收）。新增 `Cmd+Shift+F` 全工作区搜索悬浮面板：即时递归扫描工作区 Markdown，按文件分组列出命中行与上下文（命中高亮、按字符截断），`↑↓` 选择、`Enter`/点击打开并选中、`Cmd+Alt+C` 大小写、`Esc` 关闭，上限 500 条标记截断、读取失败计入跳过，命令面板/编辑菜单同步入口。新增纯函数 `collect_markdown_paths`/`search_text_lines`/`tail_chars`/`head_chars`；修复 `mazha-core::find::find_all` 大小写不敏感模式「模式比文本长」切片越界 panic（补回归断言）。桌面新增 3 条单测；桌面 fmt/clippy/test/build 全绿（52 项）。
+- 2026-11-18（`5213bc1`，0.1.95）：**拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索**（D40/D73）：文件树目录行与侧栏标题新增 `drag_over::<TreeDrag>` 高亮（铺 `palette.selection`，非法落点由 `can_drop` 阻止），侧栏标题 `can_drop` 只接受非根层条目；目录/文件行新增 `external_drag_payload`（`ExternalDragPayload::Files`）支持拖出窗口交给系统原生文件拖拽（跨应用/Finder，待实机验收）。新增 `Cmd+Shift+F` 全工作区搜索悬浮面板：即时递归扫描工作区 Markdown，按文件分组列出命中行与上下文（命中高亮、按字符截断），`↑↓` 选择、`Enter`/点击打开并选中、`Cmd+Alt+C` 大小写、`Esc` 关闭，上限 500 条标记截断、读取失败计入跳过，命令面板/编辑菜单同步入口。新增纯函数 `collect_markdown_paths`/`search_text_lines`/`tail_chars`/`head_chars`；修复 `mazha-core::find::find_all` 大小写不敏感模式「模式比文本长」切片越界 panic（补回归断言）。桌面新增 3 条单测；桌面 fmt/clippy/test/build 全绿（52 项）。
 
-- 2026-11-17（本次提交，0.1.94）：**文件树展开状态持久化**（D72）：`Settings` 新增 `tree_expanded`（按工作区根存展开目录列表），`tree_expanded_for`/`set_tree_expanded_for`（空列表删键），`reset_appearance` 保留。`DocView` 启动按工作区根恢复 `expanded_dirs`，`toggle_dir`/`refresh_workspace` 后落盘。新增 1 条设置单测；桌面 fmt/clippy/test/build 全绿（49 项）。
+- 2026-11-17（`be5f7ef`，0.1.94）：**文件树展开状态持久化**（D72）：`Settings` 新增 `tree_expanded`（按工作区根存展开目录列表），`tree_expanded_for`/`set_tree_expanded_for`（空列表删键），`reset_appearance` 保留。`DocView` 启动按工作区根恢复 `expanded_dirs`，`toggle_dir`/`refresh_workspace` 后落盘。新增 1 条设置单测；桌面 fmt/clippy/test/build 全绿（49 项）。
 
-- 2026-11-17（本次提交，0.1.93）：**文件树拖拽移动 + 新建文件夹**（D71）：文件/目录行接入 GPUI `on_drag`（`TreeDrag` + `TreeDragPreview`），目录行与侧栏标题 `sb-h` 作为落点（`can_drop`/`on_drop`），落点经 `move_entry` 移动文件/目录（拒绝自身/后代/同名，跟随更新当前文档路径与展开态前缀）。新增 `new_folder_in_root`/`new_folder_in` 建文件夹并进入重命名态，标题栏改为 `＋文件`/`＋文件夹`，命令面板加「新建 Markdown」「新建文件夹」。文件行打开/目录行折叠改 `on_click` 避免拖拽误触。新增纯函数 `drop_allowed`/`remap_expanded` 与 2 条单测；桌面 fmt/clippy/test/build 全绿（48 项）。
+- 2026-11-17（`7711d0a`，0.1.93）：**文件树拖拽移动 + 新建文件夹**（D71）：文件/目录行接入 GPUI `on_drag`（`TreeDrag` + `TreeDragPreview`），目录行与侧栏标题 `sb-h` 作为落点（`can_drop`/`on_drop`），落点经 `move_entry` 移动文件/目录（拒绝自身/后代/同名，跟随更新当前文档路径与展开态前缀）。新增 `new_folder_in_root`/`new_folder_in` 建文件夹并进入重命名态，标题栏改为 `＋文件`/`＋文件夹`，命令面板加「新建 Markdown」「新建文件夹」。文件行打开/目录行折叠改 `on_click` 避免拖拽误触。新增纯函数 `drop_allowed`/`remap_expanded` 与 2 条单测；桌面 fmt/clippy/test/build 全绿（48 项）。
 
-- 2026-11-17（本次提交，0.1.92）：**文件树层级化 + 大纲移至右侧面板**（D70）：文件树改用 `Workspace::list` 递归渲染目录/文件（目录恒显示、按 `expanded_dirs` 展开子项、文件只留 Markdown），目录行 `▸/▾` 展开折叠、`＋` 在目录内新建、`✎` 重命名、`✕` 递归删除，侧栏标题栏 `＋` 在根目录新建；删除/重命名目录同步迁移展开态前缀与当前打开文档路径。大纲从左侧栏移出，改为右侧独立可拖动面板（`outline_width` 160–420px），左侧只保留文件树。新增纯函数 `collect_tree_rows` 与桌面 1 条层级/展开/过滤单测；桌面 fmt/clippy/test/build 全绿（46 项）。
+- 2026-11-17（`608c7b2`，0.1.92）：**文件树层级化 + 大纲移至右侧面板**（D70）：文件树改用 `Workspace::list` 递归渲染目录/文件（目录恒显示、按 `expanded_dirs` 展开子项、文件只留 Markdown），目录行 `▸/▾` 展开折叠、`＋` 在目录内新建、`✎` 重命名、`✕` 递归删除，侧栏标题栏 `＋` 在根目录新建；删除/重命名目录同步迁移展开态前缀与当前打开文档路径。大纲从左侧栏移出，改为右侧独立可拖动面板（`outline_width` 160–420px），左侧只保留文件树。新增纯函数 `collect_tree_rows` 与桌面 1 条层级/展开/过滤单测；桌面 fmt/clippy/test/build 全绿（46 项）。
 
-- 2026-11-16（本次提交，0.1.91）：脚注交互闭环（D69）：新增 `mazha-md::FootnoteIndex`（按引用首次出现顺序编号、未引用定义排后、重复定义取首个，提供引用/定义区间查询）与 `Document::footnote_index()`；桌面 `Cmd+点击` 引用标签跳到定义块起点、点击定义标签跳回首个引用。导出新增 `footnotes::prepare` 源文本预规整（标签重写为序号 + 顶层定义按序号归集文末），HTML/EPUB 输出带锚点的 `<sup class="fnref"><a href="#fn-N">N</a></sup>` 与 `<section class="footnotes"><ol><li id="fn-N">`，Typst/DOCX 输出编号与文末定义；无脚注文档逐字节原样直出。限制：嵌套定义只重编号不移动、无回链、编号不写回 Markdown。workspace 548 / 桌面 45，fmt/clippy/test/build 全绿。
+- 2026-11-16（`997c3b3`，0.1.91）：脚注交互闭环（D69）：新增 `mazha-md::FootnoteIndex`（按引用首次出现顺序编号、未引用定义排后、重复定义取首个，提供引用/定义区间查询）与 `Document::footnote_index()`；桌面 `Cmd+点击` 引用标签跳到定义块起点、点击定义标签跳回首个引用。导出新增 `footnotes::prepare` 源文本预规整（标签重写为序号 + 顶层定义按序号归集文末），HTML/EPUB 输出带锚点的 `<sup class="fnref"><a href="#fn-N">N</a></sup>` 与 `<section class="footnotes"><ol><li id="fn-N">`，Typst/DOCX 输出编号与文末定义；无脚注文档逐字节原样直出。限制：嵌套定义只重编号不移动、无回链、编号不写回 Markdown。workspace 548 / 桌面 45，fmt/clippy/test/build 全绿。
 - 2026-11-16（本次提交，0.1.90 修复）：源码模式补齐任务列表与引用块渲染态抑制：不再 shape/绘制列表标记与任务勾选 glyph，不注册任务复选框命中区域，不绘制复选框边框/勾选与引用块竖条/背景，仅显示原始 Markdown 文本（如 `- [ ]`、`>`）。桌面 fmt/clippy/test 全绿（44 项）。
 - 2026-11-16（`ddb185e`，0.1.90）：新增专注模式/打字机模式/源码模式（D68），设置持久化与菜单/命令面板/快捷键接入；桌面与 workspace 门禁全绿。
 - 2026-11-16（`d487082`，0.1.89）：优化桌面端独占图片交互：渲染态点击图片左半区将光标定位到图片源码起点、右半区定位到源码终点（进入编辑态后光标落在对应边界）；光标紧贴图片末尾时 `Backspace`、紧贴图片开头时 `Delete` 直接删除整段图片源码（`BlockWidgetKind::Image` 的 `source_range`），图片作为整体处理。桌面 fmt/clippy/test/build 全绿（43 项）。
