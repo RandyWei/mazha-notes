@@ -34,6 +34,7 @@ use base64::Engine as _;
 use rfd::AsyncFileDialog;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::ops::Range;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
@@ -756,6 +757,137 @@ fn remap_expanded(expanded: &mut HashSet<String>, old_rel: &str, new_rel: &str) 
         let suffix = d.strip_prefix(old_rel).unwrap_or("");
         expanded.insert(format!("{new_rel}{suffix}"));
     }
+}
+
+/// 为导入到 `target_dir` 的文件名找一个不冲突的目标名。
+///
+/// 已存在（磁盘上或本批次已占用 `taken`）时，在扩展名前追加 ` 2`、` 3`…；
+/// 纯函数，不写文件，便于单测覆盖同名冲突与带多个点的文件名。
+fn unique_import_path(target_dir: &Path, name: &OsStr, taken: &HashSet<PathBuf>) -> PathBuf {
+    let candidate = target_dir.join(name);
+    if !candidate.exists() && !taken.contains(&candidate) {
+        return candidate;
+    }
+    let name_path = Path::new(name);
+    let stem = name_path.file_stem().unwrap_or(name).to_string_lossy();
+    let extension = name_path
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    for i in 2..10_000 {
+        let candidate = target_dir.join(format!("{stem} {i}{extension}"));
+        if !candidate.exists() && !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    // 极端情况下的兜底：仍返回唯一名字，交由后续复制失败路径报错。
+    target_dir.join(format!("{} 10000", name.to_string_lossy()))
+}
+
+/// 为外部拖入的路径规划 `(来源, 目标)` 清单（纯函数，不执行复制）。
+///
+/// 已在目标目录的条目直接跳过；同批次同名条目按 [`unique_import_path`] 递增编号；
+/// 目录不能复制进自身（目标落在源目录内部）时同样跳过，避免无限递归。
+fn plan_imports(paths: &[PathBuf], target_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let base = target_dir
+        .canonicalize()
+        .unwrap_or_else(|_| target_dir.to_path_buf());
+    let mut taken: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::new();
+    for src in paths {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        // 规范路径用于「已在目标目录」与「目录复制进自身」两种判断。
+        let src_canon = src.canonicalize().unwrap_or_else(|_| src.clone());
+        if src
+            .parent()
+            .map(|parent| {
+                parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf())
+            })
+            .is_some_and(|parent| parent == base)
+        {
+            continue;
+        }
+        let dst = unique_import_path(target_dir, name, &taken);
+        let dst_canon = base.join(dst.file_name().unwrap_or(name));
+        if src.is_dir() && dst_canon.starts_with(&src_canon) {
+            continue;
+        }
+        taken.insert(dst.clone());
+        out.push((src.clone(), dst));
+    }
+    out
+}
+
+/// 递归复制外部拖入的条目（文件直接 `copy`，目录逐项复制）。
+///
+/// 符号链接一律跳过：既不跟随目标目录造成环，也不把链接目标内容悄悄复制进工作区。
+fn copy_entry(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_entry(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// 是否为可直接作为 Markdown 文档打开的扩展名（与 `DocPath::is_markdown` 一致）。
+fn is_markdown_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
+}
+
+/// 把拖入的非 Markdown 文件转成可插入文档的 Markdown 链接。
+///
+/// `base_dir` 存在且路径位于其下时写相对路径（便于工作区整体移动），否则写绝对路径；
+/// 图片沿用 `![...]` 语法，其余文件用普通链接。
+fn dropped_link_markdown(path: &Path, base_dir: Option<&Path>) -> String {
+    let image = is_image_path(path);
+    format_markdown_link(path, base_dir, image)
+}
+
+/// `markdown_image_path` 与拖入链接共用的格式化实现。
+fn format_markdown_link(path: &Path, base_dir: Option<&Path>, image: bool) -> String {
+    let alt = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(if image { "图片" } else { "文件" })
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]");
+    // 相对路径只在能安全剥离前缀时使用；尖括号保留路径中的空格。
+    let display = base_dir
+        .and_then(|base| path.strip_prefix(base).ok())
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .unwrap_or(path);
+    // `<`/`>` 会破坏尖括号目标边界；百分号形式会由现有路径加载器还原。
+    let dest = display
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D");
+    let bang = if image { "!" } else { "" };
+    format!("{bang}[{alt}](<{dest}>)")
 }
 
 /// 一个投影块的布局几何（供命中测试与选区绘制）。
@@ -3470,8 +3602,6 @@ impl DocView {
     }
 
     /// 粘贴：图片文件保留路径，内存图片转 data URI，其余按纯文本处理。
-    ///
-    /// 按光标**位置倒序**处理，避免靠前插入使靠后光标偏移失效；剪贴板无可用内容时不动。
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx
             .read_from_clipboard()
@@ -3480,6 +3610,13 @@ impl DocView {
         else {
             return;
         };
+        self.insert_text_at_cursors(&text, cx);
+    }
+
+    /// 在全部光标处插入同一段文本（粘贴与拖入文件链接共用）。
+    ///
+    /// 按光标**位置倒序**处理，避免靠前插入使靠后光标偏移失效；空文本不动。
+    fn insert_text_at_cursors(&mut self, text: &str, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;
         }
@@ -3500,7 +3637,7 @@ impl DocView {
                 .doc
                 .apply(Edit::Replace {
                     range,
-                    text: text.clone(),
+                    text: text.to_string(),
                 })
                 .is_ok()
             {
@@ -5024,6 +5161,84 @@ impl DocView {
         self.refresh_workspace(cx);
     }
 
+    /// 把系统拖入的文件/目录导入工作区（D74：Finder → 码札）。
+    ///
+    /// `target_dir` 为落点目录（侧栏根目录/目录行）；`None` 时回退工作区根或当前文档父目录。
+    /// `insert_links` 仅对编辑区落点为真：非 Markdown 条目导入后转成相对链接插入光标。
+    /// 外部条目一律**复制**，不移动 Finder 原件；Markdown 导入完成后逐个打开为标签。
+    fn import_external_paths(
+        &mut self,
+        paths: &[PathBuf],
+        target_dir: Option<PathBuf>,
+        insert_links: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        // 链接的基准目录必须在打开新标签之前确定，否则会指向刚打开的文档目录。
+        let link_base = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let dir = target_dir
+            .or_else(|| self.workspace_root.clone())
+            .or_else(|| link_base.clone());
+        let mut opened: Vec<PathBuf> = Vec::new();
+        let mut linked: Vec<PathBuf> = Vec::new();
+        let mut imported = false;
+        if let Some(ref dir) = dir {
+            if !dir.is_dir() {
+                eprintln!("导入失败：目标不是目录 {}", dir.display());
+                return;
+            }
+            for (src, dst) in plan_imports(paths, dir) {
+                if let Err(e) = copy_entry(&src, &dst) {
+                    eprintln!("导入失败：{} → {}：{e}", src.display(), dst.display());
+                    continue;
+                }
+                imported = true;
+                // 目录只在文件树里出现，不打开也不生成指向目录的链接；
+                // 直接拖入的 Markdown 文件自动打开，其余文件生成链接。
+                if src.is_file() {
+                    if is_markdown_file(&dst) {
+                        opened.push(dst);
+                    } else {
+                        linked.push(dst);
+                    }
+                }
+            }
+            if imported {
+                self.refresh_workspace(cx);
+            }
+        } else {
+            // 尚未保存任何文档：没有可复制的工作区，直接打开 Markdown / 插入绝对路径链接。
+            for path in paths {
+                if path.is_dir() {
+                    continue;
+                }
+                if is_markdown_file(path) {
+                    opened.push(path.clone());
+                } else {
+                    linked.push(path.clone());
+                }
+            }
+        }
+        if insert_links && !linked.is_empty() {
+            let base = link_base.or_else(|| dir.clone());
+            let text = linked
+                .iter()
+                .map(|path| dropped_link_markdown(path, base.as_deref()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.insert_text_at_cursors(&text, cx);
+        }
+        for path in opened {
+            self.open_path(path, cx);
+        }
+        cx.notify();
+    }
+
     /// 重建 Workspace（CRUD 后刷新文件树）。
     fn refresh_workspace(&mut self, cx: &mut Context<Self>) {
         if let Some(ref root) = self.workspace_root
@@ -5421,13 +5636,23 @@ impl Render for DocView {
                         view.move_entry(from, root, cx);
                     }
                 }))
-                // 根目录落点不接受「本来就在根目录」的条目（移动无变化）。
+                // 根目录落点不接受「本来就在根目录」的条目（移动无变化）；外部文件拖入恒接受。
                 .can_drop(|drag, _w, _cx| {
-                    drag.downcast_ref::<TreeDrag>()
-                        .is_some_and(|d| d.rel.contains('/'))
+                    if let Some(d) = drag.downcast_ref::<TreeDrag>() {
+                        return d.rel.contains('/');
+                    }
+                    drag.is::<ExternalPaths>()
                 })
-                // 拖到根目录标题时整行铺强调底色，明确当前落点（D73）。
+                // 拖到根目录标题时整行铺强调底色，明确当前落点（D73/D74）。
                 .drag_over::<TreeDrag>(move |style, _drag, _w, _cx| style.bg(palette.selection))
+                // 系统拖入的文件落到工作区根目录（D74）。
+                .drag_over::<ExternalPaths>(move |style, _drag, _w, _cx| {
+                    style.bg(palette.selection)
+                })
+                .on_drop(cx.listener(|view, paths: &ExternalPaths, _w, cx| {
+                    let root = view.workspace_root.clone();
+                    view.import_external_paths(paths.paths(), root, false, cx);
+                }))
                 .child("资源管理器")
                 .child(
                     div()
@@ -5507,6 +5732,7 @@ impl Render for DocView {
                         let full_del = full.clone();
                         let full_new = full.clone();
                         let full_drop = full.clone();
+                        let full_external = full.clone();
                         sb.push(
                             div()
                                 .id(gpui::ElementId::Name(format!("sb-dir-{rel}").into()))
@@ -5546,14 +5772,19 @@ impl Render for DocView {
                                         )])))
                                     }
                                 })
-                                // 拒绝自身与「把目录拖进自己的子孙」两种非法落点。
+                                // 拒绝自身与「把目录拖进自己的子孙」两种非法落点；外部文件恒接受。
                                 .can_drop(move |drag, _w, _cx| {
-                                    drag.downcast_ref::<TreeDrag>().is_some_and(|d| {
-                                        drop_allowed(&d.rel, d.is_dir, &rel_for_drop)
-                                    })
+                                    if let Some(d) = drag.downcast_ref::<TreeDrag>() {
+                                        return drop_allowed(&d.rel, d.is_dir, &rel_for_drop);
+                                    }
+                                    drag.is::<ExternalPaths>()
                                 })
                                 // 合法落点上铺强调底色（`can_drop` 为 false 时不应用）。
                                 .drag_over::<TreeDrag>(move |style, _drag, _w, _cx| {
+                                    style.bg(palette.selection)
+                                })
+                                // 外部文件落到该目录（D74）。
+                                .drag_over::<ExternalPaths>(move |style, _drag, _w, _cx| {
                                     style.bg(palette.selection)
                                 })
                                 .on_drop(cx.listener(move |view, drag: &TreeDrag, _w, cx| {
@@ -5561,6 +5792,14 @@ impl Render for DocView {
                                         let from = root.join(&drag.rel);
                                         view.move_entry(from, full_drop.clone(), cx);
                                     }
+                                }))
+                                .on_drop(cx.listener(move |view, paths: &ExternalPaths, _w, cx| {
+                                    view.import_external_paths(
+                                        paths.paths(),
+                                        Some(full_external.clone()),
+                                        false,
+                                        cx,
+                                    );
                                 }))
                                 .child(
                                     div()
@@ -5938,6 +6177,15 @@ impl Render for DocView {
             .flex_col()
             .bg(palette.background)
             .text_color(palette.foreground)
+            // 窗口级兜底落点（状态栏/大纲/标签栏等）：外部文件导入根目录，不改文档（D74）。
+            .can_drop(|drag, _w, _cx| drag.is::<ExternalPaths>())
+            .drag_over::<ExternalPaths>(move |style, _drag, _w, _cx| {
+                style.bg(palette.code_block_bg)
+            })
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _w, cx| {
+                let root = view.workspace_root.clone();
+                view.import_external_paths(paths.paths(), root, false, cx);
+            }))
             .on_action(cx.listener(|view, action: &MenuAction, window, cx| {
                 view.run_menu_command(action.command, window, cx);
             }))
@@ -6002,6 +6250,14 @@ impl Render for DocView {
                             .flex_col()
                             .flex_1()
                             .min_w(px(0.))
+                            // 编辑区拖入外部文件：导入后把非 Markdown 文件转成相对链接（D74）。
+                            .can_drop(|drag, _w, _cx| drag.is::<ExternalPaths>())
+                            .drag_over::<ExternalPaths>(move |style, _drag, _w, _cx| {
+                                style.bg(palette.code_block_bg)
+                            })
+                            .on_drop(cx.listener(|view, paths: &ExternalPaths, _w, cx| {
+                                view.import_external_paths(paths.paths(), None, true, cx);
+                            }))
                             .child(tabbar_el)
                             .key_context("mazha-doc")
                             .on_action(cx.listener(|view, _: &InsertTab, _window, cx| {
@@ -7380,23 +7636,7 @@ fn clipboard_markdown(item: &ClipboardItem) -> Option<String> {
 
 /// 图片文件路径生成 Markdown 图片语法；尖括号允许路径保留空格。
 fn markdown_image_path(path: &Path) -> String {
-    let alt = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("图片")
-        .replace('\\', "\\\\")
-        .replace('[', "\\[")
-        .replace(']', "\\]");
-    // `<`/`>` 会破坏尖括号目标边界；百分号形式会由现有路径加载器还原。
-    let dest = path
-        .to_string_lossy()
-        .replace('%', "%25")
-        .replace('<', "%3C")
-        .replace('>', "%3E")
-        .replace('\n', "%0A")
-        .replace('\r', "%0D");
-    format!("![{alt}](<{dest}>)")
+    format_markdown_link(path, None, true)
 }
 
 /// 是否为桌面端可渲染的常见图片文件路径。
@@ -9420,15 +9660,18 @@ mod tests {
         BASE, BlockStyle, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos, Document,
         QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, clipboard_markdown, code_block_wrap_width,
-        footnote_jump, horizontal_step, inline_links, inline_reveals, is_image_path,
-        markdown_image_path, nearest_cell, oblique, quote_block_wrap_width, reveal_inline,
-        table_arrow_step, table_entry_snap,
+        copy_entry, dropped_link_markdown, footnote_jump, horizontal_step, inline_links,
+        inline_reveals, is_image_path, is_markdown_file, markdown_image_path, nearest_cell,
+        oblique, plan_imports, quote_block_wrap_width, reveal_inline, table_arrow_step,
+        table_entry_snap, unique_import_path,
     };
     use super::{decode_data_image, image_resource, px, size};
     use gpui_kit::{
         ClipboardEntry, ClipboardItem, ExternalPaths, Image, ImageFormat, MenuItem, Resource,
     };
     use smallvec::smallvec;
+    use std::collections::HashSet;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -9516,6 +9759,106 @@ mod tests {
         assert_eq!(
             markdown_image_path(Path::new("/tmp/a>b%.png")),
             "![a>b%.png](</tmp/a%3Eb%25.png>)"
+        );
+    }
+
+    /// 导入规划：同名追加序号且不互相覆盖，已在目标目录与复制到自身内部的条目跳过。
+    #[test]
+    fn import_plan_avoids_collisions_and_self_copy() {
+        let target = tempfile::tempdir().expect("临时目录");
+        let target_root = target.path();
+        std::fs::write(target_root.join("note.md"), b"old").expect("写入已存在文件");
+        let source = tempfile::tempdir().expect("临时目录");
+        let source_root = source.path();
+        std::fs::write(source_root.join("note.md"), b"new").expect("写入来源文件");
+        std::fs::write(source_root.join("other.txt"), b"x").expect("写入来源文件");
+        std::fs::create_dir(source_root.join("assets")).expect("创建来源目录");
+
+        let plan = plan_imports(
+            &[
+                source_root.join("note.md"),
+                source_root.join("other.txt"),
+                source_root.join("note.md"),
+                source_root.join("assets"),
+                target_root.join("note.md"),
+            ],
+            target_root,
+        );
+        let destinations: Vec<_> = plan.iter().map(|(_, dst)| dst.as_path()).collect();
+        assert_eq!(
+            destinations,
+            [
+                target_root.join("note 2.md").as_path(),
+                target_root.join("other.txt").as_path(),
+                target_root.join("note 3.md").as_path(),
+                target_root.join("assets").as_path(),
+            ]
+        );
+
+        // 多扩展名文件只在最后一段扩展名前追加序号。
+        let taken = HashSet::new();
+        assert_eq!(
+            unique_import_path(target_root, OsStr::new("draft.v1.md"), &taken),
+            target_root.join("draft.v1.md")
+        );
+        std::fs::write(target_root.join("draft.v1.md"), b"old").expect("写入已存在文件");
+        assert_eq!(
+            unique_import_path(target_root, OsStr::new("draft.v1.md"), &taken),
+            target_root.join("draft.v1 2.md")
+        );
+
+        // 目录不能复制进自身，避免无限递归。
+        let nested = target_root.join("nested");
+        std::fs::create_dir(&nested).expect("创建目录");
+        assert!(plan_imports(&[nested.clone()], &nested).is_empty());
+    }
+
+    /// 递归复制保留目录结构与文件内容，且不动来源（Finder 原件必须保留）。
+    #[test]
+    fn copy_entry_preserves_source_and_nested_files() {
+        let source = tempfile::tempdir().expect("临时目录");
+        let target = tempfile::tempdir().expect("临时目录");
+        let src_dir = source.path().join("assets");
+        std::fs::create_dir(&src_dir).expect("创建来源目录");
+        std::fs::write(src_dir.join("pic.txt"), b"image").expect("写入来源文件");
+        std::fs::write(source.path().join("note.md"), b"# note").expect("写入来源文件");
+
+        let dst_dir = target.path().join("assets");
+        copy_entry(&src_dir, &dst_dir).expect("复制目录");
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.join("pic.txt")).expect("读取复制文件"),
+            "image"
+        );
+        assert_eq!(
+            std::fs::read_to_string(src_dir.join("pic.txt")).expect("读取原文件"),
+            "image"
+        );
+        assert!(is_markdown_file(Path::new("a.MARKDOWN")));
+        assert!(!is_markdown_file(Path::new("a.txt")));
+    }
+
+    /// 拖入链接：工作区内写相对路径并区分图片/普通文件，工作区外保留绝对路径。
+    #[test]
+    fn dropped_links_use_relative_paths_when_possible() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let base = dir.path().join("notes");
+        std::fs::create_dir(&base).expect("创建目录");
+        let image = base.join("sub").join("a photo.PNG");
+        let attachment = base.join("report.pdf");
+        assert_eq!(
+            dropped_link_markdown(&image, Some(&base)),
+            "![a photo.PNG](<sub/a photo.PNG>)"
+        );
+        assert_eq!(
+            dropped_link_markdown(&attachment, Some(&base)),
+            "[report.pdf](<report.pdf>)"
+        );
+
+        let outside = tempfile::tempdir().expect("临时目录");
+        let path = outside.path().join("other.pdf");
+        assert_eq!(
+            dropped_link_markdown(&path, Some(&base)),
+            format!("[other.pdf](<{}>)", path.to_string_lossy())
         );
     }
 
