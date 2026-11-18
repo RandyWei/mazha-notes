@@ -110,9 +110,10 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 4. §9.1 剩余非 MVP 项：HTML 块、惰性续行、多段落脚注定义。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 
-## 提交历史（近期，共 140 条）
+## 提交历史（近期，共 141 条）
 
 ```
+637acda feat(desktop): 数学公式真实排版 RaTeX（0.1.98，D76）
 4ca24cd fix(desktop): 侧栏标题栏固定，列表独立滚动（0.1.97，D75）
 4b3e9ca feat(desktop): 入站外部拖拽（从 Finder 拖入）（0.1.96，D74）
 5213bc1 feat(desktop): 拖拽落点高亮 + 跨应用拖拽 + 全工作区搜索（0.1.95，D40/D73）
@@ -200,9 +201,9 @@ e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线�
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 ```
 
-> 更早提交见 `git log`；历史累计 = 140（含本次）。
+> 更早提交见 `git log`；历史累计 = 141（含本次）。
 
-- 2026-11-18（本次提交，0.1.98）：**桌面数学公式真实排版（R4 第一步，D76）**：桌面新增 `ratex-gpui`（render-only，与 gpui-kit 共用 `gpui-pre 0.3.9`），`$$…$$` 块与 `$…$` 行内在渲染态由 RaTeX 栅格化为透明底、字形着色的公式图像并叠加显示；TeX 文本在 gpui 侧转透明占位（保留排版/光标/选区/偏移映射），块级公式拼成一条 TeX、锚点行显示图像其余行高度归零，行内公式按显示字节区间定位叠加；`DocView` 按 `(tex, 字号, DPR, 颜色)` 缓存渲染结果（含失败缓存），主题/字号变化时清空；光标进入公式与源码模式显示原文，渲染失败回退字面 TeX。核心/导出不改，mermaid 真渲染留后续。内置 SAMPLE 增加行内/块级公式示例。桌面新增缓存键/TeX 拼接/RaTeX 栅格化/透明占位/定界符展开 5 条单测，`SAMPLE` LaTeX 反斜杠转义修正。桌面 fmt/clippy/test/build 全绿（60 项）；根 workspace fmt/clippy/test 全绿（548 项）。待实机目视验收。
+- 2026-11-18（`637acda`，0.1.98）：**桌面数学公式真实排版（R4 第一步，D76）**：桌面新增 `ratex-gpui`（render-only，与 gpui-kit 共用 `gpui-pre 0.3.9`），`$$…$$` 块与 `$…$` 行内在渲染态由 RaTeX 栅格化为透明底、字形着色的公式图像并叠加显示；TeX 文本在 gpui 侧转透明占位（保留排版/光标/选区/偏移映射），块级公式拼成一条 TeX、锚点行显示图像其余行高度归零，行内公式按显示字节区间定位叠加；`DocView` 按 `(tex, 字号, DPR, 颜色)` 缓存渲染结果（含失败缓存），主题/字号变化时清空；光标进入公式与源码模式显示原文，渲染失败回退字面 TeX。核心/导出不改，mermaid 真渲染留后续。内置 SAMPLE 增加行内/块级公式示例。桌面新增缓存键/TeX 拼接/RaTeX 栅格化/透明占位/定界符展开 5 条单测，`SAMPLE` LaTeX 反斜杠转义修正。桌面 fmt/clippy/test/build 全绿（60 项）；根 workspace fmt/clippy/test 全绿（548 项）。待实机目视验收。
 
 - 2026-11-18（`4ca24cd`，0.1.97）：**侧栏标题栏固定**（D75）：把「资源管理器 / ＋文件 / ＋文件夹」标题从滚动列表中拆出，作为 `#sidebar` 直接子节点（`h(28px)` + `flex_none()`），条目列表改由 `sidebar-list`（`flex_1` + `min_h(0)` + `overflow_y_scroll`）承载，列表过长时标题与新建入口始终可见；标题的根目录拖拽落点（`TreeDrag` / `ExternalPaths`）保持不变。桌面 fmt/clippy/test/build 全绿（55 项）；根 workspace fmt/clippy/test 全绿（548 项）。
 
