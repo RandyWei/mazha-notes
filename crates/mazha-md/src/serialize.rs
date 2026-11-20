@@ -145,6 +145,7 @@ fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
         BlockKind::ListItem { .. } => list_item_to_md(source, b, prefix, false, 1),
         BlockKind::MathBlock => prefix_lines(&math_block_body(source, b), prefix),
         BlockKind::FootnoteDef { label } => footnote_def_to_md(source, b, label, prefix),
+        BlockKind::HtmlBlock => html_block_to_md(source, b, prefix),
     }
 }
 
@@ -175,6 +176,20 @@ fn footnote_def_to_md(source: &str, b: &Block, label: &str, prefix: &str) -> Str
     }
     s.push('\n');
     prefix_lines(&s, prefix)
+}
+
+/// 拼回 HTML 块的 Markdown（D88）：内容按原文逐行保留（已剥离容器前缀），
+/// 回填后再补容器前缀，避免引用/列表嵌套场景下重复前缀。
+fn html_block_to_md(source: &str, b: &Block, prefix: &str) -> String {
+    let mut body = String::new();
+    for (i, sp) in b.spans.iter().enumerate() {
+        if i > 0 {
+            body.push('\n');
+        }
+        body.push_str(&source[sp.range.clone()]);
+    }
+    body.push('\n');
+    prefix_lines(&body, prefix)
 }
 
 /// 拼回显示公式块的**可见文本**（D34）：跳过 `$$` 定界标记，片段之间的换行逐个补齐、
@@ -707,5 +722,35 @@ mod roundtrip {
         let once = to_md(src);
         let twice = to_md(&once);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn html_block_roundtrip_and_idempotent() {
+        for src in [
+            "<script>\nalert(1)\n</script>\n",
+            "<pre><code>x</code></pre>\n",
+            "<!-- comment -->\n",
+            "<!DOCTYPE html>\n",
+            "<?xml version=\"1.0\"?>\n",
+            "<![CDATA[raw]]>\n",
+            "<script>\nunclosed\n",
+            "前文\n\n<pre>\ncode\n</pre>\n\n后文\n",
+            "> <pre>\n> code\n> </pre>\n",
+            "- <script>\n  x\n  </script>\n",
+        ] {
+            assert_roundtrip_exact(src);
+        }
+    }
+
+    #[test]
+    fn html_block_structure_preserved_in_containers() {
+        for src in [
+            "> <!-- c -->\n",
+            "> <!DOCTYPE html>\n",
+            "- <?pi?>\n",
+            "1. <![CDATA[x]]>\n",
+        ] {
+            assert_structure_preserved(src);
+        }
     }
 }

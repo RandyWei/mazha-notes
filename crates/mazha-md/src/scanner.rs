@@ -4,8 +4,10 @@
 //! 所有区间都直接落在源字节偏移上——这正是 WYSIWYG 精确标记显隐与后续"脏块增量重解析"
 //! 所需要的基础（`pulldown-cmark` 0.13 不暴露块级偏移，故自研）。
 //!
-//! MVP 支持的块：ATX/Setext 标题、段落、分割线、围栏/缩进代码块、引用、列表
-//! （有序/无序/任务）。表格、脚注、HTML 块、惰性续行等留待后续迭代。
+//! 支持的块：ATX/Setext 标题、段落、分割线、围栏/缩进代码块、引用、列表
+//! （有序/无序/任务）、GFM 表格、Callout、Front-matter、`$$…$$` 显示公式、
+//! `[^label]:` 脚注定义、CommonMark 类型 1–5 HTML 块（D88）。
+//! 惰性续行、多段落脚注定义等留待后续迭代。
 
 use crate::block::{Align, Block, BlockKind, CalloutKind};
 use crate::span::{SpanRole, SyntaxSpan};
@@ -447,10 +449,153 @@ fn starts_new_block(source: &str, line: Line) -> bool {
     atx_heading(rest).is_some()
         || fence_open(rest).is_some()
         || math_fence_open(rest).is_some()
+        || html_block_start(rest).is_some()
         || footnote_def_open(rest).is_some()
         || is_thematic_break(rest)
         || quote_prefix(rest).is_some()
         || list_marker(rest).is_some()
+}
+
+/// HTML 块类型 1–5 的起始种类（D88）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmlBlockStart {
+    /// `<script|pre|style|textarea ...>`，以对应结束标签闭合。
+    Type1(HtmlTag1),
+    /// `<!--`，以 `-->` 闭合。
+    Comment,
+    /// `<?`，以 `?>` 闭合。
+    ProcessingInstruction,
+    /// `<!` + 大写字母，以 `>` 闭合。
+    Declaration,
+    /// `<![CDATA[`，以 `]]>` 闭合。
+    Cdata,
+}
+
+/// 类型 1 的标签名（决定结束标签）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmlTag1 {
+    Script,
+    Pre,
+    Style,
+    Textarea,
+}
+
+impl HtmlTag1 {
+    /// 对应的结束标签（小写比较用）。
+    fn close_tag(self) -> &'static str {
+        match self {
+            Self::Script => "</script>",
+            Self::Pre => "</pre>",
+            Self::Style => "</style>",
+            Self::Textarea => "</textarea>",
+        }
+    }
+}
+
+/// 识别 HTML 块起始行（CommonMark 类型 1–5，缩进 ≤3；D88）。
+fn html_block_start(rest: &str) -> Option<HtmlBlockStart> {
+    let ind = indent(rest);
+    if ind > 3 {
+        return None;
+    }
+    let after = &rest[ind..];
+    // 类型 1：<script/pre/style/textarea 后跟空白、> 或行尾
+    if after.starts_with('<') && after.len() >= 2 {
+        let lower = after.to_ascii_lowercase();
+        for (name, tag) in [
+            ("<script", HtmlTag1::Script),
+            ("<pre", HtmlTag1::Pre),
+            ("<style", HtmlTag1::Style),
+            ("<textarea", HtmlTag1::Textarea),
+        ] {
+            if lower.starts_with(name) {
+                let next = lower.as_bytes().get(name.len()).copied();
+                if matches!(next, None | Some(b' ' | b'\t' | b'>')) {
+                    return Some(HtmlBlockStart::Type1(tag));
+                }
+            }
+        }
+        // 类型 5：<![CDATA[
+        if after.starts_with("<![CDATA[") {
+            return Some(HtmlBlockStart::Cdata);
+        }
+        // 类型 2：<!--
+        if after.starts_with("<!--") {
+            return Some(HtmlBlockStart::Comment);
+        }
+        // 类型 3：<?
+        if after.starts_with("<?") {
+            return Some(HtmlBlockStart::ProcessingInstruction);
+        }
+        // 类型 4：<! 后跟大写 ASCII 字母
+        if after.starts_with("<!") && after.as_bytes().get(2).is_some_and(u8::is_ascii_uppercase) {
+            return Some(HtmlBlockStart::Declaration);
+        }
+    }
+    None
+}
+
+/// 判断一行是否包含给定 HTML 块的结束条件。
+fn html_block_end_in_line(line: &str, start: HtmlBlockStart) -> bool {
+    match start {
+        HtmlBlockStart::Type1(tag) => line.to_ascii_lowercase().contains(tag.close_tag()),
+        HtmlBlockStart::Comment => line.contains("-->"),
+        HtmlBlockStart::ProcessingInstruction => line.contains("?>"),
+        HtmlBlockStart::Declaration => line.contains('>'),
+        HtmlBlockStart::Cdata => line.contains("]]>"),
+    }
+}
+
+/// HTML 块文本（`source[block.range]`）是否已闭合（类型 1–5；D88）。
+///
+/// 供增量重解析判断该块是否可能向后延伸；找不到结束条件则视为未闭合。
+pub(crate) fn html_block_is_closed(text: &str) -> bool {
+    let first_line = text.split_once('\n').map_or(text, |(line, _)| line);
+    let Some(start) = html_block_start(first_line) else {
+        return true;
+    };
+    match start {
+        HtmlBlockStart::Type1(tag) => {
+            // 结束标签可出现在起始行之后的任意位置（含起始行）
+            text.to_ascii_lowercase().contains(tag.close_tag())
+        }
+        HtmlBlockStart::Comment => text.contains("-->"),
+        HtmlBlockStart::ProcessingInstruction => text.contains("?>"),
+        HtmlBlockStart::Declaration => text.contains('>'),
+        HtmlBlockStart::Cdata => text.contains("]]>"),
+    }
+}
+
+/// 构造 HTML 块（CommonMark 类型 1–5；D88）。
+///
+/// 从起始行开始扫描，直到某行包含结束条件或到达文档末尾。
+/// 块内容按原文保留，不做行内 Markdown 解析。
+fn build_html_block(
+    source: &str,
+    lines: &[Line],
+    start_idx: usize,
+    start: HtmlBlockStart,
+) -> (Block, usize) {
+    let first = lines[start_idx];
+    let mut i = start_idx;
+    let mut last_end = first.end;
+    while i < lines.len() {
+        let l = lines[i];
+        last_end = l.end;
+        i += 1;
+        if html_block_end_in_line(l.rest(source), start) {
+            break;
+        }
+    }
+    let range = first.start..last_end;
+    // 原样文本：每行内容作为可见文本片段（便于投影显示），换行由行间隙隐含。
+    let mut spans = Vec::new();
+    for &l in &lines[start_idx..i] {
+        if l.content < l.end {
+            spans.push(SyntaxSpan::text(l.content..l.end, SpanRole::Normal));
+        }
+    }
+    (Block::leaf(BlockKind::HtmlBlock, range, spans), i)
 }
 
 /// 解析源文本为顶层块森林。
@@ -500,6 +645,10 @@ fn scan_blocks_range(source: &str, lines: &[Line], start: usize) -> Vec<Block> {
             i += 1;
         } else if let Some((ch, len, lang)) = fence_open(rest) {
             let (block, next) = build_fenced_code(source, lines, i, ch, len, lang);
+            blocks.push(block);
+            i = next;
+        } else if let Some(html_start) = html_block_start(rest) {
+            let (block, next) = build_html_block(source, lines, i, html_start);
             blocks.push(block);
             i = next;
         } else if let Some(head) = footnote_def_open(rest) {
@@ -2134,6 +2283,267 @@ mod footnote_tests {
             "> [^1]: note\n",
             "- [^1]: note\n",
             "[^1]: 见 **粗体**\n",
+        ] {
+            assert_eq!(to_md(src), src, "roundtrip {src:?}");
+            assert_eq!(to_md(&to_md(src)), to_md(src), "idempotent {src:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod html_block_tests {
+    use super::*;
+    use crate::serialize::to_md;
+    use crate::span::SpanKind;
+
+    /// 取块内片段的 `(kind, role, 源文本)`，逐条断言片段契约。
+    fn parts<'a>(src: &'a str, b: &Block) -> Vec<(SpanKind, SpanRole, &'a str)> {
+        b.spans
+            .iter()
+            .map(|s| (s.kind, s.role, &src[s.range.clone()]))
+            .collect()
+    }
+
+    /// 首个块。
+    fn block(src: &str) -> Block {
+        parse(src).into_iter().next().expect("应解析出至少一个块")
+    }
+
+    #[test]
+    fn html_block_type1_script_pre_style_textarea() {
+        for (tag, close) in [
+            ("script", "</script>"),
+            ("pre", "</pre>"),
+            ("style", "</style>"),
+            ("textarea", "</textarea>"),
+        ] {
+            let src = format!("<{tag}>\nconsole.log(1)\n{close}\n");
+            let b = block(&src);
+            assert_eq!(b.kind, BlockKind::HtmlBlock, "{src}");
+            assert_eq!(b.range, 0..src.trim_end_matches('\n').len(), "{src}");
+            // 内容按行作为可见文本片段，不做行内解析；换行由片段间隙/序列化回补。
+            let lines: Vec<_> = b
+                .spans
+                .iter()
+                .filter(|s| s.kind == SpanKind::Text)
+                .map(|s| &src[s.range.clone()])
+                .collect();
+            assert_eq!(
+                lines,
+                vec![
+                    format!("<{tag}>"),
+                    "console.log(1)".to_string(),
+                    close.to_string()
+                ],
+                "{src}"
+            );
+            assert!(
+                b.spans
+                    .iter()
+                    .all(|s| s.kind == SpanKind::Text && s.role == SpanRole::Normal),
+                "{src}: {:#?}",
+                b.spans
+            );
+            assert_eq!(to_md(&src), src, "roundtrip {src}");
+        }
+    }
+
+    #[test]
+    fn html_block_type1_case_insensitive_and_same_line_close() {
+        let src = "<SCRIPT>alert(1)</SCRIPT>\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..25);
+        assert_eq!(
+            parts(src, &b),
+            vec![(
+                SpanKind::Text,
+                SpanRole::Normal,
+                "<SCRIPT>alert(1)</SCRIPT>"
+            )]
+        );
+
+        let src = "<pre>code</pre>\n后续\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::HtmlBlock);
+        assert_eq!(blocks[0].range, 0..15);
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn html_block_type2_comment() {
+        let src = "<!-- 注释\n多行 -->\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..22);
+        let lines: Vec<_> = b
+            .spans
+            .iter()
+            .filter(|s| s.kind == SpanKind::Text)
+            .map(|s| &src[s.range.clone()])
+            .collect();
+        assert_eq!(lines, vec!["<!-- 注释", "多行 -->"]);
+        assert_eq!(to_md(src), src);
+
+        let same = "<!-- one line -->\n后\n";
+        let blocks = parse(same);
+        assert_eq!(blocks[0].kind, BlockKind::HtmlBlock);
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn html_block_type3_processing_instruction() {
+        let src = "<?xml version=\"1.0\"?>\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(to_md(src), src);
+
+        let multi = "<?php\necho 1;\n?>\n";
+        let b = block(multi);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..16);
+        assert_eq!(to_md(multi), multi);
+    }
+
+    #[test]
+    fn html_block_type4_declaration() {
+        let src = "<!DOCTYPE html>\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..15);
+        assert_eq!(to_md(src), src);
+
+        let multi = "<!DECLARE\nfoo>\n";
+        let b = block(multi);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..14);
+    }
+
+    #[test]
+    fn html_block_type5_cdata() {
+        let src = "<![CDATA[\nraw & < >\n]]>\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..23);
+        let lines: Vec<_> = b
+            .spans
+            .iter()
+            .filter(|s| s.kind == SpanKind::Text)
+            .map(|s| &src[s.range.clone()])
+            .collect();
+        assert_eq!(lines, vec!["<![CDATA[", "raw & < >", "]]>"]);
+        assert_eq!(to_md(src), src);
+    }
+
+    #[test]
+    fn html_block_unclosed_extends_to_eof() {
+        let src = "<script>\nconsole.log(1)\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..23);
+        assert!(!html_block_is_closed(&src[b.range.clone()]));
+        assert_eq!(to_md(src), src);
+
+        let comment = "<!-- open\nstill open\n";
+        let b = block(comment);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert!(!html_block_is_closed(&comment[b.range.clone()]));
+    }
+
+    #[test]
+    fn html_block_allows_up_to_three_space_indent() {
+        let src = "   <pre>\ncode\n</pre>\n";
+        let b = block(src);
+        assert_eq!(b.kind, BlockKind::HtmlBlock);
+        assert_eq!(b.range, 0..20);
+        assert_eq!(to_md(src), src);
+    }
+
+    #[test]
+    fn html_block_does_not_start_paragraph_mid_line_and_interrupts() {
+        // 段落内的普通行内 HTML 仍是段落内容，不升级为 HTML 块
+        let inline = "hello <span>world</span>\n";
+        let b = block(inline);
+        assert_eq!(b.kind, BlockKind::Paragraph, "{b:#?}");
+
+        // 段落之后遇到 HTML 块起始行应中断段落（解析层面）；序列化会按块间空行规范化输出。
+        let src = "段落\n<script>\nx\n</script>\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[0].range, 0..6);
+        assert_eq!(blocks[1].kind, BlockKind::HtmlBlock);
+        assert_eq!(blocks[1].range, 7..27);
+        let out = to_md(src);
+        assert_eq!(out, "段落\n\n<script>\nx\n</script>\n");
+        assert_eq!(parse(&out).len(), 2);
+        assert_eq!(to_md(&out), out);
+    }
+
+    #[test]
+    fn html_block_inside_quote_and_list_strips_container_prefix() {
+        // 引用内 HTML 块：容器前缀剥离后识别与序列化应保持逐字节往返
+        let src = "> <pre>\n> code\n> </pre>\n";
+        let quote = block(src);
+        assert_eq!(quote.kind, BlockKind::BlockQuote);
+        assert_eq!(quote.children.len(), 1, "{quote:#?}");
+        let inner = &quote.children[0];
+        assert_eq!(inner.kind, BlockKind::HtmlBlock);
+        let lines: Vec<_> = inner
+            .spans
+            .iter()
+            .filter(|s| s.kind == SpanKind::Text)
+            .map(|s| &src[s.range.clone()])
+            .collect();
+        assert_eq!(lines, vec!["<pre>", "code", "</pre>"]);
+        assert_eq!(to_md(src), src);
+
+        let list_src = "- <script>\n  x\n  </script>\n";
+        let list = block(list_src);
+        assert_eq!(
+            list.kind,
+            BlockKind::List {
+                ordered: false,
+                start: 1
+            }
+        );
+        let item = &list.children[0];
+        assert_eq!(item.children.len(), 1, "{item:#?}");
+        assert_eq!(item.children[0].kind, BlockKind::HtmlBlock);
+        assert_eq!(to_md(list_src), list_src);
+    }
+
+    #[test]
+    fn html_block_not_confused_with_inline_tag_or_media() {
+        // 行内 HTML（非类型 1–5 起始形态）与媒体元素仍保持既有行为，不应识别为 HTML 块。
+        let src = "前 <b>粗</b> 后\n";
+        assert_eq!(block(src).kind, BlockKind::Paragraph);
+        assert_eq!(
+            to_md(&to_md(src)),
+            to_md(src),
+            "inline html 段落序列化应幂等"
+        );
+
+        let media = "<video src=\"a.mp4\"></video>\n";
+        let b = block(media);
+        // 单行 video/audio 媒体已有专用行内/段落处理，不应被识别为 HTML 块
+        assert_ne!(b.kind, BlockKind::HtmlBlock, "{b:#?}");
+    }
+
+    #[test]
+    fn html_block_roundtrip_and_idempotent() {
+        for src in [
+            "<script>\nalert(1)\n</script>\n",
+            "<pre>\n  indented\n</pre>\n",
+            "<!-- c -->\n",
+            "<!DOCTYPE html>\n",
+            "<?pi data?>\n",
+            "<![CDATA[x]]>\n",
+            "<script>\nunclosed\n",
+            "前文\n\n<pre>\ncode\n</pre>\n\n后文\n",
+            "> <pre>\n> a\n> </pre>\n",
+            "- <script>\n  a\n  </script>\n",
         ] {
             assert_eq!(to_md(src), src, "roundtrip {src:?}");
             assert_eq!(to_md(&to_md(src)), to_md(src), "idempotent {src:?}");

@@ -128,27 +128,40 @@ fn splice(
 ///
 /// 安全条件：
 /// 1. `tail` **之前是空行**——段落/标题/引用/列表都会被空行闭合（本扫描器不支持惰性续行）；
-/// 2. 区域最后一块不是**未闭合的围栏代码块**——围栏是唯一能跨越空行的构造。
+/// 2. 区域最后一块不是**未闭合**的可跨空行构造（围栏代码/显示公式/HTML 块等）。
 fn is_safe_cut(new: &str, tail: usize, region: &[Block]) -> bool {
     let blank_before =
         tail <= 1 || new[..tail].ends_with("\n\n") || new[..tail].ends_with("\n\r\n");
     if !blank_before {
         return false;
     }
-    !region.last().is_some_and(is_unclosed_fence)
+    !region.last().is_some_and(|b| is_unclosed_fence(b, new))
 }
 
-/// 是否为**未闭合**的围栏代码块 / 显示公式块（都只剩开栏标记，不足两个）。
+/// 是否为**未闭合**的围栏代码块 / 显示公式块 / HTML 块（都可能延伸到文档末尾）。
 ///
 /// 公式块与围栏一样可以跨越空行（未闭合时一直延伸到文档末尾），
 /// 所以裁切点校验必须同样识别它，否则会把公式块拦腰切断（D34 ①）。
-fn is_unclosed_fence(block: &Block) -> bool {
+/// HTML 块类型 1–5 在找不到结束条件时也会延伸到文档末尾（D88）。
+fn is_unclosed_fence(block: &Block, source: &str) -> bool {
     let n = |role: SpanRole| block.spans.iter().filter(|s| s.role == role).count();
     match block.kind {
         BlockKind::CodeBlock { fenced: true, .. } => n(SpanRole::FenceMarker) < 2,
         BlockKind::MathBlock => n(SpanRole::MathMarker) < 2,
+        BlockKind::HtmlBlock => is_unclosed_html_block(source, block),
         _ => false,
     }
+}
+
+/// HTML 块（类型 1–5）是否未闭合：在块范围内找不到对应结束条件。
+///
+/// 块范围覆盖到文档末尾且仍无结束条件时，后续编辑可能改变块的闭合点，
+/// 增量重解析必须把该块视为可向后延伸的未闭合构造。
+fn is_unclosed_html_block(source: &str, block: &Block) -> bool {
+    let Some(text) = source.get(block.range.clone()) else {
+        return false;
+    };
+    !crate::scanner::html_block_is_closed(text)
 }
 
 /// 平移一个块及其全部子孙/片段的 range（`start` 前置偏移 + `delta` 全局平移）。
@@ -486,5 +499,68 @@ mod tests {
         let at = old.find("    second").unwrap();
         let new = format!("{}second{}", &old[..at], &old[at + 4..]);
         assert_matches_full(old, &new, at..at + 4);
+    }
+
+    // ---------------- HTML 块的增量重解析（D88） ----------------
+
+    #[test]
+    fn unclosed_html_block_not_cut_across_blank() {
+        // 未闭合 HTML 块可跨越空行：裁切点校验必须识别它，否则会拦腰切断
+        let old = "前言\n\n<script>\n\nbody\n";
+        let at = old.find("body").unwrap();
+        let new = format!("{}BODY{}", &old[..at], &old[at + 4..]);
+        assert_matches_full(old, &new, at..at + 4);
+    }
+
+    #[test]
+    fn edit_inside_closed_html_block_matches_full() {
+        let old = "前言\n\n<pre>\nold\n</pre>\n\n尾\n";
+        let at = old.find("old").unwrap();
+        let new = format!("{}NEW{}", &old[..at], &old[at + 3..]);
+        assert_matches_full(old, &new, at..at + 3);
+    }
+
+    #[test]
+    fn append_html_close_marker_matches_full() {
+        // 未闭合 → 补上结束标记后闭合
+        let old = "<!-- open\ntext\n";
+        let new = "<!-- open\ntext\n-->\n";
+        assert_matches_full(old, new, old.len()..old.len());
+    }
+
+    #[test]
+    fn remove_html_close_marker_keeps_unclosed() {
+        // 已闭合 → 删除结束标记后变为未闭合并延伸到文档末尾
+        let old = "<script>\nx\n</script>\n\n尾\n";
+        let start = old.find("</script>").unwrap();
+        let end = start + "</script>".len();
+        let new = old[..start].to_string() + &old[end..];
+        assert_matches_full(old, &new, start..end);
+    }
+
+    #[test]
+    fn destroy_html_open_marker_drops_block() {
+        // 起始行被改写后不再是 HTML 块，后续内容按普通块重新解析
+        let old = "前文\n\n<pre>\nx\n</pre>\n";
+        let at = old.find("<pre>").unwrap();
+        let new = "前文\n\ntext>\nx\n</pre>\n";
+        assert_matches_full(old, new, at..at + 5);
+    }
+
+    #[test]
+    fn edit_html_block_inside_quote_matches_full() {
+        let old = "> <pre>\n> x\n> </pre>\n";
+        let at = old.find('x').unwrap();
+        let new = format!("{}y{}", &old[..at], &old[at + 1..]);
+        assert_matches_full(old, &new, at..at + 1);
+    }
+
+    #[test]
+    fn html_block_type4_close_on_same_line_incremental() {
+        // 声明类型同起始行闭合，后续编辑段落不受影响
+        let old = "<!DOCTYPE html>\n\n段落\n";
+        let at = old.find("段落").unwrap();
+        let new = format!("{}新段{}", &old[..at], &old[at + 6..]);
+        assert_matches_full(old, &new, at..at + 6);
     }
 }

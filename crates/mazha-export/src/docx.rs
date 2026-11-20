@@ -118,7 +118,30 @@ fn render_block(source: &str, block: &Block, depth: usize, out: &mut Vec<BodyCon
         BlockKind::ListItem { task } => render_list_item(source, block, *task, depth, out, ""),
         BlockKind::Table { align } => out.push(table(source, block, align)),
         BlockKind::MathBlock => out.push(math_block_paragraph(source, block)),
+        BlockKind::HtmlBlock => out.push(html_block_paragraph(source, block)),
     }
+}
+
+/// HTML 块（CommonMark 类型 1–5，D88）：DOCX 无法渲染任意 HTML，
+/// 按原文降级为纯文本段落，逐行保留内容并剥离容器前缀。
+fn html_block_paragraph(source: &str, block: &Block) -> BodyContent<'static> {
+    let mut content: Vec<ParagraphContent<'static>> = Vec::new();
+    for (i, sp) in block.spans.iter().enumerate() {
+        if i > 0 {
+            content.push(line_break());
+        }
+        let line = &source[sp.range.clone()];
+        if !line.is_empty() {
+            content.push(text_run(line, CharacterProperty::default()));
+        }
+    }
+    if content.is_empty() {
+        content.push(text_run("", CharacterProperty::default()));
+    }
+    BodyContent::Paragraph(Paragraph {
+        property: ParagraphProperty::default(),
+        content,
+    })
 }
 
 /// 显示公式块（D34）：按字面量输出公式体（纯文本 + 行间软换行），`$$` 定界符隐藏。
@@ -896,5 +919,42 @@ mod tests {
         assert_eq!(texts[0], "见1与2。");
         assert_eq!(texts[1], "1 B");
         assert_eq!(texts[2], "2 A");
+    }
+
+    // ---------- HTML 块（D88）：纯文本段落原文降级 ----------
+
+    #[test]
+    fn docx_html_block_is_plain_text_paragraph() {
+        // D88：CommonMark 类型 1–5 HTML 块按原文降级为纯文本段落（不做 HTML 解析/转义）。
+        let out = render("<pre>a < b & c</pre>\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "<pre>a < b & c</pre>");
+    }
+
+    #[test]
+    fn docx_html_block_preserves_multiline_content() {
+        let out = render("<pre>\nline1\nline2\n</pre>\n");
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "<pre>line1line2</pre>");
+        // 行间应有软换行 run（与代码/公式块一致的行分隔方式）
+        assert!(p.content.iter().any(|c| matches!(
+            c,
+            ParagraphContent::Run(r)
+                if r.content.iter().any(|rc| matches!(rc, RunContent::Break(_)))
+        )));
+    }
+
+    #[test]
+    fn docx_html_block_in_quote_strips_prefix() {
+        let out = render("> <script>\n> alert(1);\n> </script>\n");
+        // 引用渲染会为段落加左边框；取首个段落文本校验内容已剥离前缀
+        let BodyContent::Paragraph(p) = &out[0] else {
+            panic!("应为段落");
+        };
+        assert_eq!(paragraph_text(p), "<script>alert(1);</script>");
     }
 }

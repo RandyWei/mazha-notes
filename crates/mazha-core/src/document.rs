@@ -1265,6 +1265,7 @@ mod tests {
                 mazha_md::BlockKind::CodeBlock { .. } => "code",
                 mazha_md::BlockKind::MathBlock => "math",
                 mazha_md::BlockKind::FootnoteDef { .. } => "footnote",
+                mazha_md::BlockKind::HtmlBlock => "html",
                 mazha_md::BlockKind::ThematicBreak => "hr",
                 mazha_md::BlockKind::ListItem { .. } => "list-item",
             })

@@ -187,6 +187,22 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
             // **不用** Typst 的 `#footnote[...]`，否则会把定义重新归集到页脚并与源顺序错位。
             inline_to_typst(source, &b.spans, out);
         }
+        BlockKind::HtmlBlock => {
+            // HTML 块（CommonMark 类型 1–5，D88）：Typst 无法渲染任意 HTML，
+            // 按原文降级为 raw 块字面输出，逐字保留内容（剥离容器前缀）。
+            let mut body = String::new();
+            for (i, sp) in b.spans.iter().enumerate() {
+                if i > 0 {
+                    body.push('\n');
+                }
+                body.push_str(&source[sp.range.clone()]);
+            }
+            let fence = "`".repeat(longest_backtick_run(&body).max(2) + 1);
+            out.push_str(&fence);
+            out.push('\n');
+            out.push_str(&body);
+            let _ = write!(out, "\n{fence}");
+        }
     }
 }
 
@@ -833,5 +849,32 @@ mod tests {
         let first = t.find("#super[1] B").expect("B 应为第 1 条脚注");
         let second = t.find("#super[2] A").expect("A 应为第 2 条脚注");
         assert!(first < second, "文末定义应按序号排列：{t}");
+    }
+
+    // ---------- HTML 块（D88）：raw fence 原文降级 ----------
+
+    #[test]
+    fn typst_html_block_is_literal_raw() {
+        // D88：CommonMark 类型 1–5 HTML 块按原文降级为 raw 块，内容逐字保留、不做 Typst 转义。
+        let t = to_typst("<pre class=\"x\">a < b</pre>\n");
+        assert!(t.contains("```"), "{t}");
+        assert!(t.contains("<pre class=\"x\">a < b</pre>"), "{t}");
+        // 不得被转义成 Typst 标记（原文逐字保留）
+        assert!(!t.contains("\\<"), "{t}");
+    }
+
+    #[test]
+    fn typst_html_block_multiline_and_container_prefix_stripped() {
+        let t = to_typst("> <script>\n> alert(1);\n> </script>\n");
+        assert!(t.contains("<script>\nalert(1);\n</script>"), "{t}");
+        assert!(!t.contains("> alert"), "{t}");
+    }
+
+    #[test]
+    fn typst_html_block_uses_longer_fence_when_needed() {
+        let src = "<pre>\n```\ncode\n```\n</pre>\n";
+        let t = to_typst(src);
+        assert!(t.contains("````"), "{t}");
+        assert!(t.contains("```\ncode\n```"), "{t}");
     }
 }

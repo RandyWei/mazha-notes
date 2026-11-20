@@ -356,6 +356,18 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool, xhtm
             render_inline(source, &block.spans, out, xhtml);
             out.push_str("</div>");
         }
+        BlockKind::HtmlBlock => {
+            // HTML 块（CommonMark 类型 1–5，D88）：原样输出，不转义、不做行内解析。
+            // 按片段逐行拼回内容，剥离引用/列表等容器前缀后透传给 HTML/EPUB。
+            for (i, sp) in block.spans.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                if let Some(text) = source.get(sp.range.clone()) {
+                    out.push_str(text);
+                }
+            }
+        }
         BlockKind::BlockQuote => {
             out.push_str("<blockquote>");
             render_blocks(source, &block.children, out, false, xhtml);
@@ -1159,5 +1171,51 @@ mod tests {
         assert!(doc.contains(".fnback"), "{doc}");
         assert!(doc.contains(".footnotes"), "{doc}");
         assert!(doc.contains("div.footnote"), "{doc}");
+    }
+
+    // ---------- HTML 块（D88）：原样输出，不转义 ----------
+
+    #[test]
+    fn html_block_is_passthrough() {
+        let src = "<script>\nif (a < b && c > d) { alert('&'); }\n</script>\n";
+        let html = to_html(src);
+        assert_eq!(
+            html,
+            "<script>\nif (a < b && c > d) { alert('&'); }\n</script>"
+        );
+        // XHTML 片段同样原样透传
+        assert_eq!(to_xhtml_body(src), html);
+    }
+
+    #[test]
+    fn html_block_types_passthrough() {
+        for src in [
+            "<!-- <b>raw</b> -->\n",
+            "<?xml version=\"1.0\"?>\n",
+            "<!DOCTYPE html>\n",
+            "<![CDATA[<tag>&]]>\n",
+            "<pre><code>&lt;</code></pre>\n",
+        ] {
+            let expected = src.trim_end_matches('\n');
+            assert_eq!(to_html(src), expected, "{src}");
+            assert_eq!(to_xhtml_body(src), expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn html_block_in_quote_strips_prefix_and_passes_through() {
+        let src = "> <script>\n> alert(1);\n> </script>\n";
+        let html = to_html(src);
+        assert_eq!(
+            html,
+            "<blockquote><script>\nalert(1);\n</script></blockquote>"
+        );
+    }
+
+    #[test]
+    fn html_block_in_list_strips_prefix_and_passes_through() {
+        let src = "- <pre>\n  code\n  </pre>\n";
+        let html = to_html(src);
+        assert_eq!(html, "<ul><li><pre>\ncode\n</pre></li></ul>");
     }
 }

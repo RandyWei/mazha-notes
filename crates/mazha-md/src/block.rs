@@ -71,6 +71,11 @@ pub enum BlockKind {
         /// 脚注标签（不含 `[^` 与 `]`）。
         label: String,
     },
+    /// HTML 块（CommonMark 类型 1–5，原样保留；D88）。
+    ///
+    /// 内容为原始 HTML 文本，不做行内 Markdown 解析；导出时 HTML/EPUB 原样输出，
+    /// Typst/DOCX 按原文/占位降级处理。
+    HtmlBlock,
 }
 
 /// 表格列对齐方式（GFM 分隔行 `:--` / `:-:` / `--:` 决定）。
