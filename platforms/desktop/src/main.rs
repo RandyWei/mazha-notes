@@ -3247,10 +3247,18 @@ impl DocView {
     }
 
     /// 所有光标左移一个字符边界。
+    ///
+    /// 源码模式下按原始字符逐个移动，不套用 WYSIWYG 表格内的跳格/吸附逻辑，
+    /// 否则在可见 `|` 与单元格文本间移动会出现"跳跃"。
     fn move_left(&mut self, shift: bool) {
+        let source_mode = self.settings.source_mode;
         let doc = &mut self.doc;
         for c in &mut self.cursors {
-            let target = horizontal_step(doc, c.caret, false);
+            let target = if source_mode {
+                doc.prev_char_boundary(c.caret)
+            } else {
+                horizontal_step(doc, c.caret, false)
+            };
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
@@ -3263,10 +3271,17 @@ impl DocView {
     }
 
     /// 所有光标右移一个字符边界。
+    ///
+    /// 源码模式下按原始字符逐个移动，不套用 WYSIWYG 表格内的跳格/吸附逻辑。
     fn move_right(&mut self, shift: bool) {
+        let source_mode = self.settings.source_mode;
         let doc = &mut self.doc;
         for c in &mut self.cursors {
-            let target = horizontal_step(doc, c.caret, true);
+            let target = if source_mode {
+                doc.next_char_boundary(c.caret)
+            } else {
+                horizontal_step(doc, c.caret, true)
+            };
             if shift {
                 if c.anchor.is_none() {
                     c.anchor = Some(c.caret);
@@ -3517,6 +3532,8 @@ impl DocView {
     /// 删除选区（或光标左侧一个字符，即退格）。返回是否发生了删除。
     ///
     /// 光标紧跟在独占图片块后面时，退格删除整张图片（视为一个整体）。
+    /// 源码模式或光标已在图片行内编辑源码（`raw_src` 状态）时不触发，
+    /// 避免把 `![alt](dest)` 当整体删掉而无法逐字符编辑。
     fn delete_backward(&mut self, cx: &mut Context<Self>) -> bool {
         let mut any_deleted = false;
         for i in 0..self.cursors.len() {
@@ -3531,17 +3548,24 @@ impl DocView {
                 }
             } else {
                 let caret = self.cursors[i].caret;
-                // 光标在图片块末尾：整块删除（`![...](...)` 作为一个整体）
-                let image_range = self
-                    .doc
-                    .projection()
-                    .block_widgets()
-                    .iter()
-                    .find(|w| {
-                        matches!(w.kind, BlockWidgetKind::Image { .. })
-                            && w.source_range.end == caret
-                    })
-                    .map(|w| w.source_range.clone());
+                // 光标在图片块末尾：整块删除（`![...](...)` 作为一个整体）。
+                // 源码模式下图片始终按原文显示；WYSIWYG 下光标落在图片行内会
+                // 切到 raw_src 编辑态，这两种情况都应允许逐字符退格。
+                let image_range = if self.settings.source_mode {
+                    None
+                } else {
+                    let projection = self.doc.projection();
+                    let caret_line = projection.line_of_source(caret);
+                    projection
+                        .block_widgets()
+                        .iter()
+                        .find(|w| {
+                            matches!(w.kind, BlockWidgetKind::Image { .. })
+                                && w.source_range.end == caret
+                                && !w.line_range.contains(&caret_line)
+                        })
+                        .map(|w| w.source_range.clone())
+                };
                 if let Some(range) = image_range {
                     if self
                         .doc
@@ -3577,6 +3601,8 @@ impl DocView {
     /// 删除光标右侧一个字符（即 Delete 键）。返回是否发生了删除。
     ///
     /// 光标紧贴在独占图片块前面时，Delete 删除整张图片（视为一个整体）。
+    /// 源码模式或光标已在图片行内编辑源码（`raw_src` 状态）时不触发，
+    /// 避免把 `![alt](dest)` 当整体删掉而无法逐字符编辑。
     fn delete_forward(&mut self, cx: &mut Context<Self>) -> bool {
         let mut any_deleted = false;
         for i in 0..self.cursors.len() {
@@ -3599,16 +3625,23 @@ impl DocView {
                 continue;
             }
             let caret = self.cursors[i].caret;
-            // 光标在图片块开头：整块删除（`![...](...)` 作为一个整体）
-            let image_range = self
-                .doc
-                .projection()
-                .block_widgets()
-                .iter()
-                .find(|w| {
-                    matches!(w.kind, BlockWidgetKind::Image { .. }) && w.source_range.start == caret
-                })
-                .map(|w| w.source_range.clone());
+            // 光标在图片块开头：整块删除（`![...](...)` 作为一个整体）。
+            // 源码模式或光标在图片行内编辑源码时，按字符删除以便编辑语法。
+            let image_range = if self.settings.source_mode {
+                None
+            } else {
+                let projection = self.doc.projection();
+                let caret_line = projection.line_of_source(caret);
+                projection
+                    .block_widgets()
+                    .iter()
+                    .find(|w| {
+                        matches!(w.kind, BlockWidgetKind::Image { .. })
+                            && w.source_range.start == caret
+                            && !w.line_range.contains(&caret_line)
+                    })
+                    .map(|w| w.source_range.clone())
+            };
             if let Some(range) = image_range {
                 if self
                     .doc
@@ -3858,7 +3891,9 @@ impl DocView {
             }
             return;
         }
-        if self.table_tab(outdent, cx) {
+        // 源码模式下表格按原始 `|` 文本编辑，Tab/Shift+Tab 应保持缩进语义，
+        // 不做 WYSIWYG 的单元格跳转（避免吞键与光标跳跃）。
+        if !self.settings.source_mode && self.table_tab(outdent, cx) {
             return;
         }
         if outdent {
