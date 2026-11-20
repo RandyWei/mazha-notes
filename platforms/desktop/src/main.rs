@@ -3549,23 +3549,29 @@ impl DocView {
             } else {
                 let caret = self.cursors[i].caret;
                 // 光标在图片块末尾：整块删除（`![...](...)` 作为一个整体）。
-                // 源码模式下图片始终按原文显示；WYSIWYG 下光标落在图片行内会
-                // 切到 raw_src 编辑态，这两种情况都应允许逐字符退格。
-                let image_range = if self.settings.source_mode {
+                // 所有模式统一处理：图片语法边界（含图片后紧邻换行的下一行行首）退格即删整图，
+                // 避免“先进入源码编辑、再逐字符删除”的回归与光标高度异常。
+                let candidates: Vec<Range<usize>> = self
+                    .doc
+                    .projection()
+                    .block_widgets()
+                    .iter()
+                    .filter(|w| matches!(w.kind, BlockWidgetKind::Image { .. }))
+                    .map(|w| w.source_range.clone())
+                    .collect();
+                let text = self.doc.text();
+                let image_range = candidates.into_iter().find_map(|r| {
+                    if r.start == caret || r.end == caret {
+                        return Some(r);
+                    }
+                    if caret > r.end {
+                        let gap = text.get(r.end..caret);
+                        if gap == Some("\n") || gap == Some("\r\n") {
+                            return Some(r.start..caret);
+                        }
+                    }
                     None
-                } else {
-                    let projection = self.doc.projection();
-                    let caret_line = projection.line_of_source(caret);
-                    projection
-                        .block_widgets()
-                        .iter()
-                        .find(|w| {
-                            matches!(w.kind, BlockWidgetKind::Image { .. })
-                                && w.source_range.end == caret
-                                && !w.line_range.contains(&caret_line)
-                        })
-                        .map(|w| w.source_range.clone())
-                };
+                });
                 if let Some(range) = image_range {
                     if self
                         .doc
@@ -3626,22 +3632,28 @@ impl DocView {
             }
             let caret = self.cursors[i].caret;
             // 光标在图片块开头：整块删除（`![...](...)` 作为一个整体）。
-            // 源码模式或光标在图片行内编辑源码时，按字符删除以便编辑语法。
-            let image_range = if self.settings.source_mode {
+            // 所有模式统一处理：图片语法边界（含图片后紧邻换行的边界）Delete 即删整图。
+            let candidates: Vec<Range<usize>> = self
+                .doc
+                .projection()
+                .block_widgets()
+                .iter()
+                .filter(|w| matches!(w.kind, BlockWidgetKind::Image { .. }))
+                .map(|w| w.source_range.clone())
+                .collect();
+            let text = self.doc.text();
+            let image_range = candidates.into_iter().find_map(|r| {
+                if r.start == caret || r.end == caret {
+                    return Some(r);
+                }
+                if caret > r.end {
+                    let gap = text.get(r.end..caret);
+                    if gap == Some("\n") || gap == Some("\r\n") {
+                        return Some(r.start..caret);
+                    }
+                }
                 None
-            } else {
-                let projection = self.doc.projection();
-                let caret_line = projection.line_of_source(caret);
-                projection
-                    .block_widgets()
-                    .iter()
-                    .find(|w| {
-                        matches!(w.kind, BlockWidgetKind::Image { .. })
-                            && w.source_range.start == caret
-                            && !w.line_range.contains(&caret_line)
-                    })
-                    .map(|w| w.source_range.clone())
-            };
+            });
             if let Some(range) = image_range {
                 if self
                     .doc
