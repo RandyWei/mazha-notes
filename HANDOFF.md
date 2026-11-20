@@ -129,7 +129,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 ## 提交历史（近期，共 159 条）
 
 ```
-（待提交） feat(md/export/core): 支持脚注多段落定义容器体并同步文档（0.1.114，D89）
+a0d6e28 feat(md/export/core): 支持脚注多段落定义容器体并同步文档（0.1.114，D89）
 57b5d09 feat(md/export): 支持 CommonMark 类型 1–5 HTML 块并同步文档（0.1.113，D88）
 42a7aa6 fix(desktop): 源码模式排版与表格分隔行显示打磨
 d8a24ad fix(export): 块级公式导出缩小与默认文件名跟随 Markdown 主干（0.1.112，D87）
