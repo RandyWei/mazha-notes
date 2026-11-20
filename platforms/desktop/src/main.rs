@@ -9630,8 +9630,11 @@ impl Element for DocElement {
                         None
                     };
                     // 网格表格行高由单元格换行后的实际视觉行数决定。
+                    // 源码模式统一使用等宽字号的普通行高，不随标题级别放大。
                     let mut line_px = if let Some(row) = &table_row {
                         row.height
+                    } else if source_mode {
+                        (mono_size * 1.5).max(LINE_HEIGHT)
                     } else {
                         block_line_px_with_mono(&line.block, font_size, mono_size)
                     };
@@ -9659,10 +9662,12 @@ impl Element for DocElement {
                         ChartLineRole::Collapsed => line_px = Pixels::ZERO,
                         ChartLineRole::None => {}
                     }
-                    // 表格分隔行（`| --- |`）投影为空行：正常布局下高度归零，改由表头行
+                    // 表格分隔行（`| --- |`）投影为空行：WYSIWYG 正常布局下高度归零，改由表头行
                     // 自身加高来提供上下内边距，避免表头与表体之间横着一整行空白。
                     // 光标若落进分隔行则恢复正常高度，否则会出现"看不见的光标"。
-                    let is_delim_hidden = line.block.table_line == Some(TableLine::Delimiter)
+                    // 源码模式需原样显示分隔行，不应用这些渲染态高度调整。
+                    let is_delim_hidden = !source_mode
+                        && line.block.table_line == Some(TableLine::Delimiter)
                         && caret_pos.line != idx;
                     if table_row.is_none() {
                         if line.block.table_line == Some(TableLine::Delimiter) {
@@ -9671,13 +9676,16 @@ impl Element for DocElement {
                             } else {
                                 line_px
                             };
-                        } else if line.block.table_line == Some(TableLine::Header) {
+                        } else if !source_mode && line.block.table_line == Some(TableLine::Header) {
                             // 上下各多给约 6px，表头文字在行盒内垂直居中
                             line_px += px(12.);
                         }
                     }
-                    // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距
-                    let wrap_width = if line.block.code_block {
+                    // 可用宽度 = 元素宽度 - 左缩进（含 BASE 左内边距）- 右侧 BASE 内边距。
+                    // 源码模式按统一纯文本行排版，不套用 WYSIWYG 代码块/引用块的额外内边距与缩进规则。
+                    let wrap_width = if source_mode {
+                        (content_width_total - indent - BASE).max(px(48.))
+                    } else if line.block.code_block {
                         code_block_wrap_width(content_width_total, indent)
                     } else if line.block.quote_depth > 0 {
                         quote_block_wrap_width(content_width_total, indent)
@@ -10272,8 +10280,10 @@ impl Element for DocElement {
             let line_x = layout.origin.x + block.indent;
             // 代码块文本整体右移 12px 让出面板内边距；光标/选区必须跟文本同一起点，
             // 否则光标会压在左侧字符上、行末光标也停在最后一个字之前（只差 12px）。
+            // 源码模式不绘制代码块面板，文本不额外右移。
             let mut text_x = line_x;
-            if block.proj.block.code_block {
+            let source_mode_now = self.view.read(cx).settings.source_mode;
+            if !source_mode_now && block.proj.block.code_block {
                 text_x += CODE_TEXT_INSET;
             }
 
