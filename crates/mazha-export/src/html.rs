@@ -143,6 +143,7 @@ fn render_body(source: &str, blocks: &[Block], out: &mut String, xhtml: bool) {
 ///
 /// 序号已经由 `prepare` 写进标签（并作为 `<li id="fn-N">` 的锚点），
 /// 因此跳过定义头部的标签片段，避免正文里再出现一次上标序号。
+/// 定义体来自子块（D89）；单段落体保持内联渲染以兼容既有输出，多块体按块级内容渲染。
 fn render_footnote_item(
     source: &str,
     block: &Block,
@@ -154,14 +155,41 @@ fn render_footnote_item(
         return;
     };
     let _ = write!(out, "<li id=\"fn-{}\">", escape_attr(label));
-    let body_start = block
-        .spans
-        .iter()
-        .position(|s| s.kind == SpanKind::Text && s.role == SpanRole::FootnoteRef)
-        .map_or(0, |i| i + 1);
-    render_inline(source, &block.spans[body_start..], out, xhtml);
+    render_footnote_body_children(source, block, out, xhtml);
     push_backlink(label, index, out);
     out.push_str("</li>\n");
+}
+
+/// 渲染脚注定义体（子块），跳过头部 `[^label]:` 标记。
+///
+/// 首个子块若为段落则内联输出，保持单段脚注的紧凑 HTML 形态；其余子块按普通块渲染。
+fn render_footnote_body_children(source: &str, block: &Block, out: &mut String, xhtml: bool) {
+    let mut iter = block.children.iter();
+    let Some(first) = iter.next() else {
+        return;
+    };
+    if matches!(first.kind, BlockKind::Paragraph) {
+        render_inline(source, &first.spans, out, xhtml);
+        for child in iter {
+            render_block(source, child, out, false, xhtml);
+        }
+    } else {
+        render_block(source, first, out, false, xhtml);
+        for child in iter {
+            render_block(source, child, out, false, xhtml);
+        }
+    }
+}
+
+/// 渲染就地脚注定义的头部标签（上标/链接形态由行内渲染决定），不渲染 `[^`/`]:` 标记与正文。
+fn render_footnote_head_label(source: &str, block: &Block, out: &mut String) {
+    for sp in &block.spans {
+        if sp.kind == SpanKind::Text && sp.role == SpanRole::FootnoteRef {
+            // 头部标签按脚注引用样式渲染，保持与既有就地定义输出一致。
+            push_footnote_ref(source, sp, out);
+            break;
+        }
+    }
 }
 
 /// 输出文末定义 → 首个正文引用的回链（D81）。
@@ -346,14 +374,15 @@ fn render_block(source: &str, block: &Block, out: &mut String, tight: bool, xhtm
             out.push_str("</div>");
         }
         BlockKind::FootnoteDef { label } => {
-            // 脚注定义（D35 ④）：就地输出（**不**重排到文末、暂不生成回链）；
-            // `[^label]:` 标记隐藏，标签（上标）与正文可见。
+            // 脚注定义（D35/D89）：就地输出（未归集时）；`[^label]:` 标记隐藏，
+            // 头部标签与定义体可见。定义体来自子块，支持多段/多块内容。
             let _ = write!(
                 out,
                 "<div class=\"footnote\" id=\"fn-{}\">",
                 escape_attr(label)
             );
-            render_inline(source, &block.spans, out, xhtml);
+            render_footnote_head_label(source, block, out);
+            render_footnote_body_children(source, block, out, xhtml);
             out.push_str("</div>");
         }
         BlockKind::HtmlBlock => {
@@ -1171,6 +1200,25 @@ mod tests {
         assert!(doc.contains(".fnback"), "{doc}");
         assert!(doc.contains(".footnotes"), "{doc}");
         assert!(doc.contains("div.footnote"), "{doc}");
+    }
+
+    #[test]
+    fn html_multiparagraph_footnote_def_is_collected_and_linked() {
+        // D89：多段脚注定义体以子块渲染，归集到文末并保留锚点/回链。
+        let html = to_html("见[^a]\n\n[^a]: first\n\n    second\n");
+        assert!(
+            html.contains("<a id=\"fnref-5\" href=\"#fn-1\">1</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<section class=\"footnotes\">\n<ol>\n<li id=\"fn-1\"> first"),
+            "{html}"
+        );
+        assert!(html.contains("<p>second</p>"), "{html}");
+        assert!(
+            html.contains("<a class=\"fnback\" href=\"#fnref-5\">↩</a></li>"),
+            "{html}"
+        );
     }
 
     // ---------- HTML 块（D88）：原样输出，不转义 ----------

@@ -6,8 +6,8 @@
 //!
 //! 支持的块：ATX/Setext 标题、段落、分割线、围栏/缩进代码块、引用、列表
 //! （有序/无序/任务）、GFM 表格、Callout、Front-matter、`$$…$$` 显示公式、
-//! `[^label]:` 脚注定义、CommonMark 类型 1–5 HTML 块（D88）。
-//! 惰性续行、多段落脚注定义等留待后续迭代。
+//! `[^label]:` 脚注定义（含多段落容器体，D89）、CommonMark 类型 1–5 HTML 块（D88）。
+//! 惰性续行等留待后续迭代。
 
 use crate::block::{Align, Block, BlockKind, CalloutKind};
 use crate::span::{SpanRole, SyntaxSpan};
@@ -1119,6 +1119,26 @@ fn build_list_item(
         let nl = lines[i];
         let nrest = nl.rest(source);
         if is_blank(nrest) {
+            // D89：脚注定义可跨空行续接。若空行后存在“仍属于本列表项且在项内容基础上
+            // 再缩进 ≥4”的非空续行，则该空行可能归属脚注定义体，不能在此截断列表项。
+            if let Some(next) = next_list_item_footnote_continuation(source, lines, i, marker) {
+                for &bl in &lines[i..next] {
+                    let brest = bl.rest(source);
+                    if is_blank(brest) {
+                        let stripped = indent(brest).min(marker.len);
+                        inner.push(Line {
+                            start: bl.start,
+                            end: bl.end,
+                            content: (bl.content + stripped).min(bl.end),
+                        });
+                    } else {
+                        // 非空续行由下方常规逻辑统一处理（保持缩进剥离规则一致）。
+                        break;
+                    }
+                }
+                i = next;
+                continue;
+            }
             break;
         }
         // 同级或更浅的列表标记 → 下一个项；否则视为续行
@@ -1154,11 +1174,13 @@ fn marker_role(marker: &ListMarker) -> SpanRole {
     }
 }
 
-/// 构造脚注定义块 `[^label]: body`（SPEC D35 ②）。
+/// 构造脚注定义块 `[^label]: body`（SPEC D35/D89）。
 ///
-/// 片段布局固定为「标记 `[^` | 标签（可见）| 标记 `]:`（含至多一个空格）| 正文」，
-/// 正文按行内语法解析。**续行**仅吸收缩进 ≥4 空格的非空行（剥离至多 4 空格），
-/// 空行或缩进 ≤3 的行即结束定义（不支持多段落定义，留后续）。
+/// `FootnoteDef` 为容器块：头部仅保留 `[^`/label/`]:` 语法片段，定义体（首行正文
+/// 及后续续行）作为子块解析。续行规则：
+/// - 缩进 **≥4** 的非空行属于定义，扫描子块前剥离 **4 空格**定义缩进；
+/// - 空行**仅当**其后存在后续非空且缩进 ≥4 的续行时才归属定义（可跨空行）；
+/// - 首行文本可与后续多块体并存；不支持惰性续行（lazy continuation）。
 fn build_footnote_def(
     source: &str,
     lines: &[Line],
@@ -1167,7 +1189,7 @@ fn build_footnote_def(
 ) -> (Block, usize) {
     let l = lines[start_idx];
     let abs = |rel: usize| l.content + rel;
-    let mut spans = vec![
+    let spans = vec![
         SyntaxSpan::marker(
             abs(head.marker_start)..abs(head.label_start),
             SpanRole::FootnoteMarker,
@@ -1181,8 +1203,9 @@ fn build_footnote_def(
             SpanRole::FootnoteMarker,
         ),
     ];
-    // 正文行：首行从 `body_start` 起，续行剥离至多 4 空格（与列表项续行同规则）
-    let mut body = vec![Line {
+
+    // 收集定义体行：首行正文 + 满足续行规则的后续行（含可归属的空行）。
+    let mut body: Vec<Line> = vec![Line {
         start: l.start,
         end: l.end,
         content: abs(head.body_start),
@@ -1191,9 +1214,19 @@ fn build_footnote_def(
     while i < lines.len() {
         let nl = lines[i];
         let nrest = nl.rest(source);
-        // 续行必须缩进 ≥4；只剥离恰好 4 空格，**多余的缩进留在可见文本里**
-        // （序列化侧对称地补 4 空格，故任意缩进都能逐字节往返）
-        if is_blank(nrest) || indent(nrest) < FN_CONT_INDENT {
+        if is_blank(nrest) {
+            // 空行仅在其后存在后续非空且缩进 ≥4 的续行时归属定义。
+            if let Some(next) = next_continuation_index(source, lines, i) {
+                // 将中间空行（含当前空行）加入定义体；空行剥离至多 4 空格缩进。
+                for &bl in &lines[i..next] {
+                    body.push(stripped_footnote_body_line(bl, source));
+                }
+                i = next;
+                continue;
+            }
+            break;
+        }
+        if indent(nrest) < FN_CONT_INDENT {
             break;
         }
         body.push(Line {
@@ -1203,12 +1236,69 @@ fn build_footnote_def(
         });
         i += 1;
     }
-    spans.extend(paragraph_spans(source, &body));
+
     let range = l.start..body.last().map_or(l.end, |x| x.end);
+    let children = scan_blocks(source, &body);
     let kind = BlockKind::FootnoteDef {
         label: head.label.clone(),
     };
-    (Block::leaf(kind, range, spans), i)
+    (Block::container(kind, range, spans, children), i)
+}
+
+/// 从 `from` 起跳过连续空行，返回首个非空且缩进 ≥4 的续行下标；否则 `None`。
+fn next_continuation_index(source: &str, lines: &[Line], from: usize) -> Option<usize> {
+    let mut j = from;
+    while j < lines.len() && is_blank(lines[j].rest(source)) {
+        j += 1;
+    }
+    if j < lines.len() && indent(lines[j].rest(source)) >= FN_CONT_INDENT {
+        Some(j)
+    } else {
+        None
+    }
+}
+
+/// 列表项内跨空行的脚注定义续行探测（D89）：
+///
+/// 跳过空行后，若下一非空行仍可作为当前列表项续行（不是同级/更浅列表标记），
+/// 且在剥离列表标记宽度后仍保留 ≥4 空格缩进，则可能是脚注定义的跨空行续行。
+fn next_list_item_footnote_continuation(
+    source: &str,
+    lines: &[Line],
+    from: usize,
+    marker: &ListMarker,
+) -> Option<usize> {
+    let mut j = from;
+    while j < lines.len() && is_blank(lines[j].rest(source)) {
+        j += 1;
+    }
+    if j >= lines.len() {
+        return None;
+    }
+    let rest = lines[j].rest(source);
+    if let Some(m) = list_marker(rest)
+        && m.indent <= marker.indent
+    {
+        return None;
+    }
+    let stripped = indent(rest).min(marker.len);
+    let after_item = rest.get(stripped..).unwrap_or("");
+    if indent(after_item) >= FN_CONT_INDENT {
+        Some(j)
+    } else {
+        None
+    }
+}
+
+/// 把定义体中的空行转换为子块扫描用行（剥离至多 4 空格定义缩进）。
+fn stripped_footnote_body_line(line: Line, source: &str) -> Line {
+    let rest = line.rest(source);
+    let stripped = indent(rest).min(FN_CONT_INDENT);
+    Line {
+        start: line.start,
+        end: line.end,
+        content: (line.content + stripped).min(line.end),
+    }
 }
 
 /// 构造段落；若其后紧跟 Setext 下划线，则升级为标题。
@@ -2051,13 +2141,22 @@ mod footnote_tests {
         parse(src).into_iter().next().expect("至少一个块")
     }
 
-    /// 块内全部可见（Text）片段拼接。
+    /// 块自身 spans 内全部可见（Text）片段拼接。
     fn visible_text(src: &str, b: &Block) -> String {
         let mut out = String::new();
         for s in &b.spans {
             if s.kind == SpanKind::Text {
                 out.push_str(&src[s.range.clone()]);
             }
+        }
+        out
+    }
+
+    /// 递归收集块及其子孙块中的可见文本。
+    fn visible_text_deep(src: &str, b: &Block) -> String {
+        let mut out = visible_text(src, b);
+        for c in &b.children {
+            out.push_str(&visible_text_deep(src, c));
         }
         out
     }
@@ -2115,60 +2214,67 @@ mod footnote_tests {
 
     #[test]
     fn footnote_def_block_spans() {
+        // D89：FootnoteDef 为容器，头部 spans 仅含 `[^`/label/`]:`，正文在子块中。
+        // `:` 后的空格属于正文（可见），以保证 `[^1]: note` 逐字节往返与显示空格。
         let src = "[^1]: note\n";
         let b = footnote_def(src);
         assert_eq!(b.kind, BlockKind::FootnoteDef { label: "1".into() });
+        assert!(b.is_container());
         assert_eq!(
             parts(src, &b),
             vec![
                 (SpanKind::Marker, SpanRole::FootnoteMarker, "[^"),
                 (SpanKind::Text, SpanRole::FootnoteRef, "1"),
                 (SpanKind::Marker, SpanRole::FootnoteMarker, "]:"),
-                (SpanKind::Text, SpanRole::Normal, " note"),
             ]
         );
-        // 可见文本 = 标签 + 正文（两者都可见，避免"丢字"）
-        assert_eq!(visible_text(src, &b), "1 note");
+        assert_eq!(b.children.len(), 1);
+        assert_eq!(b.children[0].kind, BlockKind::Paragraph);
+        assert_eq!(visible_text_deep(src, &b), "1 note");
     }
 
     #[test]
     fn footnote_def_without_space_and_empty_body() {
         let src = "[^a]:x\n";
         let b = footnote_def(src);
-        assert_eq!(parts(src, &b).last().unwrap().2, "x");
+        assert_eq!(parts(src, &b).last().unwrap().2, "]:");
+        assert_eq!(b.children.len(), 1);
+        assert_eq!(visible_text_deep(src, &b), "ax");
+
         let src = "[^a]:\n";
         let b = footnote_def(src);
         assert_eq!(b.kind, BlockKind::FootnoteDef { label: "a".into() });
+        assert!(b.children.is_empty());
         assert_eq!(visible_text(src, &b), "a");
     }
 
     #[test]
     fn footnote_def_keeps_extra_spaces() {
-        // `:` 后的空格归可见正文，故多余空格与"无空格"两种写法都能逐字节往返
+        // `:` 后空格归正文（首个空格是常见分隔，额外空格也须逐字节往返）。
         let src = "[^1]:  x\n";
         let b = footnote_def(src);
-        assert_eq!(parts(src, &b).last().unwrap().2, "  x");
+        assert_eq!(parts(src, &b).last().unwrap().2, "]:");
+        assert_eq!(b.children.len(), 1);
+        assert_eq!(visible_text_deep(src, &b), "1  x");
         assert_eq!(to_md(src), src);
         assert_eq!(to_md("[^1]:x\n"), "[^1]:x\n");
     }
 
     #[test]
     fn footnote_def_continuation_lines() {
-        // 缩进 ≥4 的续行归入定义（剥离至多 4 空格），行间是隐藏的软换行标记
+        // 缩进 ≥4 的续行归入定义（剥离 4 空格），同段落内表现为软换行。
         let src = "[^a]: first\n    second\n";
         let blocks = parse(src);
         assert_eq!(blocks.len(), 1, "{blocks:#?}");
         assert_eq!(blocks[0].kind, BlockKind::FootnoteDef { label: "a".into() });
-        assert_eq!(
-            parts(src, &blocks[0]),
-            vec![
-                (SpanKind::Marker, SpanRole::FootnoteMarker, "[^"),
-                (SpanKind::Text, SpanRole::FootnoteRef, "a"),
-                (SpanKind::Marker, SpanRole::FootnoteMarker, "]:"),
-                (SpanKind::Text, SpanRole::Normal, " first"),
-                (SpanKind::Marker, SpanRole::SoftBreak, "\n"),
-                (SpanKind::Text, SpanRole::Normal, "second"),
-            ]
+        assert_eq!(blocks[0].children.len(), 1);
+        assert_eq!(blocks[0].children[0].kind, BlockKind::Paragraph);
+        assert_eq!(visible_text_deep(src, &blocks[0]), "a firstsecond");
+        assert!(
+            blocks[0].children[0]
+                .spans
+                .iter()
+                .any(|s| s.role == SpanRole::SoftBreak)
         );
     }
 
@@ -2184,11 +2290,15 @@ mod footnote_tests {
     }
 
     #[test]
-    fn footnote_def_ends_at_blank_line() {
-        let src = "[^a]: first\n\n    second\n";
+    fn footnote_def_ends_at_blank_line_without_following_continuation() {
+        // 空行后若无后续“非空且缩进 ≥4”的续行，则空行不属于定义（D89）。
+        let src = "[^a]: first\n\nsecond\n";
         let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
         assert!(matches!(blocks[0].kind, BlockKind::FootnoteDef { .. }));
-        assert_eq!(visible_text(src, &blocks[0]), "a first");
+        assert_eq!(visible_text_deep(src, &blocks[0]), "a first");
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(visible_text(src, &blocks[1]), "second");
     }
 
     #[test]
@@ -2226,8 +2336,19 @@ mod footnote_tests {
     fn footnote_def_body_parses_inline() {
         let src = "[^1]: 见 **粗体** 与 `code`\n";
         let b = footnote_def(src);
-        assert!(b.spans.iter().any(|s| s.role == SpanRole::Strong));
-        assert!(b.spans.iter().any(|s| s.role == SpanRole::InlineCode));
+        assert_eq!(b.children.len(), 1);
+        assert!(
+            b.children[0]
+                .spans
+                .iter()
+                .any(|s| s.role == SpanRole::Strong)
+        );
+        assert!(
+            b.children[0]
+                .spans
+                .iter()
+                .any(|s| s.role == SpanRole::InlineCode)
+        );
     }
 
     #[test]
@@ -2237,7 +2358,7 @@ mod footnote_tests {
         assert_eq!(quote.kind, BlockKind::BlockQuote);
         let def = &quote.children[0];
         assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
-        assert_eq!(visible_text(src, def), "1 note");
+        assert_eq!(visible_text_deep(src, def), "1 note");
     }
 
     #[test]
@@ -2247,7 +2368,7 @@ mod footnote_tests {
         let item = &list.children[0];
         let def = &item.children[0];
         assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
-        assert_eq!(visible_text(src, def), "1 note");
+        assert_eq!(visible_text_deep(src, def), "1 note");
     }
 
     #[test]
@@ -2260,7 +2381,7 @@ mod footnote_tests {
         assert_eq!(item.children.len(), 1, "{:#?}", item.children);
         let def = &item.children[0];
         assert_eq!(def.kind, BlockKind::FootnoteDef { label: "1".into() });
-        assert_eq!(visible_text(src, def), "1 first续行");
+        assert_eq!(visible_text_deep(src, def), "1 first续行");
     }
 
     #[test]
@@ -2287,6 +2408,95 @@ mod footnote_tests {
             assert_eq!(to_md(src), src, "roundtrip {src:?}");
             assert_eq!(to_md(&to_md(src)), to_md(src), "idempotent {src:?}");
         }
+    }
+
+    #[test]
+    fn footnote_def_blank_line_belongs_when_followed_by_continuation() {
+        // D89：空行后若仍有非空且缩进 ≥4 的续行，则空行属于定义，后续内容并入定义体。
+        let src = "[^a]: first\n\n    second\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        let def = &blocks[0];
+        assert_eq!(def.kind, BlockKind::FootnoteDef { label: "a".into() });
+        assert_eq!(def.children.len(), 2, "{:#?}", def.children);
+        assert_eq!(def.children[0].kind, BlockKind::Paragraph);
+        assert_eq!(def.children[1].kind, BlockKind::Paragraph);
+        assert_eq!(visible_text_deep(src, def), "a firstsecond");
+        assert_eq!(to_md(src), src);
+        assert_eq!(to_md(&to_md(src)), to_md(src));
+    }
+
+    #[test]
+    fn footnote_def_multi_paragraph_with_blank_lines_roundtrip() {
+        // 首行文本后可跟多个段落（D89）；空行仅在后续仍有缩进续行时归属定义。
+        let src = "[^a]: intro\n\n    second paragraph\n\n    third paragraph\n\n后文\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        let def = &blocks[0];
+        assert_eq!(def.kind, BlockKind::FootnoteDef { label: "a".into() });
+        assert_eq!(def.children.len(), 3, "{:#?}", def.children);
+        assert!(
+            def.children
+                .iter()
+                .all(|c| matches!(c.kind, BlockKind::Paragraph))
+        );
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(visible_text(src, &blocks[1]), "后文");
+        assert_eq!(to_md(src), src);
+        assert_eq!(to_md(&to_md(src)), to_md(src));
+    }
+
+    #[test]
+    fn footnote_def_multiblock_body_with_list_and_code_roundtrip() {
+        // 定义体可包含非段落子块；子块前的定义缩进（4 空格）在解析前剥离。
+        let src =
+            "[^a]: intro\n\n    - item 1\n    - item 2\n\n    ```rs\n    fn f() {}\n    ```\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        let def = &blocks[0];
+        assert_eq!(def.kind, BlockKind::FootnoteDef { label: "a".into() });
+        assert_eq!(def.children.len(), 3, "{:#?}", def.children);
+        assert_eq!(def.children[0].kind, BlockKind::Paragraph);
+        assert!(matches!(def.children[1].kind, BlockKind::List { .. }));
+        assert!(matches!(
+            def.children[2].kind,
+            BlockKind::CodeBlock { fenced: true, .. }
+        ));
+        assert_eq!(to_md(src), src);
+        assert_eq!(to_md(&to_md(src)), to_md(src));
+    }
+
+    #[test]
+    fn footnote_def_in_quote_multiblock_roundtrip() {
+        let src = "> [^a]: first\n>\n>     - item\n>\n>     tail\n\n后文\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].kind, BlockKind::BlockQuote);
+        let def = blocks[0]
+            .children
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::FootnoteDef { .. }))
+            .expect("引用内应有脚注定义");
+        assert_eq!(def.children.len(), 3, "{:#?}", def.children);
+        assert_eq!(to_md(src), src);
+        assert_eq!(to_md(&to_md(src)), to_md(src));
+    }
+
+    #[test]
+    fn footnote_def_in_list_multiblock_roundtrip() {
+        let src = "- [^a]: first\n\n      - nested\n\n      tail\n\n后文\n";
+        let blocks = parse(src);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert!(matches!(blocks[0].kind, BlockKind::List { .. }));
+        let item = &blocks[0].children[0];
+        let def = item
+            .children
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::FootnoteDef { .. }))
+            .expect("列表项内应有脚注定义");
+        assert!(def.children.len() >= 2, "{:#?}", def.children);
+        assert_eq!(to_md(src), src);
+        assert_eq!(to_md(&to_md(src)), to_md(src));
     }
 }
 

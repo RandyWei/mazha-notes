@@ -1323,4 +1323,25 @@ mod tests {
         assert_eq!(new_def.start, old_def.start + "前".len());
         assert_eq!(index.get("b").unwrap().number, 1, "编号不应因平移改变");
     }
+
+    /// 多段脚注定义（D89 容器块）下索引与投影保持兼容。
+    #[test]
+    fn footnote_index_and_projection_support_multiparagraph_def() {
+        let mut d = doc("见[^a]\n\n[^a]: first\n\n    second\n");
+        let index = d.footnote_index();
+        assert_eq!(index.get("a").unwrap().number, 1);
+        assert!(index.get("a").unwrap().definition.is_some());
+        let p = d.projection();
+        assert!(!p.lines.is_empty());
+        assert_projection_matches(&mut d, "多段脚注定义");
+
+        d.apply(Edit::Insert {
+            at: d.len(),
+            text: "\n尾".into(),
+        })
+        .unwrap();
+        assert_projection_matches(&mut d, "多段脚注定义追加");
+        let index = d.footnote_index();
+        assert_eq!(index.get("a").unwrap().number, 1);
+    }
 }

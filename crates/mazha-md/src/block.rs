@@ -62,11 +62,12 @@ pub enum BlockKind {
     /// 公式体记 `SpanRole::Math`（可见），两端 `$$` 记 `SpanRole::MathMarker`（隐藏）。
     /// 行内公式 `$…$` 不产生块，只是段落里的片段。
     MathBlock,
-    /// 脚注定义块（行首 `[^label]: body`，缩进 ≥4 的续行归入本块；D35）。
+    /// 脚注定义块（行首 `[^label]: body`，定义体可含多段/多块；D35/D89）。
     ///
-    /// `label` 是脚注标签（引用 `[^label]` 与之对应）。片段：`[^` 与 `]:` 记
-    /// `SpanRole::FootnoteMarker`（隐藏）、label 记 `SpanRole::FootnoteRef`（可见）、
-    /// 正文按行内语法解析。行内引用 `[^label]` 不产生块，只是段落里的片段。
+    /// `FootnoteDef` 为**容器块**：头部标记 `[^`/`]:` 与标签（`FootnoteRef`）保留在
+    /// 本块 `spans` 中，定义体解析为 `children` 子块。续行缩进 ≥4 的非空行属于定义，
+    /// 扫描子块前剥离 4 空格定义缩进；空行仅在其后仍有非空且缩进 ≥4 的续行时归属定义。
+    /// 行内引用 `[^label]` 不产生块，只是段落里的片段。
     FootnoteDef {
         /// 脚注标签（不含 `[^` 与 `]`）。
         label: String,
@@ -171,7 +172,7 @@ impl Block {
         }
     }
 
-    /// 是否为容器块（引用/列表/列表项）。
+    /// 是否为容器块（引用/列表/列表项/脚注定义）。
     pub fn is_container(&self) -> bool {
         matches!(
             self.kind,
@@ -179,6 +180,7 @@ impl Block {
                 | BlockKind::Callout { .. }
                 | BlockKind::List { .. }
                 | BlockKind::ListItem { .. }
+                | BlockKind::FootnoteDef { .. }
         )
     }
 }

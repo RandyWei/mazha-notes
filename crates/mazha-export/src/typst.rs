@@ -183,9 +183,10 @@ fn block_to_typst(source: &str, b: &Block, out: &mut String) {
             let _ = write!(out, "\n{fence}");
         }
         BlockKind::FootnoteDef { .. } => {
-            // 脚注定义（D35 ④）：按普通段落输出（标签 `#super[...]` + 正文）。
+            // 脚注定义（D35/D89）：按普通内容输出（标签 `#super[...]` + 正文），
             // **不用** Typst 的 `#footnote[...]`，否则会把定义重新归集到页脚并与源顺序错位。
-            inline_to_typst(source, &b.spans, out);
+            // 头部标签在 def spans 中，定义体在子块中（支持多段/多块）。
+            render_footnote_def_typst(source, b, out);
         }
         BlockKind::HtmlBlock => {
             // HTML 块（CommonMark 类型 1–5，D88）：Typst 无法渲染任意 HTML，
@@ -255,6 +256,35 @@ fn list_item_to_typst(source: &str, item: &Block, out: &mut String) {
                 }
             }
             _ => block_to_typst(source, child, out),
+        }
+    }
+}
+
+/// 渲染脚注定义块（D35/D89）：头部标签 + 子块定义体。
+fn render_footnote_def_typst(source: &str, block: &Block, out: &mut String) {
+    for sp in &block.spans {
+        if sp.kind == SpanKind::Text && sp.role == SpanRole::FootnoteRef {
+            let text = escape_typst(&source[sp.range.clone()]);
+            let _ = write!(out, "#super[{text}]");
+            break;
+        }
+    }
+    let mut iter = block.children.iter();
+    let Some(first) = iter.next() else {
+        return;
+    };
+    if matches!(first.kind, BlockKind::Paragraph) {
+        inline_to_typst(source, &first.spans, out);
+        for child in iter {
+            out.push_str("\n\n");
+            block_to_typst(source, child, out);
+        }
+    } else {
+        out.push_str("\n\n");
+        block_to_typst(source, first, out);
+        for child in iter {
+            out.push_str("\n\n");
+            block_to_typst(source, child, out);
         }
     }
 }
@@ -849,6 +879,18 @@ mod tests {
         let first = t.find("#super[1] B").expect("B 应为第 1 条脚注");
         let second = t.find("#super[2] A").expect("A 应为第 2 条脚注");
         assert!(first < second, "文末定义应按序号排列：{t}");
+    }
+
+    #[test]
+    fn typst_multiparagraph_footnote_def_renders_body_blocks() {
+        // D89：多段脚注定义按子块渲染，归集到文末并保留编号。
+        let t = to_typst("见[^a]\n\n[^a]: first\n\n    second\n");
+        assert!(t.contains("见#super[1]"), "{t}");
+        assert!(t.contains("#super[1] first"), "{t}");
+        assert!(t.contains("first\n\nsecond"), "{t}");
+        let body = t.find("#super[1] first").expect("应包含编号定义体");
+        let ref_pos = t.find("见#super[1]").expect("应包含引用");
+        assert!(ref_pos < body, "定义体应归集在引用之后：{t}");
     }
 
     // ---------- HTML 块（D88）：raw fence 原文降级 ----------

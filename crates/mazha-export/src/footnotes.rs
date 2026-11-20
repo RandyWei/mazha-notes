@@ -120,9 +120,9 @@ fn collect_defs<'a>(blocks: &'a [Block], out: &mut Vec<(usize, &'a Block)>) {
 /// 取定义块源文本并剥离嵌套容器前缀，使其归集后仍能被解析为顶层定义块。
 ///
 /// 首行 `[^` 之前的部分即容器前缀（如 `> `、`- `、`  - ` 或纯缩进）。续行若以
-/// 同一前缀开头就整段剥掉；列表项续行只有缩进、没有列表标记，此时剥掉与前缀
-/// 等宽的前导空格。**边界**：只按字节剥空格/`>`/列表标记，tab 或混合前缀不识别，
-/// 保留原样（退化为就地渲染，不破坏结构）。
+/// 同一前缀开头就整段剥掉；引用空行常写成 `>`/`> `，列表项续行可能只有缩进，
+/// 此时按前缀形态剥离等价的容器部分并保留脚注定义体自身的缩进/空行形态。
+/// **边界**：只按字节剥空格/`>`/列表标记，tab 或混合前缀不识别，保留原样。
 fn cleaned_def_text(source: &str, block: &Block) -> Option<String> {
     let text = source.get(block.range.clone())?;
     let first_line = text.split('\n').next().unwrap_or("");
@@ -131,24 +131,44 @@ fn cleaned_def_text(source: &str, block: &Block) -> Option<String> {
         return Some(text.to_string());
     }
     let prefix_len = prefix.len();
+    let trimmed_prefix = prefix.trim_end();
     let mut out = String::with_capacity(text.len());
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
             out.push('\n');
         }
         if i == 0 || line.starts_with(prefix) {
-            // 首行必带完整前缀；引用内的续行也带同样的 `> ` 前缀。
             out.push_str(&line[prefix_len..]);
-        } else {
-            // 列表项续行只有缩进（宽度 == 列表标记宽度），剥掉同宽空格后
-            // 恰好留下脚注定义续行需要的 4 空格缩进。
-            let spaces = line
-                .bytes()
-                .take_while(|b| *b == b' ')
-                .count()
-                .min(prefix_len);
-            out.push_str(&line[spaces..]);
+            continue;
         }
+
+        // 引用空行：`>` 或 `> `（以及多层引用前缀的 trim 形式）。
+        if !trimmed_prefix.is_empty() {
+            if line == trimmed_prefix {
+                out.push_str("");
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix(trimmed_prefix) {
+                if rest.is_empty() || rest.chars().all(|c| c == ' ') {
+                    out.push_str("");
+                    continue;
+                }
+                // 如 `>     second`（前缀 `> ` 但实际写成 `>` + 多空格）：剥掉引用标记后保留剩余缩进。
+                if trimmed_prefix.contains('>') {
+                    out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                    continue;
+                }
+            }
+        }
+
+        // 列表项续行只有缩进（宽度 == 列表标记宽度），剥掉同宽空格后
+        // 恰好留下脚注定义续行需要的 4 空格缩进；空行也按同宽缩进剥离。
+        let spaces = line
+            .bytes()
+            .take_while(|b| *b == b' ')
+            .count()
+            .min(prefix_len);
+        out.push_str(&line[spaces..]);
     }
     Some(out)
 }
@@ -220,6 +240,32 @@ mod tests {
         let src = "- [^a]: first\n      续行\n\n见[^a]\n";
         let out = prepare(src);
         assert!(out.trim_end().ends_with("[^1]: first\n    续行"), "{out}");
+        assert!(!out.contains("- [^1]"), "{out}");
+    }
+
+    #[test]
+    fn nested_quote_multiparagraph_definition_is_collected() {
+        // D89：引用内多段脚注定义归集到文末时，需剥离引用前缀并保留定义体结构/缩进。
+        let src = "> [^a]: first\n>\n>     second\n\n见[^a]\n";
+        let out = prepare(src);
+        assert!(out.trim_start().starts_with("见[^1]"), "{out}");
+        assert!(
+            out.trim_end().ends_with("[^1]: first\n\n    second"),
+            "{out}"
+        );
+        assert!(!out.contains("> [^1]"), "{out}");
+    }
+
+    #[test]
+    fn nested_list_multiparagraph_definition_is_collected() {
+        // D89：列表项内多段脚注定义归集到文末时，需保留定义体空行与 4 空格续行缩进。
+        let src = "- [^a]: first\n  \n      second\n\n见[^a]\n";
+        let out = prepare(src);
+        assert!(out.trim_start().starts_with("见[^1]"), "{out}");
+        assert!(
+            out.trim_end().ends_with("[^1]: first\n\n    second"),
+            "{out}"
+        );
         assert!(!out.contains("- [^1]"), "{out}");
     }
 

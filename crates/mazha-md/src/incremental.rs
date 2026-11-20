@@ -128,29 +128,63 @@ fn splice(
 ///
 /// 安全条件：
 /// 1. `tail` **之前是空行**——段落/标题/引用/列表都会被空行闭合（本扫描器不支持惰性续行）；
-/// 2. 区域最后一块不是**未闭合**的可跨空行构造（围栏代码/显示公式/HTML 块等）。
+/// 2. 区域最后一块不是**未闭合/可向后延伸**的可跨空行构造
+///    （围栏代码/显示公式/HTML 块，以及可跨空行续行的脚注定义等）。
 fn is_safe_cut(new: &str, tail: usize, region: &[Block]) -> bool {
     let blank_before =
         tail <= 1 || new[..tail].ends_with("\n\n") || new[..tail].ends_with("\n\r\n");
     if !blank_before {
         return false;
     }
-    !region.last().is_some_and(|b| is_unclosed_fence(b, new))
+    !region
+        .last()
+        .is_some_and(|b| is_unclosed_or_extending(b, new, tail))
 }
 
-/// 是否为**未闭合**的围栏代码块 / 显示公式块 / HTML 块（都可能延伸到文档末尾）。
+/// 是否为**未闭合**或在裁切点 `tail` 处仍可能**向后延伸**的构造。
 ///
-/// 公式块与围栏一样可以跨越空行（未闭合时一直延伸到文档末尾），
-/// 所以裁切点校验必须同样识别它，否则会把公式块拦腰切断（D34 ①）。
-/// HTML 块类型 1–5 在找不到结束条件时也会延伸到文档末尾（D88）。
-fn is_unclosed_fence(block: &Block, source: &str) -> bool {
+/// 围栏代码/显示公式/HTML 块在未闭合时可延伸到文档末尾；脚注定义（D89）
+/// 支持“空行 + 后续缩进 ≥4 续行”的跨空行续接，若定义块紧贴 `tail` 且
+/// `tail` 之后仍可形成续行，则切片解析会过早结束定义块，必须整段重解析。
+fn is_unclosed_or_extending(block: &Block, source: &str, tail: usize) -> bool {
     let n = |role: SpanRole| block.spans.iter().filter(|s| s.role == role).count();
     match block.kind {
         BlockKind::CodeBlock { fenced: true, .. } => n(SpanRole::FenceMarker) < 2,
         BlockKind::MathBlock => n(SpanRole::MathMarker) < 2,
         BlockKind::HtmlBlock => is_unclosed_html_block(source, block),
+        BlockKind::FootnoteDef { .. } => footnote_def_may_extend(block, source, tail),
         _ => false,
     }
+}
+
+/// 脚注定义块是否可能在 `tail` 之后继续延伸（D89）。
+///
+/// 仅当定义块范围紧贴裁切点时才需检查：从 `tail` 起跳过空行后，若遇到
+/// 缩进 ≥4 的非空行，则该行可作为定义续行（空行可归属定义），切片解析无法看到。
+fn footnote_def_may_extend(block: &Block, source: &str, tail: usize) -> bool {
+    if block.range.end != tail || tail > source.len() || !source.is_char_boundary(tail) {
+        return false;
+    }
+    let mut rest = &source[tail..];
+    loop {
+        let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let line = &rest[..line_end];
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if content.trim().is_empty() {
+            if line_end == rest.len() {
+                return false;
+            }
+            rest = &rest[line_end..];
+            continue;
+        }
+        return leading_indent_spaces(content) >= 4;
+    }
+}
+
+/// 统计行首空白缩进字符数（tab 按 1 计，足够判定脚注续行的 4 空格约定）。
+fn leading_indent_spaces(line: &str) -> usize {
+    line.chars().take_while(|&c| c == ' ' || c == '\t').count()
 }
 
 /// HTML 块（类型 1–5）是否未闭合：在块范围内找不到对应结束条件。
@@ -499,6 +533,33 @@ mod tests {
         let at = old.find("    second").unwrap();
         let new = format!("{}second{}", &old[..at], &old[at + 4..]);
         assert_matches_full(old, &new, at..at + 4);
+    }
+
+    #[test]
+    fn footnote_def_cross_blank_line_continuation_not_cut() {
+        // D89：空行后若仍有缩进 ≥4 的续行，则空行可归属定义；跨该空行的裁切不安全。
+        let old = "前文\n\n[^1]: first\n\n    second\n\n尾\n";
+        let at = old.find("second").unwrap();
+        let new = format!("{}SECOND{}", &old[..at], &old[at + "second".len()..]);
+        assert_matches_full(old, &new, at..at + "second".len());
+    }
+
+    #[test]
+    fn insert_cross_blank_line_continuation_extends_footnote_def() {
+        // 原先定义在空行处结束；插入缩进续行后空行应并入定义（D89）。
+        let old = "前文\n\n[^1]: first\n\n尾\n";
+        let insert_at = old.find("\n尾\n").unwrap() + 1; // 空行后、"尾"前
+        let new = format!("{}    more\n{}", &old[..insert_at], &old[insert_at..]);
+        assert_matches_full(old, &new, insert_at..insert_at);
+    }
+
+    #[test]
+    fn remove_cross_blank_line_continuation_shrinks_footnote_def() {
+        let old = "前文\n\n[^1]: first\n\n    more\n\n尾\n";
+        let start = old.find("    more\n").unwrap();
+        let end = start + "    more\n".len();
+        let new = format!("{}{}", &old[..start], &old[end..]);
+        assert_matches_full(old, &new, start..end);
     }
 
     // ---------------- HTML 块的增量重解析（D88） ----------------

@@ -96,11 +96,13 @@ fn render_blocks(
 /// 渲染单个块。
 fn render_block(source: &str, block: &Block, depth: usize, out: &mut Vec<BodyContent<'static>>) {
     match &block.kind {
-        // 脚注定义（D35 ④）与普通段落渲染相同：标签与正文都是纯文本
-        // （docx-rs 1.1 无上标 API，标签不做上标处理），`[^label]:` 标记由
-        // inline_content 的兜底忽略。
-        BlockKind::Paragraph | BlockKind::FootnoteDef { .. } => {
+        BlockKind::Paragraph => {
             out.push(text_paragraph(source, &block.spans, &BaseStyle::default()));
+        }
+        // 脚注定义（D35/D89）：容器块，头部标签在 spans、正文在子块中。
+        // 单段正文保持单段落输出以兼容既有语义；多块正文按子块展开。
+        BlockKind::FootnoteDef { .. } => {
+            render_footnote_def_docx(source, block, depth, out);
         }
         BlockKind::Heading { level } => out.push(heading_paragraph(source, &block.spans, *level)),
         BlockKind::ThematicBreak => out.push(thematic_break_paragraph()),
@@ -331,6 +333,64 @@ fn render_list_item(
     }
     prepend_prefix(&mut inner, &prefix);
     out.extend(inner);
+}
+
+/// 渲染脚注定义块到 DOCX（D35/D89）。
+fn render_footnote_def_docx(
+    source: &str,
+    block: &Block,
+    depth: usize,
+    out: &mut Vec<BodyContent<'static>>,
+) {
+    let base = BaseStyle::default();
+    let mut children = block.children.iter();
+    let Some(first) = children.next() else {
+        // 无正文：仅输出头部可见内容（标签）。
+        out.push(BodyContent::Paragraph(Paragraph {
+            property: ParagraphProperty::default(),
+            content: footnote_head_inline_docx(source, block, &base),
+        }));
+        return;
+    };
+
+    if matches!(first.kind, BlockKind::Paragraph) {
+        let mut content = footnote_head_inline_docx(source, block, &base);
+        content.extend(inline_content(source, &first.spans, &base));
+        out.push(BodyContent::Paragraph(Paragraph {
+            property: ParagraphProperty::default(),
+            content,
+        }));
+        for child in children {
+            render_block(source, child, depth, out);
+        }
+    } else {
+        out.push(BodyContent::Paragraph(Paragraph {
+            property: ParagraphProperty::default(),
+            content: footnote_head_inline_docx(source, block, &base),
+        }));
+        render_block(source, first, depth, out);
+        for child in children {
+            render_block(source, child, depth, out);
+        }
+    }
+}
+
+/// 提取脚注定义头部标签的 DOCX 行内内容（纯文本，隐藏 `[^`/`]:` 标记）。
+fn footnote_head_inline_docx(
+    source: &str,
+    block: &Block,
+    base: &BaseStyle,
+) -> Vec<ParagraphContent<'static>> {
+    for sp in &block.spans {
+        if sp.kind == SpanKind::Text && sp.role == SpanRole::FootnoteRef {
+            let style = InlineStyle::default();
+            return vec![text_run(
+                &source[sp.range.clone()],
+                run_property(base, &style, false),
+            )];
+        }
+    }
+    Vec::new()
 }
 
 /// 在首个段落开头插入一个文本 run（用于列表前缀）；无段落则忽略。
@@ -919,6 +979,22 @@ mod tests {
         assert_eq!(texts[0], "见1与2。");
         assert_eq!(texts[1], "1 B");
         assert_eq!(texts[2], "2 A");
+    }
+
+    #[test]
+    fn docx_multiparagraph_footnote_def_renders_body_blocks() {
+        // D89：多段脚注定义归集到文末后按子块展开，编号与正文保持可见。
+        let out = render("见[^a]\n\n[^a]: first\n\n    second\n");
+        let texts: Vec<String> = out
+            .iter()
+            .map(|b| match b {
+                BodyContent::Paragraph(p) => paragraph_text(p),
+                BodyContent::Table(_) => String::new(),
+            })
+            .collect();
+        assert_eq!(texts[0], "见1");
+        assert_eq!(texts[1], "1 first");
+        assert_eq!(texts[2], "second");
     }
 
     // ---------- HTML 块（D88）：纯文本段落原文降级 ----------

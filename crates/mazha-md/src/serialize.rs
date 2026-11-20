@@ -149,33 +149,157 @@ fn block_to_md(source: &str, b: &Block, prefix: &str) -> String {
     }
 }
 
-/// 拼回脚注定义块的 Markdown（D35 ②）：`[^label]:` 整体回填，正文只取 `]:`
-/// 标记之后的片段（正文里的软换行渲染为 `\n`，由 [`prefix_lines`] 逐行补容器前缀）。
+/// 拼回脚注定义块的 Markdown（D35/D89）。
 ///
-/// 解析侧对续行剥离**恰好 4 空格**缩进，这里对称补回；多余缩进会留在可见文本里，
-/// 因此任意缩进都能逐字节往返。
+/// `FootnoteDef` 为容器块：头部 `[^label]:` 保留在本块 spans 中，定义体由子块承载。
+/// 首个子块的首行与头部同行；定义体内其余行统一补 4 空格定义缩进（与扫描侧“剥离
+/// 4 空格后解析子块”对称）。子块间优先保留源码间隙以维持字节级 round-trip（如定义
+/// 内“归属定义”的空行），缺失间隙时回退到规范的 `    \n` 分隔。
 fn footnote_def_to_md(source: &str, b: &Block, label: &str, prefix: &str) -> String {
-    // 找到 `]:` 标记（脚注标记角色中以 `]` 开头的那个），正文从其下一片段开始
-    let body_from = b
-        .spans
-        .iter()
-        .position(|sp| {
-            sp.kind == SpanKind::Marker
-                && sp.role == SpanRole::FootnoteMarker
-                && source.as_bytes().get(sp.range.start) == Some(&b']')
-        })
-        .map_or(b.spans.len(), |p| p + 1);
-    let body = spans_to_inline_md(source, &b.spans[body_from..]);
-    let mut s = format!("[^{label}]:");
-    for (k, line) in body.split('\n').enumerate() {
-        if k > 0 {
-            // 续行补回解析侧剥离的 4 空格缩进（见 FN_CONT_INDENT）
-            s.push_str("\n    ");
-        }
-        s.push_str(line);
+    if b.children.is_empty() {
+        let head = footnote_head_text(source, b, label);
+        return prefix_lines(&format!("{head}\n"), prefix);
     }
-    s.push('\n');
+
+    let body_start = footnote_body_start(b);
+    let head_start = b.spans.first().map_or(b.range.start, |sp| sp.range.start);
+    let head = &source[head_start.min(b.range.end)..body_start.min(b.range.end)];
+    let mut s = String::new();
+    s.push_str(head);
+
+    for (idx, child) in b.children.iter().enumerate() {
+        if idx == 0 {
+            let first_md = block_to_md(source, child, "");
+            if let Some(stripped) =
+                strip_first_line_prefix_from_block_md(source, child, body_start, &first_md)
+            {
+                append_footnote_body_chunk(&mut s, &stripped, false);
+            } else {
+                // 兜底：大多数情况下 child 渲染首行即正文（`head` 已覆盖到 body_start）。
+                append_footnote_body_chunk(&mut s, &first_md, false);
+            }
+            continue;
+        }
+
+        let prev_end = b.children[idx - 1].range.end.min(b.range.end);
+        let child_start = child.range.start.min(b.range.end);
+        if prev_end < child_start
+            && source.is_char_boundary(prev_end)
+            && source.is_char_boundary(child_start)
+        {
+            // 保留源码间隙（可能包含归属定义的空行）。间隙来自源文本，可能已带外层
+            // 容器前缀（如引用 `> `）；先剥离外层 prefix，避免最终 prefix_lines 重复叠加。
+            let gap = &source[prev_end..child_start];
+            let gap = if s.ends_with('\n') && gap.starts_with('\n') {
+                &gap[1..]
+            } else {
+                gap
+            };
+            push_unprefixed_gap(&mut s, gap, prefix);
+        } else {
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("    \n");
+        }
+
+        let child_md = block_to_md(source, child, "    ");
+        s.push_str(&child_md);
+    }
+
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
     prefix_lines(&s, prefix)
+}
+
+/// 将一段脚注正文追加到 `s`：首行直接追加，其余行补 4 空格定义缩进。
+///
+/// `all_indented=true` 时连首行也补缩进（用于非首子块且无源码间隙可复用的场景，
+/// 当前主要保留为通用能力；首子块应传 `false`）。
+fn append_footnote_body_chunk(s: &mut String, chunk: &str, all_indented: bool) {
+    let mut lines = chunk.split_inclusive('\n');
+    if let Some(line0) = lines.next() {
+        if all_indented {
+            s.push_str("    ");
+        }
+        s.push_str(line0);
+        for line in lines {
+            s.push_str("    ");
+            s.push_str(line);
+        }
+    } else if all_indented {
+        s.push_str("    \n");
+    } else {
+        s.push('\n');
+    }
+}
+
+/// 将源码间隙按“未加外层 prefix”的形式追加到缓冲区。
+///
+/// `footnote_def_to_md` 最终会对整体结果统一调用 `prefix_lines(..., prefix)`；
+/// 若直接拼入已带外层容器前缀的源码间隙，会导致双重前缀（如引用内空行变成 `> >`）。
+fn push_unprefixed_gap(out: &mut String, gap: &str, prefix: &str) {
+    if prefix.is_empty() {
+        out.push_str(gap);
+        return;
+    }
+    let trimmed = prefix.trim_end_matches(' ');
+    for line in gap.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            out.push_str(rest);
+        } else if !trimmed.is_empty() && line == format!("{trimmed}\n") {
+            out.push('\n');
+        } else if !trimmed.is_empty() {
+            if let Some(rest) = line.strip_prefix(trimmed) {
+                out.push_str(rest);
+            } else {
+                out.push_str(line);
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+}
+
+/// 获取脚注定义头部文本（`[^label]:`，不含正文起始空格；空格若存在则属于正文）。
+fn footnote_head_text(source: &str, b: &Block, label: &str) -> String {
+    let start = b.spans.first().map_or(b.range.start, |sp| sp.range.start);
+    let end = footnote_body_start(b);
+    if end <= b.range.end && end >= start && start <= source.len() && end <= source.len() {
+        source[start..end].to_string()
+    } else {
+        format!("[^{label}]:")
+    }
+}
+
+/// 定义体正文起点（`]:` 之后；若有分隔空格则位于空格之后）。
+fn footnote_body_start(b: &Block) -> usize {
+    b.spans
+        .iter()
+        .rfind(|sp| sp.kind == SpanKind::Marker && sp.role == SpanRole::FootnoteMarker)
+        .map_or(b.range.start, |sp| sp.range.end)
+}
+
+/// 首个子块序列化结果通常以其块起始范围对应的源码内容开头；脚注定义首行中，
+/// 块起始到 `body_start` 之间的内容已由头部输出，这里裁掉该前缀对应的首行前缀。
+fn strip_first_line_prefix_from_block_md(
+    source: &str,
+    child: &Block,
+    body_start: usize,
+    rendered: &str,
+) -> Option<String> {
+    if body_start <= child.range.start || body_start > child.range.end {
+        return None;
+    }
+    let raw_prefix = source.get(child.range.start..body_start)?;
+    if let Some(rest) = rendered.strip_prefix(raw_prefix) {
+        return Some(rest.to_string());
+    }
+    if child.range.start == body_start {
+        return Some(rendered.to_string());
+    }
+    None
 }
 
 /// 拼回 HTML 块的 Markdown（D88）：内容按原文逐行保留（已剥离容器前缀），

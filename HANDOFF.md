@@ -4,9 +4,9 @@
 > 单一事实来源是 `SPEC.md`（接口契约 §6、决策 §14、变更记录 §15）；本文件只做「当前进度 / 下一步」的归总，不代替 SPEC。
 
 - 最近更新：2026-11-20
-- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模/**CommonMark 类型 1–5 HTML 块（D88）**）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + **文件树层级化（目录展开折叠/目录内新建，D70）** + **文件树拖拽移动/新建文件夹（D71）** + **展开状态持久化（D72）** + **拖拽落点高亮/跨应用拖拽（D73）** + **入站外部拖拽（从 Finder 拖入，D74）** + **侧栏标题固定（D75）** + **数学公式真实排版 RaTeX（D76，块级公式居左/点击编辑/无边框/编辑态显 TeX，行内不重叠）** + **Mermaid 图表真实渲染（D77，R4 第二步，mermaid-rs → SVG → GPUI 栅格化）** + **全工作区搜索 Cmd+Shift+F（D40）** + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39（**已移至右侧独立面板 D70**）+ 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68 + 脚注双向跳转与导出编号/文末归集 D69，源码模式已修复任务列表/引用块渲染装饰残留，**2026-11-20 继续打磨：源码模式不再折叠表格分隔行/不套用表头额外行高与代码块/引用块 WYSIWYG 内边距，标题与代码块统一行高与缩进**）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用（0.1.108–0.1.112，D82–D87），**2026-11-20 已由用户实机验收通过**（四格式导出、缺图降级、导出不阻塞/状态栏、公式与图表渲染、行内/块级公式尺寸与文件名等）
+- 当前阶段：**Phase 1（共享核心）已完成**；**Phase 2/3 已完成**（桌面只读投影 → WYSIWYG 标记显隐/命中 → IME/编辑命令/多光标 → 文档级坐标 API → 块级 widget 渲染 → 表格增删行列/代码高亮/软换行/剪贴板/视觉行移动/查找替换/公式与图表/脚注/图片本地/远程/data/协议相对渲染/内联 HTML 标签与颜色/HTML 音视频建模/**CommonMark 类型 1–5 HTML 块（D88）** + **脚注多段落定义/容器体（D89，lazy continuation 排除）**）；**Phase 4 桌面 MVP 主体达成**（文件管理打开/保存/新建/重命名/删除/移动 + **文件树层级化（目录展开折叠/目录内新建，D70）** + **文件树拖拽移动/新建文件夹（D71）** + **展开状态持久化（D72）** + **拖拽落点高亮/跨应用拖拽（D73）** + **入站外部拖拽（从 Finder 拖入，D74）** + **侧栏标题固定（D75）** + **数学公式真实排版 RaTeX（D76，块级公式居左/点击编辑/无边框/编辑态显 TeX，行内不重叠）** + **Mermaid 图表真实渲染（D77，R4 第二步，mermaid-rs → SVG → GPUI 栅格化）** + **全工作区搜索 Cmd+Shift+F（D40）** + 多标签页 D37 + 命令面板 D38 + 大纲/目录导航 D39（**已移至右侧独立面板 D70**）+ 文本选区 + 浅灰选中/标签关闭/底部状态栏 D59 + macOS Dock 图标 D60 + macOS `.app` 打包 D61 + 外观设置 D62 + macOS 原生应用菜单 D63 + AVPlayer 音视频预览 D64 + 视图模式 D68 + 脚注双向跳转与导出编号/文末归集 D69，源码模式已修复任务列表/引用块渲染装饰残留，**2026-11-20 继续打磨：源码模式不再折叠表格分隔行/不套用表头额外行高与代码块/引用块 WYSIWYG 内边距，标题与代码块统一行高与缩进**）；**导出线**并行：HTML / PDF / DOCX / EPUB 均可用（0.1.108–0.1.112，D82–D87），**2026-11-20 已由用户实机验收通过**（四格式导出、缺图降级、导出不阻塞/状态栏、公式与图表渲染、行内/块级公式尺寸与文件名等）
 - 仓库：`git@github.com:RandyWei/mazha-notes.git`（私有，发版后转公开）；分支 `main`
-- 当前版本：**0.1.113**（细节见 SPEC §15 变更记录；本节只列归总）
+- 当前版本：**0.1.114**（细节见 SPEC §15 变更记录；本节只列归总）
 
 ## 门禁（提交前必须全绿）
 
@@ -26,11 +26,11 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 状态 | 能力面（要点） | 待办 |
 |-------|------|----------------|------|
-| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/块缓存+投影缓存**双增量**维护/`apply_and_sync`）、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`WidgetKind::{Image,Media}`/`RunStyle` + **块级 widget** `BlockWidget{source_range,line_range,kind}`、`BlockWidgetKind::{Code{lang,fenced},Table{align},Rule,Math,Chart{lang},Image{alt,dest}}` + `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标**（`DocPos`/`LineDisplayRange`/`source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`selection_display_ranges`）、显示列↔字节换算（软换行用）、`commands`、`IntentMapper`、`table::edit_table`、`highlight::Highlighter`（syntect）、`find::{find_all,replace_all,replace_all_edit}`、导航（行范围/CJK 词范围）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接 | `DocId` |
-| `mazha-md` | ✅ Phase 1 完成（方言全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏/缩进代码、引用、列表/任务、GFM 表格、Callout、Front-matter、**`$$…$$` 显示公式**、**`[^label]: body` 脚注定义**、**CommonMark 类型 1–5 HTML 块**，D88）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/wiki-link/tags/`$…$` 行内公式/**`[^label]` 脚注引用**/转义/**内联 HTML 标签与 `<font>` 颜色/`<br>` 剥离**，D56；**单行 `<video>`/`<audio>` 媒体元素**，D64）、`serialize_source`/`to_md`（前缀穿线，逐字节往返 + 幂等）、`reparse`（脏块增量 + 裁切点安全校验，未闭合公式/HTML 块视为非安全裁切）、`FootnoteIndex`（引用首次出现顺序编号 + 引用/定义区间查询，D69）；列表项续行只剥标记宽度缩进（D81 修正，嵌套脚注定义续行不再脱离定义块） | 惰性续行、多段落脚注定义（见 SPEC §9.1/§15） |
+| `mazha-core` | ✅ Phase 1 完成 | `Document`（rope/编辑/undo-redo/块缓存+投影缓存**双增量**维护/`apply_and_sync`）、`OffsetMap`、`Projection`（`BlockStyle`/`TextRun`/`WidgetKind::{Image,Media}`/`RunStyle` + **块级 widget** `BlockWidget{source_range,line_range,kind}`、`BlockWidgetKind::{Code{lang,fenced},Table{align},Rule,Math,Chart{lang},Image{alt,dest}}` + `block_widget_at`/`block_widget_on_line`）、**文档级跨行坐标**（`DocPos`/`LineDisplayRange`/`source_to_doc_pos`/`doc_pos_to_source`/`line_of_source`/`selection_display_ranges`）、显示列↔字节换算（软换行用）、`commands`、`IntentMapper`、`table::edit_table`、`highlight::Highlighter`（syntect）、`find::{find_all,replace_all,replace_all_edit}`、导航（行范围/CJK 词范围）、`Workspace`（open/save/create/remove/rename/list/find）、`crdt` 桥接；投影与 `footnote_index()` 兼容 D89 容器 `FootnoteDef` | `DocId` |
+| `mazha-md` | ✅ Phase 1 完成（方言全齐） | `parse`（ATX/Setext 标题、段落、分割线、围栏/缩进代码、引用、列表/任务、GFM 表格、Callout、Front-matter、**`$$…$$` 显示公式**、**`[^label]: body` 脚注定义**、**CommonMark 类型 1–5 HTML 块**，D88）、`parse_inline`（强调/粗体/删除线/行内代码/链接/图片/自动链接/wiki-link/tags/`$…$` 行内公式/**`[^label]` 脚注引用**/转义/**内联 HTML 标签与 `<font>` 颜色/`<br>` 剥离**，D56；**单行 `<video>`/`<audio>` 媒体元素**，D64）、`serialize_source`/`to_md`（前缀穿线，逐字节往返 + 幂等）、`reparse`（脏块增量 + 裁切点安全校验，未闭合公式/HTML 块与可跨空行续接的 `FootnoteDef` 视为非安全裁切）、`FootnoteIndex`（引用首次出现顺序编号 + 引用/定义区间查询，D69）；**脚注定义多段/多块容器体**（D89）：`FootnoteDef` 为容器、续行缩进 ≥4 剥离后解析子块、空行仅在后续仍有非空续行时归属定义、首行文本可与多块体并存，保持逐字节往返与幂等；列表项续行只剥标记宽度缩进（D81 修正，嵌套脚注定义续行不再脱离定义块） | 惰性续行（lazy continuation，D89 明确排除） |
 | `mazha-store` | ✅ MVP | `StorageProvider`（同步，D24）、`FileSystemProvider`、`DocPath`、`Entry`、`StoreError` | 文件监听、异步/流式（Phase 5）、云端/插件 Provider |
 | `mazha-crdt` | ✅ MVP | `CrdtDoc`（`Y.Text`，字符↔字节）、insert/delete/replace/push、状态向量 + 增量更新（Yjs v1）、`apply_update`、`fork`、`snapshot`、并发收敛、落盘（`save_crdt`/`load_crdt`） | 多文档名册 |
-| `mazha-export` | ✅ HTML + PDF + DOCX + EPUB + 主题/模板 + 缺图降级（D82） | `to_html*`（完整外壳 + 默认 CSS + 主题）、`to_typst*` + `to_pdf*`（`ExportWorld` 实现 `typst::World` → `typst::compile` + `typst_pdf`；`PdfDocument{bytes,warnings,pages}`；真实文档回归 `tests/pdf_real_doc.rs`）、`to_docx*`（docx-rs 1.1 直出 OOXML）、`to_epub*`（Zip + XHTML，EPUB 3，输出确定）、`Theme`/`Template`；**脚注导出前规整**（`footnotes::prepare`：按引用顺序编号 + **所有**定义含嵌套归集文末并剥容器前缀，HTML/EPUB 带 `<sup class="fnref">` 唯一锚点 + `<section class="footnotes"><ol>` + 定义侧 `↩` 回链，Typst/DOCX 纯文本编号，D69/D81）；块/行内特性与编辑器同源（含公式、脚注；媒体在 HTML/EPUB 保留可播放标签，PDF/DOCX 输出占位）；**PDF 缺图降级**（`pdf_image_path`/`replace_unresolvable_images` 纯函数，D82：缺文件/远程/data/绝对路径图片在独立副本里替换为占位文字，不再阻断 Typst 编译；`PdfExportOptions::base_dir` 由桌面传当前文档目录解析真实图片）；**渲染资产桥接（D84）**：`collect_render_requests`/`prepare_renderables` 纯函数 + `RenderAssets`/`AssetTarget`，`export_with_assets`/`to_pdf_with_assets` 经 `ExportWorld` 内存虚拟文件把桌面渲染的 SVG 嵌入 PDF，HTML/EPUB 用 data URI，DOCX 维持字面；**行内公式区间修正（D85）**：`inline_math_range` 纯函数仅合并紧邻、首尾相接、长度恰为 1 的前后 `MathMarker`，使替换区间覆盖整对 `$…$`，键仍为纯公式体（与桌面 RaTeX 渲染键一致），修复导出后图片语法被 `$` 包裹而回退成公式字面；**行内公式尺寸与不换行（D86）**：`RenderRequest.inline` 区分行内/块级，导出副本用保留 alt `__mz_inline_math__` 标记行内公式，HTML `img` 加 `max-height:1.1em;vertical-align:-0.15em`、Typst `#image` 加 `height: 1.1em`（alt 还原为「公式」），按行高缩放且不挤换行；**块级公式尺寸（D87）**：新增块级专用保留 alt `__mz_block_math__`，HTML/EPUB 输出 `max-height:2em`、Typst 输出 `height: 2em`（约行内 1.1em 两倍，仍小于 32px 固有尺寸且大于正文，矢量缩放清晰），alt 还原为「公式」；mermaid 图表与普通图片保持固有尺寸 | 字体子集（Web，Phase 7） |
+| `mazha-export` | ✅ HTML + PDF + DOCX + EPUB + 主题/模板 + 缺图降级（D82） | `to_html*`（完整外壳 + 默认 CSS + 主题）、`to_typst*` + `to_pdf*`（`ExportWorld` 实现 `typst::World` → `typst::compile` + `typst_pdf`；`PdfDocument{bytes,warnings,pages}`；真实文档回归 `tests/pdf_real_doc.rs`）、`to_docx*`（docx-rs 1.1 直出 OOXML）、`to_epub*`（Zip + XHTML，EPUB 3，输出确定）、`Theme`/`Template`；**脚注导出前规整**（`footnotes::prepare`：按引用顺序编号 + **所有**定义含嵌套归集文末并剥容器前缀，HTML/EPUB 带 `<sup class="fnref">` 唯一锚点 + `<section class="footnotes"><ol>` + 定义侧 `↩` 回链，Typst/DOCX 纯文本编号，D69/D81；D89 多块定义体按整块归集并从子块渲染）；块/行内特性与编辑器同源（含公式、脚注；媒体在 HTML/EPUB 保留可播放标签，PDF/DOCX 输出占位）；**PDF 缺图降级**（`pdf_image_path`/`replace_unresolvable_images` 纯函数，D82：缺文件/远程/data/绝对路径图片在独立副本里替换为占位文字，不再阻断 Typst 编译；`PdfExportOptions::base_dir` 由桌面传当前文档目录解析真实图片）；**渲染资产桥接（D84）**：`collect_render_requests`/`prepare_renderables` 纯函数 + `RenderAssets`/`AssetTarget`，`export_with_assets`/`to_pdf_with_assets` 经 `ExportWorld` 内存虚拟文件把桌面渲染的 SVG 嵌入 PDF，HTML/EPUB 用 data URI，DOCX 维持字面；**行内公式区间修正（D85）**：`inline_math_range` 纯函数仅合并紧邻、首尾相接、长度恰为 1 的前后 `MathMarker`，使替换区间覆盖整对 `$…$`，键仍为纯公式体（与桌面 RaTeX 渲染键一致），修复导出后图片语法被 `$` 包裹而回退成公式字面；**行内公式尺寸与不换行（D86）**：`RenderRequest.inline` 区分行内/块级，导出副本用保留 alt `__mz_inline_math__` 标记行内公式，HTML `img` 加 `max-height:1.1em;vertical-align:-0.15em`、Typst `#image` 加 `height: 1.1em`（alt 还原为「公式」），按行高缩放且不挤换行；**块级公式尺寸（D87）**：新增块级专用保留 alt `__mz_block_math__`，HTML/EPUB 输出 `max-height:2em`、Typst 输出 `height: 2em`（约行内 1.1em 两倍，仍小于 32px 固有尺寸且大于正文，矢量缩放清晰），alt 还原为「公式」；mermaid 图表与普通图片保持固有尺寸 | 字体子集（Web，Phase 7） |
 | `mazha-plugin` | ⬜ 占位 | — | WASM 宿主、能力授权（Phase 5） |
 | `mazha-ffi` | ⬜ 占位 | — | UniFFI 绑定（Phase 6） |
 | `mazha-wasm` | ⬜ 占位 | — | Web 绑定（Phase 7） |
@@ -48,12 +48,12 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 
 | crate | 数量 |
 |-------|------|
-| `mazha-core` | 204 |
-| `mazha-md` | 198 |
-| `mazha-export` | 181 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
+| `mazha-core` | 205 |
+| `mazha-md` | 206 |
+| `mazha-export` | 186 单测 + 3 集成（`tests/pdf_real_doc.rs`） |
 | `mazha-crdt` | 11 |
-| 合计 | **612**（其余含 store 与占位 crate 测试） |
-| `platforms/desktop`（独立 workspace） | 92（不计入上面的 581） |
+| 合计 | **626**（其余含 store 与占位 crate 测试） |
+| `platforms/desktop`（独立 workspace） | 92（不计入上面的 626） |
 
 ## 关键决策索引（全文见 SPEC §14）
 
@@ -118,7 +118,7 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 1. **Phase 4 余项**：**文件树层级化（D70）、拖拽移动/新建文件夹（D71）、展开状态持久化（D72）、拖拽落点高亮/跨应用拖拽（D73）、全工作区搜索 `Cmd+Shift+F`（D40）均已完成**；**当前文档查找/替换** `Cmd+F` 已于 0.1.49 实现。跨应用拖拽（出站）已于 2026-11-18 实机验收通过；**入站**外部拖拽（从 Finder 拖入，D74）亦已实机验收通过。专注/打字机/源码（代码）模式已于 0.1.90 落地（D68），**0.1.104 完成首轮打磨（D78）**：专注改段落粒度、打字机改中心带。**2026-11-20 源码模式细节打磨**：修复表格分隔行在源码模式下被折叠隐藏、表头额外行高残留，以及代码块/引用块 WYSIWYG 专用文本内边距与换行宽度、标题放大行高泄漏到源码视图的问题（`platforms/desktop/src/main.rs`）；`platforms/desktop` fmt/clippy/test/build 全绿（92 项）。剩余可继续实机找茬其它交互细节。
 2. ~~**中文斜体合成仍不完美**（D43 遗留）~~ **已于 0.1.105 完成首轮优化（D79），0.1.106 完成抗锯齿根治（D80）**：轮廓缓存/原点校正（D79）保留为回退；主路径改为 CoreText 直接栅格化 12° 剪切字形出 DPR 位图（`oblique::cached_glyph` + `paint_image`），消除 gpui 路径仅 ≤4× MSAA、无灰阶 AA/字干加粗造成的「发虚」；新增 7 条桌面单测（剪切墨迹范围/整数设备像素几何/无效几何回退/DPR 放置/位图缓存键/灰阶 AA 覆盖/顶部右倾）。**剩余风险**：CoreText 对剪切矩阵可能关闭部分 hinting，与原生直立字面仍不可能逐像素一致；`CJK_FALLBACKS` 固定顺序可能与 CoreText 级联字面不同；本机截图已能取到窗口（暗色主题下斜体 CJK 行有 181 级灰阶、ASCII 目测顶部右倾且无重影），**已由用户实机验收通过**（Metal 自定义着色器仍需重写 gpui 场景管线，风险高不选）。
 3. **渲染层深化**（R4）：**数学排版已于 0.1.98 完成并在 0.1.99/0.1.100/0.1.101 细化块级公式居左/点击编辑/去装饰/编辑态显 TeX、行内不重叠（D76：`ratex-gpui` 块级/行内公式真实栅格化，已实机截图验收）**；**Mermaid 图表真实渲染已于 0.1.102 完成并在 0.1.103 按实机反馈细化（D77：`mermaid-rs-renderer` → SVG → GPUI 栅格化，替换块级占位面板；透明背景去弱底/描边、内置示例改无回边分叉；已据实机反馈修正待复验）**；R4 剩余为**渲染质量跟踪**（mermaid-rs 早期，观感未完全对齐 mermaid-cli；回边流程图菱形端口/标签偏离连线属上游缺陷、应用层无法改布局算法，用户文档含回边仍会复现，失败已回退占位）；脚注点击跳转/自动编号/文末归集已于 0.1.91 完成（D69）；**导出反向回链与嵌套定义归集已于 0.1.107 完成（D81）**，剩余为多引用逐个回跳/复杂容器前缀等打磨；软换行**横向滚动**（D33 已知限制，0.1.107 评估为高风险坐标体系重构未选，见 D81）。
-4. §9.1 剩余非 MVP 项：惰性续行、多段落脚注定义。
+4. §9.1 剩余非 MVP 项：惰性续行（lazy continuation，D89 明确排除）；**多段落脚注定义已于 0.1.114 落地（D89）**。
 5. `mazha-export`：字体子集（Web，Phase 7）；`mazha-crdt`：多文档名册；`mazha-store`：文件监听（Phase 5）。
 6. **导出修复（D82，0.1.108）已实机验收通过**（2026-11-20，用户确认）：菜单/命令面板 HTML/PDF/DOCX/EPUB 四格式入口与 PDF 缺图降级可用；已知限制不变（远程/data/绝对路径图片在 PDF 中退化为占位，HTML/EPUB 不打包外部资源）。
 7. **导出体验（D83/D84，0.1.109）已实机验收通过**（2026-11-20，用户确认）：导出不阻塞窗口 + 底部状态栏反馈正常，渲染后公式/图表可进入导出文件，非法公式/图表 DSL 保留原字面且不中断导出。
@@ -126,11 +126,12 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 9. **导出图片尺寸/换行优化（D86，0.1.111）已实机验收通过**（2026-11-20，用户确认）：行内公式高度贴近正文且不换行，块级公式/图表保持独占显示尺寸；DOCX 字面仍为已知限制。
 10. **块级公式缩小与导出默认文件名（D87，0.1.112）已实机验收通过**（2026-11-20，用户确认）：块级公式缩小后可读、图表与行内公式尺寸符合预期，导出默认文件名跟随 Markdown 主干。
 
-## 提交历史（近期，共 158 条）
+## 提交历史（近期，共 159 条）
 
 ```
-（待回填） feat(md/export): 支持 CommonMark 类型 1–5 HTML 块并同步文档（0.1.113，D88）
-0d2bd4f fix(desktop): 源码模式排版与表格分隔行显示打磨
+（待提交） feat(md/export/core): 支持脚注多段落定义容器体并同步文档（0.1.114，D89）
+57b5d09 feat(md/export): 支持 CommonMark 类型 1–5 HTML 块并同步文档（0.1.113，D88）
+42a7aa6 fix(desktop): 源码模式排版与表格分隔行显示打磨
 d8a24ad fix(export): 块级公式导出缩小与默认文件名跟随 Markdown 主干（0.1.112，D87）
 325de1c fix(export): 导出图片尺寸合理化与 PDF 行内图片不换行（0.1.111，D86）
 66af795 fix(export): 修复导出行内公式显示成 markdown 图片源码（0.1.110，D85）
