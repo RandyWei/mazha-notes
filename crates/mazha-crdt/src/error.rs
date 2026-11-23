@@ -26,4 +26,16 @@ pub enum CrdtError {
     /// 文本规模超出 yrs 的 `u32` 索引范围。
     #[error("文本过大，超出 yrs u32 索引范围：{0}")]
     TooLarge(usize),
+
+    /// 文档 ID 非法：必须非空且不含控制字符。
+    #[error("文档 ID 非法（必须非空且不含控制字符）：{0}")]
+    InvalidDocumentId(String),
+
+    /// 创建文档时 ID 已被占用。
+    #[error("文档已存在：{0}")]
+    DocumentAlreadyExists(String),
+
+    /// 操作目标文档不存在。
+    #[error("文档不存在：{0}")]
+    DocumentNotFound(String),
 }

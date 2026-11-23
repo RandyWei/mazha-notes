@@ -2,6 +2,7 @@
 //!
 //! 基于 [yrs](https://crates.io/crates/yrs) 的多端同步层：在 `Y.Text` 中保存
 //! Markdown 源文本，产出/消费标准 Yjs 更新帧，支持状态向量与合并。
+//! [`CrdtRoster`] 在此之上按稳定 ID 管理多篇文档，并以 ID → Yjs v1 帧的映射提供整册同步。
 //! 见 `SPEC.md` §6.5。
 //!
 //! ## 索引单位
@@ -9,8 +10,10 @@
 //! 内部按 **UTF-8 字节**计量。所有跨边界处用 [`char_to_byte`] 转换，避免中文被切坏。
 
 mod error;
+mod roster;
 
 pub use error::{CrdtError, CrdtResult};
+pub use roster::{CrdtRoster, DocId};
 
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
