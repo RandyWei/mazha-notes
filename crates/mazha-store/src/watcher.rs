@@ -4,7 +4,7 @@
 
 use crate::error::StoreResult;
 use crate::path::DocPath;
-use notify::event::{CreateKind, Event, EventKind, RemoveKind, RenameMode};
+use notify::event::{CreateKind, Event, EventKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{RecursiveMode, Watcher as NotifyWatcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 /// 去重窗口：同一路径在该时长内的重复修改只上报首次（D91）。
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(150);
+
+/// 重命名配对窗口（D93）：macOS FSEvents 即时模式把一次改名拆成前后两条
+/// `Modify(Name(Any))`，间隔超过此值就不再配对，各自退回普通修改事件。
+const RENAME_PAIR_WINDOW: Duration = Duration::from_millis(250);
 
 /// 规范化事件种类（对应 [`WatchEvent`] 的四个变体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +131,8 @@ fn map_single_event(root: &Path, path: &Path, kind: WatchEventKind) -> Option<Wa
 /// - `Modify::{Data,Metadata,Any,…}` 与 `EventKind::Any` → [`WatchEvent::Modified`]；
 /// - `Modify::Name(Both)` → [`WatchEvent::Renamed`]（旧→新）；`From`/`To` 因拿不到成对路径，
 ///   分别降级为 Removed / Created，不跨事件猜测配对（D91）；
+/// - `Modify::Name(Any)`（macOS FSEvents 即时模式）先按 [`WatchEvent::Modified`] 规范化，
+///   由监听线程的 [`RenamePairer`] 在短窗口内把前后两条配成 [`WatchEvent::Renamed`]（D93）；
 /// - `Access`/`Other`、目录、非 Markdown、非 UTF-8、工作区外路径被忽略。
 pub fn normalize_watch_events(root: &Path, event: &Event) -> Vec<WatchEvent> {
     match event.kind {
@@ -159,8 +165,8 @@ pub fn normalize_watch_events(root: &Path, event: &Event) -> Vec<WatchEvent> {
             .filter_map(|p| map_single_event(root, p, WatchEventKind::Create))
             .collect(),
         // 显式目录事件忽略（即使目录名带 .md 后缀也不能当成文档）；
-        // Access/Other 不表示内容变化。其余 Name 变体（Any/Other）落入下面的
-        // Modify(_) 作为普通修改上报，避免漏掉可能的重命名。
+        // Access/Other 不表示内容变化。Name(Any) 落入下面的 Modify(_) 作为普通修改，
+        // 供 RenamePairer 配对（D93）；Name(Other) 同样按修改上报，避免漏报。
         EventKind::Create(CreateKind::Folder)
         | EventKind::Remove(RemoveKind::Folder)
         | EventKind::Access(_)
@@ -218,6 +224,92 @@ impl WatchCoalescer {
     }
 }
 
+/// FSEvents 拆分重命名配对器（D93）。
+///
+/// macOS 即时模式下一次改名会给出前后两条 `Modify(Name(Any))`（先旧路径、后新路径），
+/// 单条看无法区分「改名」与「内容修改」。这里在短窗口内把两条名字事件合并成一条
+/// [`WatchEvent::Renamed`]；配对失败（超时/同路径）时挂起事件退回普通 `Modified`，
+/// 保证不漏报。仅作用于名字事件，其它平台给出的 `Both`/`From`/`To` 不受影响。
+struct RenamePairer {
+    /// 尚未配对的名字事件（到达时刻 + 路径）。
+    pending: Option<(Instant, DocPath)>,
+    /// 配对窗口。
+    window: Duration,
+}
+
+impl RenamePairer {
+    /// 以给定配对窗口创建配对器。
+    fn new(window: Duration) -> Self {
+        Self {
+            pending: None,
+            window,
+        }
+    }
+
+    /// 接受一条已规范化事件及「是否来自 Name(Any)」标记，返回可继续投递的事件。
+    ///
+    /// 返回事件带原到达时刻，便于下游合并器按真实时间判定折叠窗口。
+    fn push(
+        &mut self,
+        at: Instant,
+        event: WatchEvent,
+        name_change: bool,
+    ) -> Vec<(Instant, WatchEvent)> {
+        // Name(Any) 只会规范化成单路径的 Modified；其它情况按普通事件透传
+        let name_path = if name_change {
+            match &event {
+                WatchEvent::Modified { path } => Some(path.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(path) = name_path {
+            if let Some((prev_at, prev_path)) = self.pending.take() {
+                if at.saturating_duration_since(prev_at) <= self.window && prev_path != path {
+                    // 旧→新配对成功：只上报 Renamed，避免旧路径先被误判成删除/外部修改
+                    return vec![(
+                        prev_at,
+                        WatchEvent::Renamed {
+                            from: prev_path,
+                            to: path,
+                        },
+                    )];
+                }
+                // 超时或同路径：旧事件按普通修改放出，当前事件继续挂起等待下一条
+                let out = vec![(prev_at, WatchEvent::Modified { path: prev_path })];
+                self.pending = Some((at, path));
+                return out;
+            }
+            self.pending = Some((at, path));
+            return Vec::new();
+        }
+        // 挂起期间同路径的尾随事件属于改名前的旧路径，随配对一起丢弃；
+        // 其它路径不受影响，照常透传。
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, pending_path)| event.path() == pending_path)
+        {
+            return Vec::new();
+        }
+        vec![(at, event)]
+    }
+
+    /// 冲刷超时挂起事件（按普通修改放出），由监听线程定时调用。
+    fn flush_expired(&mut self, now: Instant) -> Vec<(Instant, WatchEvent)> {
+        match self.pending.take() {
+            Some((at, path)) if now.saturating_duration_since(at) > self.window => {
+                vec![(at, WatchEvent::Modified { path })]
+            }
+            kept => {
+                self.pending = kept;
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// 纯函数版事件合并：按到达顺序折叠 `window` 内同一路径的重复修改。
 ///
 /// 首次发出的事件优先（例如新建后紧随的写入只保留 `Created`）；删除后的修改、
@@ -272,7 +364,8 @@ impl Drop for NotifyWatchHandle {
 /// # Errors
 /// `notify` 后端创建、注册监听或工作线程启动失败时返回 [`crate::StoreError::Watch`]。
 pub(crate) fn spawn_watch(root: PathBuf, watch_path: &Path) -> StoreResult<Box<dyn WatchHandle>> {
-    let (raw_tx, raw_rx) = mpsc::channel::<(Instant, WatchEvent)>();
+    // 第三个分量标记该事件是否来自 `Modify(Name(Any))`，供 RenamePairer 配对（D93）
+    let (raw_tx, raw_rx) = mpsc::channel::<(Instant, WatchEvent, bool)>();
     let (event_tx, event_rx) = mpsc::sync_channel::<WatchEvent>(256);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
@@ -280,8 +373,14 @@ pub(crate) fn spawn_watch(root: PathBuf, watch_path: &Path) -> StoreResult<Box<d
         // 回调运行在 notify 内部线程：只做纯规范化与时间戳；运行期后端错误不入事件流（D91）
         if let Ok(event) = result {
             let now = Instant::now();
+            // FSEvents 即时模式把改名拆成两条 Name(Any)；打标记交给配对器。
+            // inotify 等后端已给出 Both/From/To，无需配对。
+            let name_change = matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any))
+            );
             for normalized in normalize_watch_events(&root, &event) {
-                if raw_tx.send((now, normalized)).is_err() {
+                if raw_tx.send((now, normalized, name_change)).is_err() {
                     break;
                 }
             }
@@ -299,19 +398,32 @@ pub(crate) fn spawn_watch(root: PathBuf, watch_path: &Path) -> StoreResult<Box<d
             // watcher 随线程存活；线程退出（停机/接收端关闭）即释放 OS watch
             let _watcher = watcher;
             let mut coalescer = WatchCoalescer::new(COALESCE_WINDOW);
+            let mut pairer = RenamePairer::new(RENAME_PAIR_WINDOW);
+            // 配对器输出 → 合并器 → 投递；返回 true 表示接收端已关闭，线程立即退出
+            let mut dispatch = |items: Vec<(Instant, WatchEvent)>| -> bool {
+                for (at, event) in items {
+                    if let Some(emitted) = coalescer.push(at, event)
+                        && send_event(&event_tx, emitted)
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
             loop {
                 // 周期性检查停机信号，避免事件密集时无法响应 drop
                 match stop_rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                while let Ok((at, event)) = raw_rx.try_recv() {
-                    if let Some(emitted) = coalescer.push(at, event) {
-                        // 接收端已 drop 则立即退出，不阻塞停机
-                        if send_event(&event_tx, emitted) {
-                            return;
-                        }
+                while let Ok((at, event, name_change)) = raw_rx.try_recv() {
+                    if dispatch(pairer.push(at, event, name_change)) {
+                        return;
                     }
+                }
+                // 定时冲刷超时挂起的名字事件，避免单次改名只拿到旧路径时漏报
+                if dispatch(pairer.flush_expired(Instant::now())) {
+                    return;
                 }
             }
         })
@@ -469,6 +581,120 @@ mod tests {
             vec![WatchEvent::Created {
                 path: DocPath::new("new.md").unwrap()
             }]
+        );
+    }
+
+    #[test]
+    fn name_any_normalizes_to_modified_for_pairing() {
+        // D93：FSEvents 即时模式的单路径 Name(Any) 先按普通修改规范化，再由配对器合并
+        assert_eq!(
+            normalize_watch_events(
+                Path::new("/ws"),
+                &event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                    &["/ws/old.md"]
+                )
+            ),
+            vec![WatchEvent::Modified {
+                path: DocPath::new("old.md").unwrap()
+            }]
+        );
+    }
+
+    #[test]
+    fn pairs_split_name_changes_into_one_rename() {
+        let base = Instant::now();
+        let mut pairer = RenamePairer::new(RENAME_PAIR_WINDOW);
+        let old = WatchEvent::Modified {
+            path: DocPath::new("dir/old.md").unwrap(),
+        };
+        let new = WatchEvent::Modified {
+            path: DocPath::new("new.md").unwrap(),
+        };
+        // 第一条挂起；第二条在窗口内到达且路径不同 → 合并为 Renamed
+        assert!(pairer.push(base, old, true).is_empty());
+        assert_eq!(
+            pairer.push(base + Duration::from_millis(5), new, true),
+            vec![(
+                base,
+                WatchEvent::Renamed {
+                    from: DocPath::new("dir/old.md").unwrap(),
+                    to: DocPath::new("new.md").unwrap(),
+                }
+            )]
+        );
+        assert!(
+            pairer
+                .flush_expired(base + Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unpaired_name_change_falls_back_to_modified() {
+        let base = Instant::now();
+        let mut pairer = RenamePairer::new(RENAME_PAIR_WINDOW);
+        let old = WatchEvent::Modified {
+            path: DocPath::new("old.md").unwrap(),
+        };
+        assert!(pairer.push(base, old.clone(), true).is_empty());
+        // 窗口内不冲刷；超时后退回普通修改，不漏报
+        assert!(pairer.flush_expired(base + RENAME_PAIR_WINDOW).is_empty());
+        assert_eq!(
+            pairer.flush_expired(base + RENAME_PAIR_WINDOW + Duration::from_millis(1)),
+            vec![(base, old)]
+        );
+    }
+
+    #[test]
+    fn same_path_and_trailing_events_do_not_pair() {
+        let base = Instant::now();
+        let mut pairer = RenamePairer::new(RENAME_PAIR_WINDOW);
+        let old = WatchEvent::Modified {
+            path: DocPath::new("old.md").unwrap(),
+        };
+        let other = WatchEvent::Modified {
+            path: DocPath::new("other.md").unwrap(),
+        };
+        assert!(pairer.push(base, old.clone(), true).is_empty());
+        // 旧路径的尾随事件丢弃；其它路径照常透传
+        assert!(
+            pairer
+                .push(base + Duration::from_millis(1), old.clone(), false)
+                .is_empty()
+        );
+        assert_eq!(
+            pairer.push(base + Duration::from_millis(2), other.clone(), false),
+            vec![(base + Duration::from_millis(2), other)]
+        );
+        // 同一路径的第二条名字事件不配对：旧事件立即按修改放出，新的挂起
+        let later = base + Duration::from_millis(3);
+        assert_eq!(
+            pairer.push(later, old.clone(), true),
+            vec![(base, old.clone())]
+        );
+        assert_eq!(
+            pairer.flush_expired(later + RENAME_PAIR_WINDOW + Duration::from_millis(1)),
+            vec![(later, old)]
+        );
+    }
+
+    #[test]
+    fn name_changes_beyond_window_are_not_paired() {
+        let base = Instant::now();
+        let mut pairer = RenamePairer::new(RENAME_PAIR_WINDOW);
+        let old = WatchEvent::Modified {
+            path: DocPath::new("old.md").unwrap(),
+        };
+        let new = WatchEvent::Modified {
+            path: DocPath::new("new.md").unwrap(),
+        };
+        assert!(pairer.push(base, old.clone(), true).is_empty());
+        let late = base + RENAME_PAIR_WINDOW + Duration::from_millis(1);
+        assert_eq!(pairer.push(late, new.clone(), true), vec![(base, old)]);
+        assert_eq!(
+            pairer.flush_expired(late + RENAME_PAIR_WINDOW + Duration::from_millis(1)),
+            vec![(late, new)]
         );
     }
 

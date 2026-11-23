@@ -38,7 +38,10 @@ use std::ffi::OsStr;
 use std::ops::Range;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use gpui_kit::base::h_flex;
@@ -59,7 +62,9 @@ use mazha_export::{
 };
 use mazha_md::{FootnoteIndex, MediaElement, MediaKind, SpanKind, SpanRole, parse_inline};
 #[allow(unused_imports, dead_code)]
-use mazha_store::{DocPath, Entry, EntryKind, FileSystemProvider};
+use mazha_store::{
+    DocPath, Entry, EntryKind, FileSystemProvider, StorageProvider, WatchEvent, WatchHandle,
+};
 mod media;
 mod oblique;
 mod settings;
@@ -771,6 +776,387 @@ fn footnote_jump(
         ));
     }
     None
+}
+
+// ==================== 外部文件变更（D92，SPEC §11.12）====================
+//
+// 这一组类型与函数全部是**纯数据**：不持有 GPUI 句柄、不做文件 IO，便于无 UI 单测锁定
+// 「回声抑制 / 干净重载 / 脏冲突 / 删除 / 重命名」的判定契约。调用方负责把事件里的
+// 工作区相对 `DocPath` 解析并 canonicalize 成绝对路径、把磁盘文本读好，再传进来。
+
+/// 外部变更种类：修改（含读取失败）或删除。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalChangeKind {
+    /// 文件仍在磁盘上，但内容与保存快照不同（或读取失败）。
+    Modified,
+    /// 文件已在外部删除。
+    Removed,
+}
+
+/// 标签会话态：外部变更横幅的待处理内容（随标签切换迁移，不写 Markdown、不持久化）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalChange {
+    /// 已 canonicalize 的绝对路径，与标签 `path` 用同一套比较规则。
+    path: PathBuf,
+    /// 磁盘文本；`None` 表示删除、读失败或非 UTF-8，此时绝不自动重载。
+    disk_text: Option<String>,
+    /// 变更种类，决定横幅文案与「另存为」是否放行。
+    kind: ExternalChangeKind,
+}
+
+/// D91 事件的绝对路径版本：路径由调用方 `canonicalize` 后填入。
+///
+/// `DocPath` 是工作区相对路径，纯函数不做 IO，因此先在上层完成「root.join + canonicalize」
+/// 再交给这里判定；否则软链/`..` 会让同一文件被当成不同标签。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedWatchEvent {
+    /// 新建文件。
+    Created {
+        /// 已规范化的绝对路径。
+        path: PathBuf,
+    },
+    /// 内容/元数据修改。
+    Modified {
+        /// 已规范化的绝对路径。
+        path: PathBuf,
+    },
+    /// 文件删除。
+    Removed {
+        /// 已规范化的绝对路径。
+        path: PathBuf,
+    },
+    /// 重命名/移动。
+    Renamed {
+        /// 旧路径（已规范化）。
+        from: PathBuf,
+        /// 新路径（已规范化）。
+        to: PathBuf,
+    },
+}
+
+/// 事件分类对一个标签的只读快照（活动标签由调用方用 `self.*` 实时覆盖）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchTabSnapshot {
+    /// 已规范化的绝对路径；`None` 表示未保存标签。
+    path: Option<PathBuf>,
+    /// 当前源文本（用于判定是否脏）。
+    text: String,
+    /// 保存/打开时的磁盘快照（`None` 表示从未保存）。
+    saved_text: Option<String>,
+    /// 该文件此前读取失败而保留的空标签（`Created` 事件按修改处理）。
+    read_failed: bool,
+}
+
+/// 事件作用对象：活动标签的实时状态在 `DocView` 自身，非活动标签在 `tabs[i]`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchTarget {
+    /// 当前活动标签。
+    Active,
+    /// 非活动标签下标。
+    Tab(usize),
+}
+
+/// 事件分类结果：主线程据此改 UI 状态，不在分类函数里产生副作用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchAction {
+    /// 仅刷新文件树（自写回声、无对应标签的新建）。
+    RefreshOnly,
+    /// 安全重命名：只更新标签路径，不动文本/脏状态。
+    UpdateTabPath {
+        /// 目标标签。
+        target: WatchTarget,
+        /// 新路径。
+        to: PathBuf,
+    },
+    /// 干净标签：整文档重载（等同重新打开）。
+    Reload {
+        /// 目标标签。
+        target: WatchTarget,
+        /// 磁盘路径。
+        path: PathBuf,
+        /// 磁盘文本。
+        text: String,
+    },
+    /// 脏标签/读失败/删除：挂起非模态冲突横幅。
+    Conflict {
+        /// 目标标签。
+        target: WatchTarget,
+        /// 冲突内容。
+        change: ExternalChange,
+    },
+    /// 不安全重命名：拆成删除+新建分别处理。
+    Batch(Vec<WatchAction>),
+}
+
+/// 横幅上的操作按钮（文案与行为分离，便于纯函数测试与 GPUI 渲染各自演进）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalBannerAction {
+    /// 丢弃本地编辑，使用磁盘文本重载。
+    UseDisk,
+    /// 保留本地编辑，把 `saved_text` 更新为磁盘文本。
+    KeepLocal,
+    /// 不保存直接关闭标签。
+    CloseTab,
+    /// 另存为新路径（删除冲突的解决动作）。
+    SaveAs,
+}
+
+/// 横幅文案与按钮集合。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalChangeBanner {
+    /// 主提示文字。
+    title: String,
+    /// 按顺序排列的操作按钮。
+    actions: Vec<ExternalBannerAction>,
+}
+
+impl NormalizedWatchEvent {
+    /// 事件主路径（重命名取新路径 `to`，与 D91 的 `WatchEvent::path` 一致）。
+    fn path(&self) -> &Path {
+        match self {
+            Self::Created { path }
+            | Self::Modified { path }
+            | Self::Removed { path }
+            | Self::Renamed { to: path, .. } => path,
+        }
+    }
+}
+
+/// 比较用路径规范化：软链与 `..` 归一时以真实路径为准，失败则原样返回。
+///
+/// 这是路径 IO 的唯一边界；调用方必须先规范化再交给纯函数，否则同一文件经不同写法
+/// （软链/`..`）会被当成不同标签，导致回声误判或重命名安全性误判。
+fn canonicalize_watch_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// 读取事件路径的 UTF-8 文本；读失败/非 UTF-8 返回 `None`（按冲突处理，不静默重载）。
+fn read_watch_text(path: &Path) -> Option<String> {
+    String::from_utf8(std::fs::read(path).ok()?).ok()
+}
+
+/// 按绝对路径找标签；路径为空（未保存标签）永不匹配。
+fn watch_tab_by_path<'a>(
+    tabs: &'a [WatchTabSnapshot],
+    path: &Path,
+) -> Option<(usize, &'a WatchTabSnapshot)> {
+    tabs.iter()
+        .enumerate()
+        .find(|(_, t)| t.path.as_deref() == Some(path))
+}
+
+/// 判断路径是否严格位于工作区根内（根本身、同前缀的兄弟目录都不算）。
+fn watch_path_inside_root(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|rel| !rel.as_os_str().is_empty())
+}
+
+/// 标签下标的展示目标：活动标签走 `self.*`，其余走 `tabs[i]`。
+fn watch_target(index: usize, active: usize) -> WatchTarget {
+    if index == active {
+        WatchTarget::Active
+    } else {
+        WatchTarget::Tab(index)
+    }
+}
+
+/// 重命名安全性判定（纯函数，路径须已 canonicalize）。
+///
+/// 只有「旧路径对应已打开标签、新路径仍在根内、且未被其它标签占用」才安全；
+/// 否则上层必须拆成 `Removed(from)` + `Created(to)`，避免把文件移动误当成同一文档换名。
+fn safe_rename_target(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    tabs: &[WatchTabSnapshot],
+) -> Option<usize> {
+    if !watch_path_inside_root(root, to) {
+        return None;
+    }
+    let (index, _) = watch_tab_by_path(tabs, from)?;
+    let occupied = tabs
+        .iter()
+        .enumerate()
+        .any(|(i, t)| i != index && t.path.as_deref() == Some(to));
+    if occupied { None } else { Some(index) }
+}
+
+/// 构造一个冲突动作（修改或删除统一入口）。
+fn watch_conflict(
+    target: WatchTarget,
+    path: &Path,
+    kind: ExternalChangeKind,
+    disk_text: Option<String>,
+) -> WatchAction {
+    WatchAction::Conflict {
+        target,
+        change: ExternalChange {
+            path: path.to_path_buf(),
+            disk_text,
+            kind,
+        },
+    }
+}
+
+/// 修改事件分类：先按 `saved_text` 字节比对抑制回声，再按脏状态决定重载或挂横幅。
+///
+/// 基准必须是 `saved_text` 而非当前 `doc.text()`：脏标签的后者本就与磁盘不同，
+/// 只有保存/打开时留下的磁盘快照才能判断「磁盘是否被外部改动」。
+fn classify_modified(
+    index: usize,
+    path: &Path,
+    tab: &WatchTabSnapshot,
+    active: usize,
+    disk_text: Option<&str>,
+) -> WatchAction {
+    let target = watch_target(index, active);
+    let saved = tab.saved_text.as_deref();
+    // 磁盘字节与保存快照一致：本应用写入的回声，只刷新文件树，不提示也不重载。
+    if let (Some(saved), Some(disk)) = (saved, disk_text)
+        && saved.as_bytes() == disk.as_bytes()
+    {
+        return WatchAction::RefreshOnly;
+    }
+    // 可安全重载的磁盘文本 = 标签相对磁盘基线「干净」时才有值：
+    // - 普通标签：正文等于保存快照才算干净；
+    // - 读取失败保留的空标签：没有保存快照（saved_text = None）且正文仍为空，
+    //   等价于干净（没有可丢的本地编辑），外部把文件建好/改好后直接载入磁盘文本。
+    // 读失败/非 UTF-8（disk_text = None）绝不进入重载分支，一律按冲突提示。
+    let reload_disk = match (saved, disk_text) {
+        (Some(saved), Some(disk)) if tab.text == saved => Some(disk),
+        (None, Some(disk)) if tab.read_failed && tab.text.is_empty() => Some(disk),
+        _ => None,
+    };
+    if let Some(disk) = reload_disk {
+        WatchAction::Reload {
+            target,
+            path: path.to_path_buf(),
+            text: disk.to_owned(),
+        }
+    } else {
+        watch_conflict(
+            target,
+            path,
+            ExternalChangeKind::Modified,
+            disk_text.map(str::to_owned),
+        )
+    }
+}
+
+/// 事件分类主入口（纯函数）：输入已规范化的事件、根、标签只读快照与磁盘文本。
+///
+/// `disk_text` 是事件主路径（重命名取 `to`）的磁盘内容；`None` 代表读失败/非 UTF-8。
+/// 只读路径、比较字节、产出动作，**不**做 IO、不依赖 GPUI、不修改任何状态。
+fn classify_watch_event(
+    event: &NormalizedWatchEvent,
+    root: &Path,
+    tabs: &[WatchTabSnapshot],
+    active: usize,
+    disk_text: Option<&str>,
+) -> WatchAction {
+    match event {
+        NormalizedWatchEvent::Created { path } => {
+            match watch_tab_by_path(tabs, path) {
+                // 无对应标签：仅刷新文件树。
+                None => WatchAction::RefreshOnly,
+                // 读取失败保留的空标签收到 Created：按外部修改走同一套比对/重载逻辑。
+                Some((index, tab)) if tab.read_failed => {
+                    classify_modified(index, path, tab, active, disk_text)
+                }
+                Some(_) => WatchAction::RefreshOnly,
+            }
+        }
+        NormalizedWatchEvent::Modified { path } => match watch_tab_by_path(tabs, path) {
+            None => WatchAction::RefreshOnly,
+            Some((index, tab)) => classify_modified(index, path, tab, active, disk_text),
+        },
+        NormalizedWatchEvent::Removed { path } => match watch_tab_by_path(tabs, path) {
+            // 删除不自动关闭标签、不重载：等用户在横幅上选「关闭/另存为」。
+            None => WatchAction::RefreshOnly,
+            Some((index, _)) => watch_conflict(
+                watch_target(index, active),
+                path,
+                ExternalChangeKind::Removed,
+                None,
+            ),
+        },
+        NormalizedWatchEvent::Renamed { from, to } => {
+            if let Some(index) = safe_rename_target(root, from, to, tabs) {
+                // 安全重命名：只换路径，saved_text 不变，因此不会产生脏标记。
+                WatchAction::UpdateTabPath {
+                    target: watch_target(index, active),
+                    to: to.clone(),
+                }
+            } else {
+                // 旧路径未打开、新路径越界/被占用：拆成删除+新建各自判定。
+                let removed = match watch_tab_by_path(tabs, from) {
+                    Some((index, _)) => watch_conflict(
+                        watch_target(index, active),
+                        from,
+                        ExternalChangeKind::Removed,
+                        None,
+                    ),
+                    None => WatchAction::RefreshOnly,
+                };
+                let created = match watch_tab_by_path(tabs, to) {
+                    Some((index, tab)) if tab.read_failed => {
+                        classify_modified(index, to, tab, active, disk_text)
+                    }
+                    _ => WatchAction::RefreshOnly,
+                };
+                WatchAction::Batch(vec![removed, created])
+            }
+        }
+    }
+}
+
+/// 横幅文案与按钮（纯函数）：修改给「磁盘/本地」二选一，删除给「关闭/另存为」。
+///
+/// 读失败/非 UTF-8 的修改没有可用磁盘文本，「使用磁盘版本」「保留本地版本」都会空转，
+/// 必须退化为与删除相同的可解决动作，否则横幅无法关闭、保存又被拦截（死局）。
+fn external_change_banner(change: &ExternalChange) -> ExternalChangeBanner {
+    match (change.kind, change.disk_text.as_deref()) {
+        (ExternalChangeKind::Modified, Some(_)) => ExternalChangeBanner {
+            title: "文件已在外部被修改".to_owned(),
+            actions: vec![
+                ExternalBannerAction::UseDisk,
+                ExternalBannerAction::KeepLocal,
+            ],
+        },
+        (ExternalChangeKind::Modified, None) => ExternalChangeBanner {
+            title: "外部文件读取失败".to_owned(),
+            actions: vec![ExternalBannerAction::CloseTab, ExternalBannerAction::SaveAs],
+        },
+        (ExternalChangeKind::Removed, _) => ExternalChangeBanner {
+            title: "文件已在外部删除".to_owned(),
+            actions: vec![ExternalBannerAction::CloseTab, ExternalBannerAction::SaveAs],
+        },
+    }
+}
+
+/// 状态栏提示文案：横幅之外的第二处可见提示，说明保存已被暂停。
+fn external_change_status_text(change: &ExternalChange) -> String {
+    let name = change
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    format!(
+        "⚠ {}：{}（保存已暂停）",
+        external_change_banner(change).title,
+        name
+    )
+}
+
+/// 未解决的外部变更一律拦截普通保存（`Cmd+S` / `Cmd+Shift+S` / 命令面板同入口）。
+fn should_block_save(change: Option<&ExternalChange>) -> bool {
+    change.is_some()
+}
+
+/// 「另存为」只作为删除/读失败冲突的解决动作放行；有磁盘文本的修改冲突仍禁止，
+/// 避免绕开冲突直接覆盖；读失败无磁盘文本可比对，必须给出可退出的解决路径。
+fn should_block_save_as(change: Option<&ExternalChange>) -> bool {
+    matches!(change, Some(c) if c.kind == ExternalChangeKind::Modified && c.disk_text.is_some())
 }
 
 /// 递归收集文件树的行（`(深度, 条目)`），供侧栏按层级渲染。
@@ -2485,6 +2871,10 @@ struct Tab {
     highlighter: Option<Highlighter>,
     find: FindState,
     saved_text: Option<String>,
+    /// 外部变更横幅（D92，仅当前标签会话有效，随切换迁移、不写 Markdown）。
+    external_change: Option<ExternalChange>,
+    /// 打开时读取失败而保留的空标签：`Created` 事件按修改处理。
+    read_failed: bool,
 }
 
 #[allow(dead_code)]
@@ -2505,6 +2895,8 @@ impl Tab {
             highlighter: None,
             find: FindState::default(),
             saved_text: saved,
+            external_change: None,
+            read_failed: false,
         }
     }
     fn is_dirty(&self) -> bool {
@@ -2525,11 +2917,14 @@ impl Tab {
                 .into_owned(),
             None => "内置示例".to_string(),
         };
-        if self.is_dirty() {
-            format!("* {base}")
+        // 非活动标签若有未处理的外部变更，用 ⚠ 提示（横幅只显示活动标签，避免遗漏）。
+        let mark = if self.external_change.is_some() {
+            "⚠ "
         } else {
-            base
-        }
+            ""
+        };
+        let dirty = if self.is_dirty() { "* " } else { "" };
+        format!("{mark}{dirty}{base}")
     }
     fn full(&self) -> String {
         match &self.path {
@@ -2849,6 +3244,16 @@ struct DocView {
     outline_open: bool,
     /// 已打开文件的保存快照（脏状态用）
     saved_text: Option<String>,
+    /// 当前标签的外部变更横幅会话态（D92；只在主线程修改）。
+    external_change: Option<ExternalChange>,
+    /// 当前标签是否因打开时读取失败而保留空文本（Created 事件按修改处理）。
+    read_failed: bool,
+    /// D91 工作区监听句柄（drop 即停）；`Arc<Mutex<_>>` 让监听线程与视图共享同一句柄。
+    watch_handle: Option<Arc<Mutex<Box<dyn WatchHandle>>>>,
+    /// 当前监听的工作区根（canonicalize 后）；用于保证每个根只 `watch` 一次。
+    watch_root: Option<PathBuf>,
+    /// 监听线程停止标志：根变化或视图 drop 时置位，旧线程及时退出。
+    watch_stop: Option<Arc<AtomicBool>>,
     /// 命令面板状态（`Cmd+P`，D38）。
     #[allow(dead_code)]
     cmd_palette: PaletteState,
@@ -2899,8 +3304,16 @@ impl DocView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut read_failed = false;
         let text = match path {
-            Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| format!("> 读取失败：{e}\n")),
+            Some(p) => match std::fs::read_to_string(p) {
+                Ok(text) => text,
+                // 读取失败仍保留标签；标记下来供 `Created` 事件按修改处理（D92）。
+                Err(e) => {
+                    read_failed = true;
+                    format!("> 读取失败：{e}\n")
+                }
+            },
             None => SAMPLE.to_string(),
         };
         let mut settings = settings;
@@ -2952,6 +3365,8 @@ impl DocView {
             highlighter: None,
             find: FindState::default(),
             saved_text: path.is_some().then(|| text.clone()),
+            external_change: None,
+            read_failed,
         };
         let focus = cx.focus_handle();
         let focus_sub = cx.on_focus(&focus, window, |view, _, cx| view.start_blink(cx));
@@ -3003,6 +3418,11 @@ impl DocView {
             outline_resizing: false,
             outline_open: true,
             saved_text,
+            external_change: None,
+            read_failed,
+            watch_handle: None,
+            watch_root: None,
+            watch_stop: None,
             cmd_palette: PaletteState::default(),
             renaming: None,
             dialog_open: false,
@@ -5384,6 +5804,9 @@ impl DocView {
         t.highlighter = None;
         t.find = FindState::default();
         t.saved_text = self.saved_text.clone();
+        // 外部变更与读取失败标记是标签会话态：切走不丢，也不写进 Markdown。
+        t.external_change = self.external_change.clone();
+        t.read_failed = self.read_failed;
     }
 
     /// 从 `tabs[idx]` 装载编辑态到当前字段（调用方负责先回写旧标签）。
@@ -5398,6 +5821,8 @@ impl DocView {
         let primary = t.primary;
         let selecting = t.selecting;
         let saved_text = t.saved_text.clone();
+        let external_change = t.external_change.clone();
+        let read_failed = t.read_failed;
         self.active = idx;
         self.path = path;
         self.doc = doc;
@@ -5413,6 +5838,9 @@ impl DocView {
         self.highlighter = None;
         self.find = FindState::default();
         self.saved_text = saved_text;
+        // 横幅属于目标标签：切回时恢复；脚注游标仍是当前标签会话之外的状态，保持清空。
+        self.external_change = external_change;
+        self.read_failed = read_failed;
         self.media.clear();
         self.table_column_widths.clear();
         self.table_row_heights.clear();
@@ -5511,16 +5939,25 @@ impl DocView {
                 } else {
                     self.workspace_root = Some(parent.to_path_buf());
                 }
+                // 根可能变化：旧的监听必须释放，新根只 watch 一次（D92）。
+                self.sync_workspace_watch(cx);
             }
             cx.notify();
             return;
         }
-        // 读取失败也保留一个空标签，方便用户继续新建/保存。
-        self.tabs.push(Tab::new(String::new(), Some(full)));
+        // 读取失败也保留一个空标签，方便用户继续新建/保存（D92：Created 事件按修改处理）。
+        let mut tab = Tab::new(String::new(), Some(full));
+        tab.read_failed = true;
+        self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, cx);
     }
 
     fn save_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // D92：外部变更未解决时一律拦截，避免静默覆盖外部改动（横幅已给出解决动作）。
+        if should_block_save(self.external_change.as_ref()) {
+            cx.notify();
+            return;
+        }
         if let Some(path) = self.path.clone() {
             if let Err(e) = std::fs::write(&path, self.doc.text().as_bytes()) {
                 eprintln!("保存失败：{}", e);
@@ -5886,6 +6323,257 @@ impl DocView {
         cx.notify();
     }
 
+    /// D91 监听生命周期：工作区根确定后只 `watch` 一次；根变化/视图 drop 时释放旧句柄。
+    ///
+    /// 无工作区或监听不可用（不支持/后端报错）时静默降级为现状，不弹错误打扰用户。
+    /// 事件由后台线程收取，再经 `cx.spawn` + `WeakView::update` 派发到 GPUI 主线程，
+    /// 因此所有 UI 状态只在主线程闭包里改。
+    fn sync_workspace_watch(&mut self, cx: &mut Context<Self>) {
+        let root = self.workspace_root.as_deref().map(canonicalize_watch_path);
+        // 同一根不重复 watch；D91 已做 150ms 折叠，桌面不二次防抖。
+        if root == self.watch_root {
+            return;
+        }
+        // 先停旧根：标志让后台线程从轮询中退出，再 drop 共享句柄（D91 drop 即停）。
+        if let Some(stop) = self.watch_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        self.watch_handle = None;
+        self.watch_root = None;
+        let Some(root) = root else { return };
+        let Ok(provider) = FileSystemProvider::open(&root) else {
+            return;
+        };
+        let Ok(Some(handle)) = provider.watch(&DocPath::root()) else {
+            return;
+        };
+        let shared = Arc::new(Mutex::new(handle));
+        self.watch_handle = Some(Arc::clone(&shared));
+        self.watch_root = Some(root);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.watch_stop = Some(Arc::clone(&stop));
+        let (tx, rx) = std::sync::mpsc::channel::<WatchEvent>();
+        let thread_stop = Arc::clone(&stop);
+        // 后台线程只收事件与投递，不碰 GPUI。用 try_recv + 短睡而非阻塞 recv：
+        // WatchHandle 只有 recv/try_recv，阻塞 recv 会因共享句柄未释放而无法被停止标志唤醒。
+        let spawned = std::thread::Builder::new()
+            .name("mazha-workspace-watch".to_owned())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    let event = shared.lock().ok().and_then(|handle| handle.try_recv());
+                    match event {
+                        Some(event) => {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        None => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // 线程创建失败：清掉本次监听，保持「静默降级」语义。
+            self.watch_handle = None;
+            self.watch_root = None;
+            self.watch_stop = None;
+            return;
+        }
+        // 前台任务短间隔取事件并派发；WeakView 让视图释放后任务自然结束，不续命。
+        let poll_stop = Arc::clone(&stop);
+        let rx = Arc::new(Mutex::new(rx));
+        cx.spawn(async move |this, cx| {
+            loop {
+                if poll_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let batch: Vec<WatchEvent> = {
+                    let Ok(rx) = rx.lock() else { break };
+                    std::iter::from_fn(|| rx.try_recv().ok()).take(16).collect()
+                };
+                for event in batch {
+                    if this
+                        .update(cx, |view, cx| view.apply_watch_event(event, cx))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(20))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// 把 D91 的工作区相对事件路径解析为规范化绝对路径，供纯函数按同一套规则比对。
+    fn normalize_watch_event(event: &WatchEvent, root: &Path) -> NormalizedWatchEvent {
+        let abs = |rel: &DocPath| canonicalize_watch_path(&root.join(rel.as_str()));
+        match event {
+            WatchEvent::Created { path } => NormalizedWatchEvent::Created { path: abs(path) },
+            WatchEvent::Modified { path } => NormalizedWatchEvent::Modified { path: abs(path) },
+            WatchEvent::Removed { path } => NormalizedWatchEvent::Removed { path: abs(path) },
+            WatchEvent::Renamed { from, to } => NormalizedWatchEvent::Renamed {
+                from: abs(from),
+                to: abs(to),
+            },
+        }
+    }
+
+    /// 事件分类用的标签只读快照：活动标签的实时状态在 `self`，`tabs[active]` 只是占位。
+    fn watch_tab_snapshot(&self) -> Vec<WatchTabSnapshot> {
+        let mut tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|t| WatchTabSnapshot {
+                path: t.path.as_deref().map(canonicalize_watch_path),
+                text: t.doc.text().to_string(),
+                saved_text: t.saved_text.clone(),
+                read_failed: t.read_failed,
+            })
+            .collect();
+        if let Some(active) = tabs.get_mut(self.active) {
+            active.path = self.path.as_deref().map(canonicalize_watch_path);
+            active.text = self.doc.text().to_string();
+            active.saved_text = self.saved_text.clone();
+            active.read_failed = self.read_failed;
+        }
+        tabs
+    }
+
+    /// 主线程收到一条 D91 事件：读盘 → 纯函数分类 → 应用动作 → 刷新文件树。
+    fn apply_watch_event(&mut self, event: WatchEvent, cx: &mut Context<Self>) {
+        let Some(root_raw) = self.workspace_root.clone() else {
+            return;
+        };
+        let root = canonicalize_watch_path(&root_raw);
+        // 切换工作区后旧根的在途事件直接丢弃，避免误伤新根下打开的标签。
+        if self.watch_root.as_ref() != Some(&root) {
+            return;
+        }
+        let normalized = Self::normalize_watch_event(&event, &root);
+        // 删除事件无需读盘（文件已不存在）；其余事件读失败/非 UTF-8 → None → 冲突提示。
+        let disk_text = if matches!(&normalized, NormalizedWatchEvent::Removed { .. }) {
+            None
+        } else {
+            read_watch_text(normalized.path())
+        };
+        let tabs = self.watch_tab_snapshot();
+        let action =
+            classify_watch_event(&normalized, &root, &tabs, self.active, disk_text.as_deref());
+        self.apply_watch_action(action);
+        // 回声、刷新树、冲突等所有分支都复用既有刷新逻辑（D72 展开态一并落盘）。
+        self.refresh_workspace(cx);
+    }
+
+    /// 把分类结果应用到视图状态（非模态，不弹框）；刷新由调用方统一做一次。
+    fn apply_watch_action(&mut self, action: WatchAction) {
+        match action {
+            WatchAction::RefreshOnly => {}
+            WatchAction::UpdateTabPath { target, to } => match target {
+                WatchTarget::Active => self.path = Some(to),
+                WatchTarget::Tab(i) => {
+                    if let Some(tab) = self.tabs.get_mut(i) {
+                        tab.path = Some(to);
+                    }
+                }
+            },
+            WatchAction::Reload { target, path, text } => {
+                self.reload_watch_tab(target, &path, &text);
+            }
+            WatchAction::Conflict { target, change } => match target {
+                WatchTarget::Active => self.external_change = Some(change),
+                WatchTarget::Tab(i) => {
+                    if let Some(tab) = self.tabs.get_mut(i) {
+                        tab.external_change = Some(change);
+                    }
+                }
+            },
+            WatchAction::Batch(actions) => {
+                for action in actions {
+                    self.apply_watch_action(action);
+                }
+            }
+        }
+    }
+
+    /// 整文档替换式重载，等同重新打开：新 `Document` 清撤销栈，并清布局/高亮/查找/
+    /// 回跳游标与滚动跟随；旧源偏移在整文档替换后失效，光标必须 clamp 到新长度。
+    fn reload_watch_tab(&mut self, target: WatchTarget, path: &Path, text: &str) {
+        let doc = Document::new(text);
+        let len = doc.len();
+        let clamp = |cursors: &mut [Cursor]| {
+            for c in cursors {
+                c.caret = c.caret.min(len);
+                if let Some(anchor) = c.anchor {
+                    c.anchor = Some(anchor.min(len));
+                }
+            }
+        };
+        match target {
+            WatchTarget::Active => {
+                self.doc = doc;
+                self.path = Some(path.to_path_buf());
+                self.saved_text = Some(text.to_owned());
+                self.external_change = None;
+                self.read_failed = false;
+                self.layout = None;
+                self.highlighter = None;
+                self.find = FindState::default();
+                self.footnote_origin = None;
+                self.scroll_to_source_top = None;
+                self.caret_scroll_key = None;
+                self.content_height = px(0.);
+                self.scroll = gpui::ScrollHandle::new();
+                self.media.clear();
+                self.table_column_widths.clear();
+                self.table_row_heights.clear();
+                self.table_resizing = None;
+                clamp(&mut self.cursors);
+            }
+            WatchTarget::Tab(i) => {
+                if let Some(tab) = self.tabs.get_mut(i) {
+                    tab.doc = doc;
+                    tab.path = Some(path.to_path_buf());
+                    tab.saved_text = Some(text.to_owned());
+                    tab.external_change = None;
+                    tab.read_failed = false;
+                    tab.layout = None;
+                    tab.highlighter = None;
+                    tab.find = FindState::default();
+                    clamp(&mut tab.cursors);
+                }
+            }
+        }
+    }
+
+    /// 横幅「使用磁盘版本」：丢弃本地编辑并重载（脏标签据此显式解决冲突）。
+    fn accept_disk_version(&mut self, cx: &mut Context<Self>) {
+        let Some(change) = self.external_change.clone() else {
+            return;
+        };
+        // 删除/读失败没有可用文本，按钮本就不会出现；这里再守一道，杜绝空文本覆盖。
+        let Some(text) = change.disk_text else {
+            return;
+        };
+        self.reload_watch_tab(WatchTarget::Active, &change.path, &text);
+        self.refresh_workspace(cx);
+    }
+
+    /// 横幅「保留本地版本」：只把 `saved_text` 改成磁盘文本，本地编辑成为相对新基线的脏，
+    /// 后续同内容磁盘事件自然按回声过滤；用户显式 `Cmd+S` 才会覆盖磁盘。
+    fn keep_local_version(&mut self, cx: &mut Context<Self>) {
+        let Some(change) = self.external_change.clone() else {
+            return;
+        };
+        if change.kind != ExternalChangeKind::Modified || change.disk_text.is_none() {
+            return;
+        }
+        self.saved_text = change.disk_text;
+        self.external_change = None;
+        self.refresh_workspace(cx);
+    }
+
     /// 当前工作区根目录的持久化键（绝对路径字符串）；无工作区时为 `None`。
     fn workspace_key(&self) -> Option<String> {
         self.workspace_root
@@ -5931,6 +6619,11 @@ impl DocView {
     /// 另存为：异步保存对话框（`AsyncFileDialog` + `cx.spawn`，D41），避免同步对话框
     /// 嵌套泵 runloop 触发 gpui 键盘布局回调的 `RefCell` 争用。
     fn save_as(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // 「另存为」是删除冲突的解决动作，必须放行；修改冲突仍拦截（纯函数判定）。
+        if should_block_save_as(self.external_change.as_ref()) {
+            cx.notify();
+            return;
+        }
         self.begin_dialog(cx);
         let text = self.doc.text().to_string();
         cx.spawn(async move |this, cx| {
@@ -5952,12 +6645,16 @@ impl DocView {
                 let _ = this.update(cx, |view, cx| {
                     view.path = Some(path.clone());
                     view.saved_text = Some(view.doc.text().to_string());
+                    // 写新路径后冲突已解除：删除横幅不再拦截后续保存。
+                    view.external_change = None;
+                    view.read_failed = false;
                     if let Some(parent) = path.parent()
                         && let Ok(p) = FileSystemProvider::open(parent)
                     {
                         view.workspace_root = Some(parent.to_path_buf());
                         view.workspace = Some(Workspace::new(p));
                         view.tree_open = true;
+                        view.sync_workspace_watch(cx);
                     }
                     // 与 `save_current` 同理：当前文档仍由 `self.doc` 持有，
                     // 标签快照等切走时再回写。
@@ -5985,6 +6682,19 @@ impl DocView {
             self.cursors.push(Cursor::new(src));
             self.primary = self.cursors.len() - 1; // 新光标设为主光标
         }
+    }
+}
+
+/// 视图释放时停掉 D91 监听：置停止标志让后台线程与前台轮询任务尽快退出，
+/// `watch_handle` 字段随视图一起 drop（D91 的 `WatchHandle` drop 即注销监听）。
+/// 用 `Drop` 而非 `on_release` 回调，保证任何释放路径（关窗、切根）都不遗留 OS 监听器。
+impl Drop for DocView {
+    fn drop(&mut self) {
+        if let Some(stop) = self.watch_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        self.watch_handle = None;
+        self.watch_root = None;
     }
 }
 
@@ -6772,6 +7482,57 @@ impl Render for DocView {
             .border_color(palette.border)
             .bg(palette.subtle)
             .children(tbc);
+        // D92：外部变更横幅（非模态），常驻标签栏下方直到用户显式选择。
+        // 修改给「使用磁盘版本 / 保留本地版本」，删除给「关闭标签 / 另存为…」；
+        // 按钮文案由纯函数 `external_change_banner` 给出，这里只做 GPUI 渲染与点击派发。
+        let external_banner: Option<gpui::AnyElement> =
+            self.external_change.as_ref().map(|change| {
+                let banner = external_change_banner(change);
+                let mut row = h_flex()
+                    .id("external-change-banner")
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(palette.accent)
+                    .bg(palette.subtle)
+                    .text_sm()
+                    .child(div().flex_none().text_color(palette.accent).child("⚠"))
+                    .child(div().flex_1().min_w(px(0.)).child(banner.title.clone()));
+                for action in banner.actions {
+                    let label = match action {
+                        ExternalBannerAction::UseDisk => "使用磁盘版本",
+                        ExternalBannerAction::KeepLocal => "保留本地版本",
+                        ExternalBannerAction::CloseTab => "关闭标签",
+                        ExternalBannerAction::SaveAs => "另存为…",
+                    };
+                    // `action` 是 Copy 枚举，可安全移入点击回调；`window` 由回调参数提供，
+                    // 让「另存为」复用同一个文件对话框入口（与 Cmd+Shift+S 完全一致）。
+                    row = row.child(
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("ext-change-{action:?}").into(),
+                            ))
+                            .flex_none()
+                            .cursor_pointer()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(3.))
+                            .bg(palette.code_bg)
+                            .on_click(cx.listener(move |view, _ev, window, cx| match action {
+                                ExternalBannerAction::UseDisk => view.accept_disk_version(cx),
+                                ExternalBannerAction::KeepLocal => view.keep_local_version(cx),
+                                ExternalBannerAction::CloseTab => view.close_current_tab(cx),
+                                ExternalBannerAction::SaveAs => view.save_as(window, cx),
+                            }))
+                            .child(label),
+                    );
+                }
+                row.into_any_element()
+            });
         // D83：导出进行中/完成/失败时，状态栏右侧让出快捷键提示位展示反馈；
         // 失败用强调色突出，其余状态用链接色，6s 后自动回到默认提示。
         let (export_hint, export_hint_color) = match &self.export_status {
@@ -6820,6 +7581,15 @@ impl Render for DocView {
                             .child(format!("{line_count} 行 · 光标×{caret_count}")),
                     ),
             )
+            // D92：未解决的外部变更在状态栏再提示一次，与横幅同步出现/消失。
+            .children(self.external_change.as_ref().map(|change| {
+                div()
+                    .flex_none()
+                    .max_w(px(360.))
+                    .truncate()
+                    .text_color(palette.accent)
+                    .child(external_change_status_text(change))
+            }))
             .child(div().flex_none().child(format!(
                 "字号 {:.0} · 主题 {}",
                 f32::from(self.font_size),
@@ -6922,6 +7692,8 @@ impl Render for DocView {
                                 view.import_external_paths(paths.paths(), None, true, cx);
                             }))
                             .child(tabbar_el)
+                            // D92：外部变更横幅紧随标签栏，不随正文滚动（非模态）。
+                            .children(external_banner)
                             .key_context("mazha-doc")
                             .on_action(cx.listener(|view, _: &InsertTab, _window, cx| {
                                 view.handle_tab_action(false, cx);
@@ -11013,6 +11785,8 @@ fn main() {
             gpui_kit::open_window(options, cx, move |window, cx| {
                 apply_theme_preference(settings.theme, window, cx);
                 let view = cx.new(|cx| DocView::new(path.as_ref(), settings.clone(), window, cx));
+                // D92：窗口建好即按当前工作区根启动一次监听；根变化/关窗由视图自身维护句柄。
+                view.update(cx, |view, cx| view.sync_workspace_watch(cx));
                 // 打开即聚焦，键盘事件直接可用
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
@@ -11040,6 +11814,13 @@ mod tests {
         quote_block_wrap_width, render_chart_preview, render_chart_svg, render_export,
         render_export_with_assets, render_math_preview, reveal_inline, table_arrow_step,
         table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
+    };
+    // D92：外部文件变更的纯函数与类型（无 GPUI 依赖，可直接单测契约）。
+    use super::{
+        ExternalBannerAction, ExternalChange, ExternalChangeBanner, ExternalChangeKind,
+        NormalizedWatchEvent, WatchAction, WatchTabSnapshot, WatchTarget, classify_watch_event,
+        external_change_banner, external_change_status_text, safe_rename_target, should_block_save,
+        should_block_save_as, watch_path_inside_root, watch_tab_by_path, watch_target,
     };
     use super::{decode_data_image, image_resource, point, px, size};
     use gpui_kit::{
@@ -12351,5 +13132,424 @@ mod tests {
         assert!(set.contains("subx"));
         assert!(!set.contains("sub"));
         assert!(!set.contains("sub/deep"));
+    }
+
+    // ==================== 外部文件变更（D92）纯函数契约测试 ====================
+
+    /// 构造标签快照：`path` 为绝对路径字符串，`saved` 是保存/打开时的磁盘基线。
+    fn ws_tab(path: &str, text: &str, saved: Option<&str>) -> WatchTabSnapshot {
+        WatchTabSnapshot {
+            path: Some(PathBuf::from(path)),
+            text: text.to_owned(),
+            saved_text: saved.map(str::to_owned),
+            read_failed: false,
+        }
+    }
+
+    /// 构造修改事件；路径均为已 canonicalize 的绝对路径（纯函数不做 IO）。
+    fn ws_modified(path: &str) -> NormalizedWatchEvent {
+        NormalizedWatchEvent::Modified {
+            path: PathBuf::from(path),
+        }
+    }
+
+    /// 磁盘字节等于 `saved_text` 即回声：无论标签是否脏，都只刷新文件树。
+    #[test]
+    fn watch_echo_matching_saved_text_only_refreshes() {
+        let root = Path::new("/ws");
+        let clean = ws_tab("/ws/a.md", "same", Some("same"));
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/a.md"), root, &[clean], 0, Some("same")),
+            WatchAction::RefreshOnly
+        );
+        // 脏标签当前文本不同，但磁盘仍等于保存基线 → 同样是本应用写入的回声。
+        let dirty = ws_tab("/ws/a.md", "local edit", Some("same"));
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/a.md"), root, &[dirty], 0, Some("same")),
+            WatchAction::RefreshOnly
+        );
+    }
+
+    /// 干净标签的外部修改：整文档重载，目标/路径/文本由磁盘事件给出。
+    #[test]
+    fn watch_clean_tab_external_modification_reloads() {
+        let root = Path::new("/ws");
+        let clean = ws_tab("/ws/a.md", "old", Some("old"));
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/a.md"), root, &[clean], 0, Some("new")),
+            WatchAction::Reload {
+                target: WatchTarget::Active,
+                path: PathBuf::from("/ws/a.md"),
+                text: "new".to_owned(),
+            }
+        );
+    }
+
+    /// 脏标签的外部修改：绝不自动重载，挂冲突横幅并带上磁盘文本供用户二选一。
+    #[test]
+    fn watch_dirty_tab_external_modification_conflicts() {
+        let root = Path::new("/ws");
+        let dirty = ws_tab("/ws/a.md", "local", Some("old"));
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/a.md"), root, &[dirty], 0, Some("disk")),
+            WatchAction::Conflict {
+                target: WatchTarget::Active,
+                change: ExternalChange {
+                    path: PathBuf::from("/ws/a.md"),
+                    disk_text: Some("disk".to_owned()),
+                    kind: ExternalChangeKind::Modified,
+                },
+            }
+        );
+    }
+
+    /// 读失败/非 UTF-8（`disk_text = None`）：即使标签干净也不拿空文本覆盖，按冲突处理。
+    #[test]
+    fn watch_read_failure_never_auto_reloads() {
+        let root = Path::new("/ws");
+        let clean = ws_tab("/ws/a.md", "old", Some("old"));
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/a.md"), root, &[clean], 0, None),
+            WatchAction::Conflict {
+                target: WatchTarget::Active,
+                change: ExternalChange {
+                    path: PathBuf::from("/ws/a.md"),
+                    disk_text: None,
+                    kind: ExternalChangeKind::Modified,
+                },
+            }
+        );
+    }
+
+    /// 没有对应标签的事件（修改/新建/删除）只刷新文件树，不影响任何标签。
+    #[test]
+    fn watch_event_without_matching_tab_only_refreshes() {
+        let root = Path::new("/ws");
+        let tabs = [ws_tab("/ws/b.md", "x", Some("x"))];
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/a.md"), root, &tabs, 0, Some("new")),
+            WatchAction::RefreshOnly
+        );
+        assert_eq!(
+            classify_watch_event(
+                &NormalizedWatchEvent::Created {
+                    path: PathBuf::from("/ws/c.md")
+                },
+                root,
+                &tabs,
+                0,
+                Some("new")
+            ),
+            WatchAction::RefreshOnly
+        );
+        assert_eq!(
+            classify_watch_event(
+                &NormalizedWatchEvent::Removed {
+                    path: PathBuf::from("/ws/c.md")
+                },
+                root,
+                &tabs,
+                0,
+                None
+            ),
+            WatchAction::RefreshOnly
+        );
+    }
+
+    /// 读取失败留下的空标签收到 `Created`（外部真正建好文件）：按外部修改走重载。
+    #[test]
+    fn watch_created_for_read_failed_tab_reloads() {
+        let root = Path::new("/ws");
+        let mut tab = ws_tab("/ws/a.md", "", None);
+        tab.read_failed = true;
+        let created = NormalizedWatchEvent::Created {
+            path: PathBuf::from("/ws/a.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&created, root, &[tab], 0, Some("fresh")),
+            WatchAction::Reload {
+                target: WatchTarget::Active,
+                path: PathBuf::from("/ws/a.md"),
+                text: "fresh".to_owned(),
+            }
+        );
+    }
+
+    /// 删除事件不自动关标签、不重载：挂删除横幅，等用户选「关闭/另存为」。
+    #[test]
+    fn watch_removed_tab_conflicts_without_closing() {
+        let root = Path::new("/ws");
+        let tab = ws_tab("/ws/a.md", "text", Some("text"));
+        let removed = NormalizedWatchEvent::Removed {
+            path: PathBuf::from("/ws/a.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&removed, root, &[tab], 0, None),
+            WatchAction::Conflict {
+                target: WatchTarget::Active,
+                change: ExternalChange {
+                    path: PathBuf::from("/ws/a.md"),
+                    disk_text: None,
+                    kind: ExternalChangeKind::Removed,
+                },
+            }
+        );
+    }
+
+    /// 安全重命名（源已打开、目标在根内且未被占用）：只更新标签路径，不碰文本/脏状态。
+    #[test]
+    fn watch_safe_rename_updates_path_only() {
+        let root = Path::new("/ws");
+        let tabs = [ws_tab("/ws/a.md", "text", Some("text"))];
+        assert_eq!(
+            safe_rename_target(root, Path::new("/ws/a.md"), Path::new("/ws/b.md"), &tabs),
+            Some(0)
+        );
+        let renamed = NormalizedWatchEvent::Renamed {
+            from: PathBuf::from("/ws/a.md"),
+            to: PathBuf::from("/ws/b.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&renamed, root, &tabs, 0, Some("whatever")),
+            WatchAction::UpdateTabPath {
+                target: WatchTarget::Active,
+                to: PathBuf::from("/ws/b.md"),
+            }
+        );
+    }
+
+    /// 目标越出工作区根：不安全，拆成 `Removed(from)` + `Created(to)` 各自判定。
+    #[test]
+    fn watch_rename_outside_root_splits_into_removed_and_created() {
+        let root = Path::new("/ws");
+        let tabs = [ws_tab("/ws/a.md", "text", Some("text"))];
+        let renamed = NormalizedWatchEvent::Renamed {
+            from: PathBuf::from("/ws/a.md"),
+            to: PathBuf::from("/elsewhere/b.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&renamed, root, &tabs, 0, Some("disk")),
+            WatchAction::Batch(vec![
+                WatchAction::Conflict {
+                    target: WatchTarget::Active,
+                    change: ExternalChange {
+                        path: PathBuf::from("/ws/a.md"),
+                        disk_text: None,
+                        kind: ExternalChangeKind::Removed,
+                    },
+                },
+                WatchAction::RefreshOnly,
+            ])
+        );
+    }
+
+    /// 目标已被另一标签占用：同样不安全，拆成删除 + 新建。
+    #[test]
+    fn watch_rename_to_occupied_path_splits() {
+        let root = Path::new("/ws");
+        let tabs = [
+            ws_tab("/ws/a.md", "a", Some("a")),
+            ws_tab("/ws/b.md", "b", Some("b")),
+        ];
+        assert_eq!(
+            safe_rename_target(root, Path::new("/ws/a.md"), Path::new("/ws/b.md"), &tabs),
+            None
+        );
+        let renamed = NormalizedWatchEvent::Renamed {
+            from: PathBuf::from("/ws/a.md"),
+            to: PathBuf::from("/ws/b.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&renamed, root, &tabs, 0, Some("disk")),
+            WatchAction::Batch(vec![
+                WatchAction::Conflict {
+                    target: WatchTarget::Active,
+                    change: ExternalChange {
+                        path: PathBuf::from("/ws/a.md"),
+                        disk_text: None,
+                        kind: ExternalChangeKind::Removed,
+                    },
+                },
+                WatchAction::RefreshOnly,
+            ])
+        );
+    }
+
+    /// 源未打开时重命名也走拆分路径，两侧都无标签 → 仅刷新。
+    #[test]
+    fn watch_rename_without_open_source_splits() {
+        let root = Path::new("/ws");
+        let tabs = [ws_tab("/ws/b.md", "b", Some("b"))];
+        let renamed = NormalizedWatchEvent::Renamed {
+            from: PathBuf::from("/ws/a.md"),
+            to: PathBuf::from("/ws/c.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&renamed, root, &tabs, 0, Some("disk")),
+            WatchAction::Batch(vec![WatchAction::RefreshOnly, WatchAction::RefreshOnly])
+        );
+    }
+
+    /// 不安全重命名的 `Created` 分支同样识别读取失败标签并重载。
+    #[test]
+    fn watch_rename_created_branch_reloads_read_failed_tab() {
+        let root = Path::new("/ws");
+        let mut to_tab = ws_tab("/ws/new.md", "", None);
+        to_tab.read_failed = true;
+        let tabs = [to_tab];
+        let renamed = NormalizedWatchEvent::Renamed {
+            from: PathBuf::from("/ws/gone.md"),
+            to: PathBuf::from("/ws/new.md"),
+        };
+        assert_eq!(
+            classify_watch_event(&renamed, root, &tabs, 0, Some("fresh")),
+            WatchAction::Batch(vec![
+                WatchAction::RefreshOnly,
+                WatchAction::Reload {
+                    target: WatchTarget::Active,
+                    path: PathBuf::from("/ws/new.md"),
+                    text: "fresh".to_owned(),
+                },
+            ])
+        );
+    }
+
+    /// 活动标签映射为 `Active`，非活动标签映射为 `Tab(i)`；动作目标据此选 `self` 或 `tabs[i]`。
+    #[test]
+    fn watch_target_distinguishes_active_and_inactive_tabs() {
+        assert_eq!(watch_target(0, 0), WatchTarget::Active);
+        assert_eq!(watch_target(1, 0), WatchTarget::Tab(1));
+        assert_eq!(watch_target(0, 2), WatchTarget::Tab(0));
+        let root = Path::new("/ws");
+        let tabs = [
+            ws_tab("/ws/a.md", "a", Some("a")),
+            ws_tab("/ws/b.md", "old", Some("old")),
+        ];
+        assert_eq!(
+            classify_watch_event(&ws_modified("/ws/b.md"), root, &tabs, 0, Some("new")),
+            WatchAction::Reload {
+                target: WatchTarget::Tab(1),
+                path: PathBuf::from("/ws/b.md"),
+                text: "new".to_owned(),
+            }
+        );
+    }
+
+    /// 路径必须严格位于根内：根本身、同前缀兄弟目录都不算（防重命名误判）。
+    #[test]
+    fn watch_path_inside_root_rejects_root_and_siblings() {
+        let root = Path::new("/ws");
+        assert!(watch_path_inside_root(root, Path::new("/ws/a.md")));
+        assert!(watch_path_inside_root(root, Path::new("/ws/sub/a.md")));
+        assert!(!watch_path_inside_root(root, root));
+        assert!(!watch_path_inside_root(root, Path::new("/ws2/a.md")));
+        assert!(!watch_path_inside_root(root, Path::new("/elsewhere")));
+    }
+
+    /// 未保存（`path = None`）的标签永不匹配任何事件路径。
+    #[test]
+    fn watch_tab_by_path_ignores_unsaved_tabs() {
+        let tabs = [
+            ws_tab("/ws/a.md", "a", Some("a")),
+            WatchTabSnapshot {
+                path: None,
+                text: "unsaved".to_owned(),
+                saved_text: None,
+                read_failed: false,
+            },
+        ];
+        assert_eq!(
+            watch_tab_by_path(&tabs, Path::new("/ws/a.md")).map(|(i, _)| i),
+            Some(0)
+        );
+        assert!(watch_tab_by_path(&tabs, Path::new("")).is_none());
+    }
+
+    /// 横幅文案与按钮集合由变更种类决定：修改二选一，删除关闭/另存为。
+    #[test]
+    fn external_change_banner_matches_change_kind() {
+        let modified = ExternalChange {
+            path: PathBuf::from("/ws/a.md"),
+            disk_text: Some("disk".to_owned()),
+            kind: ExternalChangeKind::Modified,
+        };
+        assert_eq!(
+            external_change_banner(&modified),
+            ExternalChangeBanner {
+                title: "文件已在外部被修改".to_owned(),
+                actions: vec![
+                    ExternalBannerAction::UseDisk,
+                    ExternalBannerAction::KeepLocal
+                ],
+            }
+        );
+        let removed = ExternalChange {
+            path: PathBuf::from("/ws/a.md"),
+            disk_text: None,
+            kind: ExternalChangeKind::Removed,
+        };
+        assert_eq!(
+            external_change_banner(&removed),
+            ExternalChangeBanner {
+                title: "文件已在外部删除".to_owned(),
+                actions: vec![ExternalBannerAction::CloseTab, ExternalBannerAction::SaveAs],
+            }
+        );
+        // 读失败/非 UTF-8 的修改：磁盘文本缺失，必须给出可解决的按钮，不能留下死横幅。
+        let unreadable = ExternalChange {
+            path: PathBuf::from("/ws/a.md"),
+            disk_text: None,
+            kind: ExternalChangeKind::Modified,
+        };
+        assert_eq!(
+            external_change_banner(&unreadable),
+            ExternalChangeBanner {
+                title: "外部文件读取失败".to_owned(),
+                actions: vec![ExternalBannerAction::CloseTab, ExternalBannerAction::SaveAs],
+            }
+        );
+    }
+
+    /// 状态栏提示含变更种类、文件名与「保存已暂停」。
+    #[test]
+    fn external_change_status_text_shows_kind_and_filename() {
+        let change = ExternalChange {
+            path: PathBuf::from("/ws/sub/a.md"),
+            disk_text: Some("disk".to_owned()),
+            kind: ExternalChangeKind::Modified,
+        };
+        let text = external_change_status_text(&change);
+        assert!(text.contains("文件已在外部被修改"));
+        assert!(text.contains("a.md"));
+        assert!(text.contains("保存已暂停"));
+    }
+
+    /// 保存拦截：普通保存拦截所有未解决变更；另存为只放行删除冲突。
+    #[test]
+    fn save_interception_blocks_unresolved_changes() {
+        let modified = ExternalChange {
+            path: PathBuf::from("/ws/a.md"),
+            disk_text: Some("disk".to_owned()),
+            kind: ExternalChangeKind::Modified,
+        };
+        let removed = ExternalChange {
+            path: PathBuf::from("/ws/a.md"),
+            disk_text: None,
+            kind: ExternalChangeKind::Removed,
+        };
+        assert!(!should_block_save(None));
+        assert!(should_block_save(Some(&modified)));
+        assert!(should_block_save(Some(&removed)));
+        assert!(!should_block_save_as(None));
+        assert!(should_block_save_as(Some(&modified)));
+        assert!(!should_block_save_as(Some(&removed)));
+        // 读失败无磁盘文本：另存为是唯一能解除拦截的出口，必须放行。
+        let unreadable = ExternalChange {
+            path: PathBuf::from("/ws/a.md"),
+            disk_text: None,
+            kind: ExternalChangeKind::Modified,
+        };
+        assert!(should_block_save(Some(&unreadable)));
+        assert!(!should_block_save_as(Some(&unreadable)));
     }
 }
