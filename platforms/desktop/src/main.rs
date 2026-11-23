@@ -701,28 +701,74 @@ struct MediaPlayback {
     error: Option<String>,
 }
 
-/// 根据脚注索引与点击落点计算跳转目标（D69）。
+/// 脚注回跳游标（D90）：记住最近一次「引用 → 定义」的来源引用。
 ///
-/// - 点击引用标签（`entry.references` 覆盖 `src`）→ 定义块起点；
-/// - 点击定义块（`entry.definition` 覆盖 `src`）→ 首个引用标签起点；
-/// - 两处都不匹配或没有对应目标 → `None`（交给普通点击放光标）。
+/// `source` 是该引用可见标签的源字节起点（与 `FootnoteIndex` 的区间起点一致）。
+/// 它同时表示**下次点击定义要回到的引用**：回跳后游标前移到下一条引用，实现顺序循环。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FootnoteOrigin {
+    /// 最近一次跳转的脚注标签（区分大小写，与索引一致）。
+    label: String,
+    /// 下次回跳目标的引用起点；编辑导致偏移失效时回退首个引用。
+    source: usize,
+}
+
+/// 根据脚注索引与点击落点计算跳转目标，并返回更新后的回跳游标（D69/D90）。
 ///
-/// 纯函数，便于在没有 GPUI 布局的单测里覆盖双向跳转。
-fn footnote_jump(index: &FootnoteIndex, label: &str, src: usize) -> Option<usize> {
+/// - 点击引用标签（`entry.references` 覆盖 `src`）→ 定义块起点，重置游标到该引用；
+/// - 点击定义块（`entry.definition` 覆盖 `src`）→ 首次回到游标记录的来源引用，
+///   之后按文档顺序在全部引用间循环（末条后回到首条）；游标失效时从首条开始；
+/// - 两处都不匹配或没有对应目标 → `None`（交给普通点击放光标，游标不变）。
+///
+/// 纯函数：索引由调用方按当前文档重建，游标只作为值传入/传回，便于无 GPUI 单测。
+/// 偏移漂移只做「精确起点匹配」校验，不追踪编辑历史（低风险，D90 限制）。
+fn footnote_jump(
+    index: &FootnoteIndex,
+    label: &str,
+    src: usize,
+    origin: Option<&FootnoteOrigin>,
+) -> Option<(usize, Option<FootnoteOrigin>)> {
     let entry = index.get(label)?;
-    if entry
+    // 引用命中优先：即使之前从别的引用跳过，也以当前点击为新的来源。
+    if let Some(reference) = entry
         .references
         .iter()
-        .any(|r| src >= r.start && src <= r.end)
+        .find(|r| src >= r.start && src <= r.end)
     {
-        return entry.definition.as_ref().map(|r| r.start);
+        return entry.definition.as_ref().map(|definition| {
+            (
+                definition.start,
+                Some(FootnoteOrigin {
+                    label: label.to_owned(),
+                    source: reference.start,
+                }),
+            )
+        });
     }
     if entry
         .definition
         .as_ref()
         .is_some_and(|r| src >= r.start && src <= r.end)
     {
-        return entry.references.first().map(|r| r.start);
+        let references = &entry.references;
+        if references.is_empty() {
+            return None;
+        }
+        // 游标只在同一标签、且起点仍精确命中某条引用时有效；否则从首条开始。
+        let pos = origin
+            .filter(|o| o.label == label)
+            .and_then(|o| references.iter().position(|r| r.start == o.source))
+            .unwrap_or(0);
+        let target = references[pos].start;
+        // 游标前移一条（末条回到首条）：下次点定义按顺序循环，无需额外计数状态。
+        let next_pos = (pos + 1) % references.len();
+        return Some((
+            target,
+            Some(FootnoteOrigin {
+                label: label.to_owned(),
+                source: references[next_pos].start,
+            }),
+        ));
     }
     None
 }
@@ -2751,6 +2797,10 @@ struct DocView {
     ///
     /// 与 `caret_scroll_key` 分开，避免普通光标移动的“最小滚动”覆盖跳转置顶。
     scroll_to_source_top: Option<usize>,
+    /// 最近一次脚注「引用 → 定义」的来源游标（D90，仅当前标签会话有效）。
+    ///
+    /// 点击定义时据此回到实际点击的引用，并在连续点击间循环；切换标签时清空。
+    footnote_origin: Option<FootnoteOrigin>,
     /// 焦点句柄：键盘事件只在获得焦点后送达。
     focus: FocusHandle,
     /// 光标当前是否处于闪烁的“可见”相位（每 500ms 翻转）。
@@ -2928,6 +2978,7 @@ impl DocView {
             content_height: px(0.),
             caret_scroll_key: None,
             scroll_to_source_top: None,
+            footnote_origin: None,
             focus,
             cursor_visible: false,
             _blink_task: Task::ready(()),
@@ -4872,11 +4923,12 @@ impl DocView {
         (!url.is_empty()).then(|| url.to_string())
     }
 
-    /// 命中坐标处的脚注标签，返回跳转目标源偏移（D69；Cmd+点击用）。
+    /// 命中坐标处的脚注标签，返回跳转目标源偏移并更新回跳游标（D69/D90；Cmd+点击用）。
     ///
     /// 只认投影里 `RunStyle::Footnote` 的片段（标签重编号前是 `[^label]` 的 label）：
-    /// 引用 → 定义块起点，定义标签 → 首个引用；其余位置返回 `None`，让普通点击放光标。
-    fn footnote_target_at(&self, position: Point<Pixels>) -> Option<usize> {
+    /// 引用 → 定义块起点，定义块 → 来源引用（连续点击顺序循环）；其余位置返回 `None`，
+    /// 让普通点击放光标。索引每次按当前文档重建，来源只能存于 `footnote_origin`。
+    fn footnote_target_at(&mut self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout.as_ref()?;
         let (row, col) = layout.hit(position)?;
         let block = &layout.blocks[row];
@@ -4886,7 +4938,15 @@ impl DocView {
                 && col < run.display_start + run.text.chars().count()
         })?;
         let src = block.source_of_col(col);
-        footnote_jump(&self.doc.footnote_index(), &run.text, src)
+        // 先借用当前游标算出结果，再整体替换，避免同时持有 `self` 的可变/不可变借用。
+        let (target, next) = footnote_jump(
+            &self.doc.footnote_index(),
+            &run.text,
+            src,
+            self.footnote_origin.as_ref(),
+        )?;
+        self.footnote_origin = next;
+        Some(target)
     }
 
     /// 导出当前文档为所选格式并保存到文件（D82、D83、D84）。
@@ -5348,6 +5408,8 @@ impl DocView {
         self.layout = None;
         self.caret_scroll_key = None;
         self.scroll_to_source_top = None;
+        // 回跳游标含旧文档的源字节偏移，跨标签必须清空，避免误跳到新文档同偏移处。
+        self.footnote_origin = None;
         self.highlighter = None;
         self.find = FindState::default();
         self.saved_text = saved_text;
@@ -10965,7 +11027,7 @@ mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
         BASE, BlockStyle, CHART_VERTICAL_PAD, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos,
-        Document, ExportFormat, ExportStatus, ExportStatusKind, MATH_VERTICAL_PAD,
+        Document, ExportFormat, ExportStatus, ExportStatusKind, FootnoteOrigin, MATH_VERTICAL_PAD,
         QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, SAMPLE, Settings, app_menus,
         block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
         chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
@@ -12034,7 +12096,7 @@ mod tests {
         assert_eq!(super::percent_decode("%ZZ"), "%ZZ");
     }
 
-    /// 脚注 Cmd+点击：引用 → 定义块起点，定义 → 首个引用；未知标签/无关落点不跳转。
+    /// 脚注 Cmd+点击：引用 → 定义块起点并记录来源，定义 → 该来源；未知标签/无关落点不跳转。
     #[test]
     fn footnote_jump_resolves_both_directions() {
         let src = "见[^a]。\n\n[^a]: note\n";
@@ -12043,18 +12105,99 @@ mod tests {
         let reference = entry.references[0].start;
         let definition = entry.definition.as_ref().expect("应有定义").start;
 
-        assert_eq!(footnote_jump(&index, "a", reference), Some(definition));
+        let (target, origin) = footnote_jump(&index, "a", reference, None).expect("引用应可跳转");
+        assert_eq!(target, definition);
         assert_eq!(
-            footnote_jump(&index, "a", definition),
-            Some(reference),
-            "点击定义块应回跳到首个引用"
+            origin,
+            Some(FootnoteOrigin {
+                label: "a".to_owned(),
+                source: reference,
+            })
         );
-        assert_eq!(footnote_jump(&index, "missing", reference), None);
+        let (target, next) = footnote_jump(&index, "a", definition, origin.as_ref())
+            .expect("定义应可回跳到来源引用");
+        assert_eq!(target, reference, "点击定义块应回到实际点击的引用");
         assert_eq!(
-            footnote_jump(&index, "a", definition - 1),
-            None,
+            next,
+            Some(FootnoteOrigin {
+                label: "a".to_owned(),
+                source: reference,
+            }),
+            "单引用循环后仍指向自身"
+        );
+        assert!(footnote_jump(&index, "missing", reference, None).is_none());
+        assert!(
+            footnote_jump(&index, "a", definition - 1, None).is_none(),
             "定义块之外的落点不跳转"
         );
+        assert!(
+            footnote_jump(&index, "a", usize::MAX, None).is_none(),
+            "非法偏移不跳转"
+        );
+    }
+
+    /// 多引用：从第二条引用进入定义后按文档顺序循环（2 → 3 → 1 → 2）。
+    #[test]
+    fn footnote_jump_cycles_references_in_document_order() {
+        let src = "甲[^a]乙[^a]丙[^a]\n\n[^a]: note\n";
+        let index = mazha_md::FootnoteIndex::new(src, &mazha_md::parse(src));
+        let entry = index.get("a").expect("应有脚注 a");
+        let references: Vec<usize> = entry.references.iter().map(|r| r.start).collect();
+        let definition = entry.definition.as_ref().expect("应有定义").start;
+        assert_eq!(references.len(), 3, "应识别到三条引用");
+
+        let (target, mut origin) =
+            footnote_jump(&index, "a", references[1], None).expect("引用应可跳转");
+        assert_eq!(target, definition);
+        for expected in [references[1], references[2], references[0], references[1]] {
+            let (target, next) =
+                footnote_jump(&index, "a", definition, origin.as_ref()).expect("定义应可循环回跳");
+            assert_eq!(target, expected, "连续点击定义应按引用顺序循环");
+            origin = next;
+        }
+    }
+
+    /// 游标跨标签/偏移失效时回退首引用；无引用定义与无定义引用都不跳转。
+    #[test]
+    fn footnote_jump_falls_back_for_stale_origin_and_missing_targets() {
+        let src = "甲[^a]乙[^a]\n\n[^a]: note\n[^only]: lone\n";
+        let index = mazha_md::FootnoteIndex::new(src, &mazha_md::parse(src));
+        let entry = index.get("a").expect("应有脚注 a");
+        let references: Vec<usize> = entry.references.iter().map(|r| r.start).collect();
+        let definition = entry.definition.as_ref().expect("应有定义").start;
+
+        let stale_label = FootnoteOrigin {
+            label: "other".to_owned(),
+            source: references[1],
+        };
+        let (target, next) = footnote_jump(&index, "a", definition, Some(&stale_label))
+            .expect("跨标签游标应回退首引用");
+        assert_eq!(target, references[0]);
+        assert_eq!(
+            next,
+            Some(FootnoteOrigin {
+                label: "a".to_owned(),
+                source: references[1],
+            })
+        );
+        let (target, _) = footnote_jump(&index, "a", definition, next.as_ref()).unwrap();
+        assert_eq!(target, references[1], "回退后继续按顺序循环");
+
+        let stale_offset = FootnoteOrigin {
+            label: "a".to_owned(),
+            source: usize::MAX,
+        };
+        let (target, _) = footnote_jump(&index, "a", definition, Some(&stale_offset)).unwrap();
+        assert_eq!(target, references[0], "偏移漂移后回退首引用");
+
+        let only = index.get("only").expect("应有定义 only");
+        let only_definition = only.definition.as_ref().expect("应有定义").start;
+        assert!(footnote_jump(&index, "only", only_definition, None).is_none());
+
+        let ghost_src = "见[^ghost]\n";
+        let ghost = mazha_md::FootnoteIndex::new(ghost_src, &mazha_md::parse(ghost_src));
+        let ghost_ref = ghost.get("ghost").unwrap().references[0].start;
+        assert!(footnote_jump(&ghost, "ghost", ghost_ref, None).is_none());
     }
 
     /// 全工作区搜索：逐行命中、行号 1 基、源偏移跨行累计、大小写与 CJK 均正确。

@@ -139,7 +139,7 @@ fn render_body(source: &str, blocks: &[Block], out: &mut String, xhtml: bool) {
     }
 }
 
-/// 渲染文末脚注列表中的一项：`<li>` + 定义正文 + 回到首个引用的 `↩` 回链。
+/// 渲染文末脚注列表中的一项：`<li>` + 定义正文 + 到全部引用的 `↩` 回链（D90）。
 ///
 /// 序号已经由 `prepare` 写进标签（并作为 `<li id="fn-N">` 的锚点），
 /// 因此跳过定义头部的标签片段，避免正文里再出现一次上标序号。
@@ -156,7 +156,7 @@ fn render_footnote_item(
     };
     let _ = write!(out, "<li id=\"fn-{}\">", escape_attr(label));
     render_footnote_body_children(source, block, out, xhtml);
-    push_backlink(label, index, out);
+    push_backlinks(label, index, out);
     out.push_str("</li>\n");
 }
 
@@ -192,16 +192,41 @@ fn render_footnote_head_label(source: &str, block: &Block, out: &mut String) {
     }
 }
 
-/// 输出文末定义 → 首个正文引用的回链（D81）。
+/// 一条回链的可视文本（D90）。
 ///
-/// 多次引用只回跳第一个，与桌面 `footnote_jump` 的定义→首个引用语义一致；
-/// 未被引用（无锚点）的定义不输出回链。
-fn push_backlink(label: &str, index: &FootnoteIndex, out: &mut String) {
-    if let Some(first) = index.get(label).and_then(|e| e.references.first()) {
+/// 单次引用保持 D81 的原样 `↩`（保证既有导出逐字节不变）；多条引用按顺序用
+/// Unicode 上标数字 `↩¹`/`↩²`/… 标注，逐位映射可覆盖两位数，避免新增 `<sup>`
+/// 标签或 CSS 影响行高与既有单引用输出。
+fn backlink_text(ordinal: usize, total: usize) -> String {
+    const SUPERSCRIPT: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    let mut text = String::from("↩");
+    if total > 1 {
+        // `to_string` 只产 ASCII 数字，逐位映射不会越界。
+        for digit in ordinal.to_string().bytes() {
+            text.push(SUPERSCRIPT[(digit - b'0') as usize]);
+        }
+    }
+    text
+}
+
+/// 输出文末定义 → 正文引用的全部回链（D81 单条、D90 多条）。
+///
+/// 每条引用都有独立 `fnref-{源字节偏移}` 锚点，按 `references` 文档顺序生成一条回链；
+/// 未被引用（无锚点）的定义不输出回链。单引用仍输出原样的 `<a …>↩</a>`，
+/// 多链接之间只加一个空格，沿用既有 `.fnback` 样式且不引入 JS。
+fn push_backlinks(label: &str, index: &FootnoteIndex, out: &mut String) {
+    let Some(entry) = index.get(label) else {
+        return;
+    };
+    for (i, reference) in entry.references.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
         let _ = write!(
             out,
-            "<a class=\"fnback\" href=\"#fnref-{}\">↩</a>",
-            first.start
+            "<a class=\"fnback\" href=\"#fnref-{}\">{}</a>",
+            reference.start,
+            backlink_text(i + 1, entry.references.len())
         );
     }
 }
@@ -1161,15 +1186,58 @@ mod tests {
 
     #[test]
     fn html_repeated_reference_shares_number_but_has_unique_anchors() {
+        // D90：同一定义的每条引用各有一条回链，分别指回自己的锚点。
         let html = to_html("甲[^note]乙[^note]\n\n[^note]: N\n");
         assert_eq!(html.matches("href=\"#fn-1\"").count(), 2, "{html}");
         assert_eq!(html.matches("<li id=\"fn-1\">").count(), 1, "{html}");
-        // 多次引用各自有唯一锚点；定义回链只指向第一个（与桌面 footnote_jump 一致）
         assert!(html.contains("id=\"fnref-5\""), "{html}");
         assert!(html.contains("id=\"fnref-12\""), "{html}");
-        assert_eq!(html.matches("class=\"fnback\"").count(), 1, "{html}");
-        assert!(html.contains("href=\"#fnref-5\""), "{html}");
-        assert!(!html.contains("href=\"#fnref-12\""), "{html}");
+        assert_eq!(
+            html,
+            "<p>甲<sup class=\"fnref\"><a id=\"fnref-5\" href=\"#fn-1\">1</a></sup>乙\
+             <sup class=\"fnref\"><a id=\"fnref-12\" href=\"#fn-1\">1</a></sup></p>\
+             <section class=\"footnotes\">\n<ol>\n<li id=\"fn-1\"> N\
+             <a class=\"fnback\" href=\"#fnref-5\">↩¹</a> \
+             <a class=\"fnback\" href=\"#fnref-12\">↩²</a></li>\n</ol>\n</section>"
+        );
+    }
+
+    #[test]
+    fn html_footnote_backlink_text_is_plain_for_single_and_superscript_for_many() {
+        use super::backlink_text;
+        // 单引用输出与 D81 逐字节一致；多、两位数用上标数字紧凑区分。
+        assert_eq!(backlink_text(1, 1), "↩");
+        assert_eq!(backlink_text(1, 2), "↩¹");
+        assert_eq!(backlink_text(2, 2), "↩²");
+        assert_eq!(backlink_text(10, 12), "↩¹⁰");
+        assert_eq!(backlink_text(123, 200), "↩¹²³");
+    }
+
+    #[test]
+    fn html_three_references_emit_three_ordered_backlinks_in_xhtml() {
+        // D90：EPUB 走同一 XHTML 渲染路径，回链数量/顺序/锚点与 HTML 一致。
+        let html = to_xhtml_body("甲[^a]乙[^a]丙[^a]\n\n[^a]: A\n");
+        let anchors: Vec<_> = html
+            .match_indices("class=\"fnback\" href=\"#fnref-")
+            .map(|(pos, _)| {
+                let rest = &html[pos + "class=\"fnback\" href=\"#fnref-".len()..];
+                rest.split('"').next().unwrap().to_owned()
+            })
+            .collect();
+        let source = crate::footnotes::prepare("甲[^a]乙[^a]丙[^a]\n\n[^a]: A\n");
+        let index = mazha_md::FootnoteIndex::new(&source, &mazha_md::parse(&source));
+        // `prepare` 已把标签重写为序号，故按序号 1 查找。
+        let expected: Vec<_> = index
+            .get("1")
+            .unwrap()
+            .references
+            .iter()
+            .map(|r| r.start.to_string())
+            .collect();
+        assert_eq!(anchors, expected, "{html}");
+        assert!(html.contains(">↩¹</a>"), "{html}");
+        assert!(html.contains(">↩²</a>"), "{html}");
+        assert!(html.contains(">↩³</a>"), "{html}");
     }
 
     #[test]
