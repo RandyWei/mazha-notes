@@ -28,6 +28,10 @@ pub enum StoreError {
     /// 底层 IO 错误。
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
+
+    /// 文件监听后端错误（创建 watcher、注册监听、线程启动失败；D91）。
+    #[error("监听错误：{0}")]
+    Watch(String),
 }
 
 impl StoreError {

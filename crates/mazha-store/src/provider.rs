@@ -2,6 +2,7 @@
 
 use crate::error::StoreResult;
 use crate::path::DocPath;
+use crate::watcher::WatchHandle;
 use std::time::SystemTime;
 
 /// 存储 Provider 能力描述。
@@ -16,6 +17,8 @@ pub struct StorageCaps {
     pub versioning: bool,
     /// 是否支持协作同步。
     pub collaboration: bool,
+    /// 是否支持工作区文件监听（D91）。
+    pub watch: bool,
 }
 
 /// 目录项类型。
@@ -85,4 +88,16 @@ pub trait StorageProvider: Send + Sync {
     /// # Errors
     /// 目标不存在或删除失败时返回 [`crate::StoreError`]。
     fn remove(&self, path: &DocPath) -> StoreResult<()>;
+
+    /// 递归监听 `dir` 子树的文件变更。
+    ///
+    /// 默认返回 `Ok(None)` 表示 Provider 无监听能力（调用方无需 panic 或特判）；
+    /// 支持监听的 Provider 应同时把 [`StorageCaps::watch`] 置为 `true`。
+    /// 返回的句柄为 `Send`，drop 即停止监听（D91）。
+    ///
+    /// # Errors
+    /// `dir` 不存在/不是目录，或监听后端初始化失败时返回 [`crate::StoreError`]。
+    fn watch(&self, _dir: &DocPath) -> StoreResult<Option<Box<dyn WatchHandle>>> {
+        Ok(None)
+    }
 }

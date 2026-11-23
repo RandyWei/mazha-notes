@@ -167,7 +167,7 @@ mazha-notes-v2/
 | `mazha-core` | 文档模型、编辑命令、撤销栈、光标/选区、显示↔源偏移映射、投影生成、表格结构编辑、代码块语法高亮、查找/替换 | 任何 GUI | `Document` `Edit` `Projection` `OffsetMap` `Selection` `edit_table` `Highlighter` `find_all` `replace_all` |
 | `mazha-md` | Markdown 解析、GFM+知识库方言、脚注（引用 + 定义 + 索引/编号）、公式（行内 `$…$` + 块级 `$$…$$`）、HTML 块（CommonMark 类型 1–5）、增量解析（脏块重解析）、序列化 | GUI | `parse` `SyntaxSpan` `Block` `FootnoteIndex` `serialize` |
 | `mazha-crdt` | 用 yrs 维护 `Y.Text`，同步协议、状态向量、合并、持久化更新 | GUI | `CrdtDoc` `SyncMessage` |
-| `mazha-store` | 存储 Provider 抽象 + 本地文件系统实现 + 文件监听 | GUI | `StorageProvider` `FileSystemProvider` |
+| `mazha-store` | 存储 Provider 抽象 + 本地文件系统实现 + 文件监听（store 层，0.1.116） | GUI | `StorageProvider` `FileSystemProvider` `StorageCaps::watch` `WatchEvent` `WatchHandle` `normalize_watch_events` `coalesce_watch_events` |
 | `mazha-export` | 源文本 → HTML / PDF / DOCX / EPUB | GUI | `to_html` / `to_pdf` / `to_docx` / `to_epub` |
 | `mazha-plugin` | WASM 插件宿主、能力授权、存储插件桥 | GUI | `PluginHost` `Capability` |
 | `mazha-ffi` | UniFFI 接口定义，供 Swift/Kotlin/ArkTS 调用 | GUI | 见 6.4 |
@@ -392,24 +392,91 @@ pub struct ChangeSummary {
 /// 工作区内相对路径（`/` 分隔、禁 `..`/`.`/空段/绝对前缀/反斜杠）
 pub struct DocPath(/* normalized */);
 
+/// Provider 能力（原四个 bool + 文件监听）
+pub struct StorageCaps {
+    pub writable: bool,
+    pub streaming: bool,
+    pub versioning: bool,
+    pub collaboration: bool,
+    pub watch: bool,                                       // 是否支持工作区文件监听
+}
+
 pub trait StorageProvider: Send + Sync {
     fn id(&self) -> &'static str;                          // "local" | "mazha-cloud" | "plugin:xxx"
-    fn capabilities(&self) -> StorageCaps;                 // writable/streaming/versioning/collaboration
+    fn capabilities(&self) -> StorageCaps;
     fn list(&self, dir: &DocPath) -> Result<Vec<Entry>>;   // 不递归，目录在前
     fn read(&self, path: &DocPath) -> Result<Vec<u8>>;
     fn write(&self, path: &DocPath, data: &[u8]) -> Result<()>;   // 覆盖并自动建父目录
     fn rename(&self, from: &DocPath, to: &DocPath) -> Result<()>;
     fn remove(&self, path: &DocPath) -> Result<()>;        // 目录递归删除
+    /// 递归监听 `dir` 子树；默认实现返回 `Ok(None)` 表示 Provider 无监听能力。
+    /// 不支持时不得 panic；目录不存在/非目录 → `NotDirectory`；后端失败 → `StoreError::Watch`。
+    fn watch(&self, dir: &DocPath) -> Result<Option<Box<dyn WatchHandle>>> { Ok(None) }
 }
+
+/// 规范化事件种类（仅四类）
+pub enum WatchEventKind { Create, Modify, Remove, Rename }
+
+/// 规范化文件事件：路径一律工作区相对 `DocPath`，仅 Markdown（`.md`/`.markdown`）
+pub enum WatchEvent {
+    Created  { path: DocPath },
+    Modified { path: DocPath },
+    Removed  { path: DocPath },
+    Renamed  { from: DocPath, to: DocPath },  // 仅 notify 同时给出旧/新路径时产生
+}
+impl WatchEvent {
+    pub fn kind(&self) -> WatchEventKind;
+    pub fn path(&self) -> &DocPath;            // Rename 取 `to`
+}
+
+/// 监听句柄：`Send`，可跨线程持有；`recv` 阻塞、`try_recv` 非阻塞。
+/// **drop 句柄即停止监听**并释放 OS watch（内部线程 join 后退出）。
+pub trait WatchHandle: Send {
+    fn recv(&self) -> Option<WatchEvent>;      // 已停止/通道关闭返回 None
+    fn try_recv(&self) -> Option<WatchEvent>;
+}
+
+/// 纯函数：notify 原始事件 → 规范化事件（过滤目录/非 Markdown/非 UTF-8/根外路径）
+pub fn normalize_watch_events(root: &Path, event: &notify::Event) -> Vec<WatchEvent>;
+/// 纯函数：按到达顺序折叠短时间内同一路径的重复修改
+pub fn coalesce_watch_events(events: &[(Instant, WatchEvent)], window: Duration) -> Vec<WatchEvent>;
 ```
+
+**监听契约细则（0.1.116，D91）**：
+
+- `StorageCaps.watch` 为 `true` 的 Provider 才可能返回 `Some(handle)`；其余 Provider 走 trait
+  默认实现返回 `None`，调用方无需特判 panic。`FileSystemProvider::watch` 为**递归**监听，
+  监听根 = `dir` 解析出的绝对路径，内部把 notify 事件的绝对/相对路径 `strip_prefix(root)`
+  转成 [`DocPath`]。
+- **过滤**：只上报 Markdown 文件（`.md`/`.markdown`，大小写不敏感）；目录事件、路径不能
+  `strip_prefix`（工作区外）、非 UTF-8、无法构造合法 `DocPath` 的事件一律忽略。
+- **事件映射**：`Create`→`Created`，`Modify::{Data,Metadata,Any}`/`EventKind::Any`→`Modified`，
+  `Remove`→`Removed`，`Modify::Name(Both)`→`Renamed { from, to }`；`RenameMode::{From,To}`
+  因单个事件拿不到成对路径，分别降级为 `Removed` / `Created`（不跨事件猜测配对）。
+  `Access` 事件忽略。
+- **去重/合并**：`coalesce_watch_events` 以**首次发出**的事件为准：同一路径（Rename 以 `to`
+  为键）在 `window` 内的后续 `Modified` 被丢弃；`Created` 后紧随的 `Modified` 也折叠进
+  `Created`；删除后的修改、重命名、窗口外的修改原样透传。内部监听线程在投递到接收器前
+  执行该函数，窗口取 150ms（常量，不暴露配置项）；事件的 `Instant` 由接收回调打上。
+- **自写文件反馈**：Provider 自身的 `write`/`rename`/`remove` 也会被 OS 监听器捕获，store
+  **不做内部抑制**，一律按真实磁盘事件上报（D91）；上层（桌面）应按「该路径是否正被本应用
+  编辑且脏」比对内容后决定是否提示/重载，store 层不感知编辑器状态。纯函数测试断言
+  `Modify(Data)` 事件**原样产出 `Modified`**，以此锁定该策略。
+- **生命周期/错误**：`watch()` 失败（目录不存在/后端初始化或注册失败）返回 `StoreError`；
+  监听器在内部线程运行，不改变 `StorageProvider` 的同步契约（D24 不翻案）；后端运行期错误
+  不进入事件流（回调里直接忽略），由 UI 层在需要时重新建监听。句柄 drop 后 `recv` 返回
+  `None`。核心 crate 仍**不依赖任何 GUI**。
 
 - 默认实现 `FileSystemProvider`（本地文件系统）；`DocPath` 定义在 `mazha-store`，
   由 `mazha-core` 复用（依赖方向 `core → store`，避免循环）。
 - 云/自部署/用户自定义存储均以 Provider 形式接入，其中用户自定义走 **WASM 插件**（第 6.3 节）。
 - 付费用户连接官方云服务，本质是 `mazha-cloud` Provider；是否收费与 Provider 接口无关。
 - **MVP 采用同步接口**（决策 D24，第 14 节）：本地文件系统是唯一 Provider，同步 IO
-  足够且免去异步运行时依赖。异步/流式能力（以及 `watch` 文件监听）留待 Phase 5
-  接入云端 Provider 时评估。
+  足够且免去异步运行时依赖。异步/流式能力仍推迟；**文件监听已在 Phase 5 的 store 层落地**
+  （0.1.116，内部线程，同步 API 不变），桌面接入属后续一期。
+- **本期边界**：仅 `mazha-store` API/实现/纯函数单测 + 文档与锁文件；**不修改**
+  `platforms/desktop/src/main.rs`。外部文件变更后编辑器如何提示/重载、脏文档冲突处理
+  涉及 UX 决策，列为后续待办（见 §15 0.1.116 与 `HANDOFF.md` 下一步）。
 
 ### 6.3 插件 ABI（WASM）
 
@@ -517,6 +584,7 @@ interface Workspace {
 | DOCX 导出 | `docx-rs` 1.1（[`mazha-export::to_docx`]） | 纯 Rust；基于 `mazha-md` 块/片段模型直接生成 OOXML（标题用直接格式、行内 粗/斜/删除线/行内代码、链接「文字 + (URL)」、图片占位、GFM 表格、列表/任务/引用/提示块/代码块/分割线），决策 D26 |
 | EPUB 导出 | Zip + XHTML（复用 `to_html` 同源渲染，[`mazha-export::to_epub`]） | 纯 Rust；EPUB 3 容器（`mimetype` 首条目且不压缩 / `container.xml` / `content.opf` / `nav.xhtml` / `toc.ncx` / XHTML 正文），正文走 XHTML 方言（空元素自闭合、布尔属性带值），决策 D27 |
 | 导出主题/模板 | 自研 [`mazha-export::Theme`]（HTML/EPUB 的 CSS）与 [`mazha-export::Template`]（PDF/Typst 的版式前置） | 纯 Rust；内置主题 `light`/`dark`/`sepia`、模板 `plain`/`article`，均确定性常量，可 `custom`；`Template::article` 不覆盖字体族以保留 CJK 回退，决策 D28 |
+| 文件监听 | `notify` 9（`mazha-store`，纯 Rust 无 GUI；MSRV 1.91 ≤ 工作区 1.92） | `recommended_watcher` 递归监听，内部线程 + `mpsc`，事件规范化/去重为纯函数；桌面独立 workspace 已有 notify 8 传递依赖，锁文件新增 notify 9 但保留原条目（D91） |
 | 字体/中文字形 | `[待确认]` 系统字体 + 内置 CJK 子集 | Web/wasm 需内置 |
 
 ---
@@ -561,7 +629,7 @@ interface Workspace {
 | Phase 2 | 桌面 GPUI：只读投影渲染 + WYSIWYG 显隐标记 + IME | Phase 1 | 6–10 |
 | Phase 3 | `OffsetMap` 完善（跨行选区/命中/IME）+ 块级 widget（表格/图片/代码/公式/图表） | Phase 2 | 6–10 |
 | Phase 4 | 文件管理/多标签/命令面板/导出 + 大纲/搜索/主题 | Phase 3 | 4–6 |
-| Phase 5 | `mazha-crdt`（yrs）+ `mazha-store` Provider + WASM 插件 + 云服务端（独立 SPEC） | Phase 4 | 8–12 |
+| Phase 5 | `mazha-crdt`（yrs）+ `mazha-store` Provider（含文件监听 store 层，0.1.116；桌面接入留下一期）+ WASM 插件 + 云服务端（独立 SPEC） | Phase 4 | 8–12 |
 | Phase 6 | 移动端 iOS/Android（UniFFI + 原生 UI + 交互规范） | Phase 5 | 8–12 |
 | Phase 7 | Web：spike → 方案 A/B → 实现 | Phase 6 | 4–8 |
 | Phase 8 | HarmonyOS（ArkUI + NAPI） | Phase 6 | 待评估 |
@@ -736,11 +804,13 @@ interface Workspace {
 | D89 | 脚注多段落定义（容器体，lazy continuation 排除） | **问题**：D35/D69/D81 仅支持叶子式脚注定义（首行正文 + 缩进 ≥4 的续行按同一段落软/硬换行拼接），无法表达定义内的多段落/多块内容；导出虽可归集定义，但体只能按单段渲染。**决策**：① **模型**：`BlockKind::FootnoteDef` 改为**容器块**（`Block::is_container()` 为真）。定义头（`[^label]:` 标记与首行正文）仍以 `spans` 表达；定义体解析为 `children` 子块。② **续行与边界**（`mazha-md::scanner`）：缩进 **≥4** 的非空行属于同一定义，构造子块扫描输入前剥离 **4 空格**定义缩进（保留更深缩进给子块自身语法，如嵌套列表/代码块/引用前缀）；空行**仅当**其后存在后续非空且缩进 ≥4 的续行时才归属该定义（可跨空行连接多段/多块），否则定义在该空行前结束；首行文本可与后续多块体并存。**不支持惰性续行（lazy continuation）**（与定义前缀剥离、空行前瞻和逐字节往返约束冲突）。③ **序列化**：`FootnoteDef` 作为容器序列化——头部行按原 spans/行写回，子块按常规块序列化后逐行补加定义前缀（4 空格）并保持幂等/逐字节往返。④ **增量**：因定义可跨空行续接（需前瞻），可形成此类续接的 `FootnoteDef` 视为可向后延伸构造；`is_unclosed_fence`/安全切点校验须将其判为非安全裁切，避免局部重解析破坏块边界。⑤ **索引/导出/核心**：`FootnoteIndex` 仍按整块范围与头部标签工作（`entry_for_definition` 覆盖整个容器）；`mazha-export::footnotes::prepare` 继续按整块字节范围重编号/归集并剥离外层容器前缀（D81）；HTML/EPUB/Typst/DOCX 渲染定义体时从子块生成内容，保留锚点/回链/编号/文末归集语义（D35/D69/D81）。`mazha-core` 投影与 `Document::footnote_index()` 兼容容器定义。⑥ **限制**：不支持惰性续行；复杂 tab/混合容器前缀剥离仍按既有退化策略；WYSIWYG 不改变定义原位与标签原文。**实现**：`crates/mazha-md/src/{block,scanner,serialize,incremental,footnote}.rs`、`crates/mazha-export/src/{footnotes,html,typst,docx}.rs`、`crates/mazha-core/src/{projection,document}.rs` 及相关测试。 | 确认（Phase 3/4 脚注补齐） |
 | D90 | 脚注多引用回跳：桌面来源引用 + 顺序循环，HTML/EPUB 多回链 | **问题**：D69/D81 的多次引用只能回跳**首个**引用：桌面 `footnote_jump` 每次点击都重建 `FootnoteIndex`（已含全部 `references` 区间）却只取 `first()`，来源没有存活到定义点击；HTML/EPUB 的每个引用已有唯一 `fnref-{偏移}` 锚点，但定义侧只生成一条 `↩`，读者从第二/第三个引用进入定义后回不到点击处。**决策**：① **桌面**：`DocView` 会话字段保存最近一次「引用 → 定义」的来源（脚注标签 + 下次应回到的引用起点源字节偏移），切换标签时清空、不写回 Markdown；纯函数 `footnote_jump(index, label, src, origin)` 同时返回目标偏移与更新后的游标（回跳后游标前移一条，末条后回到首条），GPUI 事件处理只负责调用与 `goto_source`。点引用仍跳定义块起点并把游标重置到该引用；点定义首次回到该来源引用，之后连续点击按 `references` 文档顺序循环。来源标签不匹配或起始偏移在重建索引中找不到（编辑导致偏移漂移）时回退首个引用并进入下一次循环；无对应条目、无定义、无引用或无关落点返回 `None`、不改状态。② **HTML/EPUB**：`push_backlinks` 为同一定义的每条引用生成一条 `<a class="fnback" href="#fnref-{偏移}">`，可视文本为 `↩¹ ↩² …`（序号用 Unicode 上标数字，逐位映射，可覆盖两位数）；**单引用仍输出原样的单条 `↩`**，既有导出逐字节不变；多链接之间只加一个空格，沿用既有 `.fnback` 样式，静态 HTML 不引入 JS；EPUB 复用同一 XHTML 渲染路径。③ **不改动**：编辑器源文本 / `OffsetMap` / 光标与选区映射，`mazha-md::FootnoteIndex` 契约与 `FootnoteEntry` 结构（全部引用区间早已保存），编号与文末归集（D69/D81/D89），Typst/DOCX（纯编号无锚点）。**取舍**：桌面回跳状态只在当前标签会话内有效且不持久化；编辑造成偏移漂移时只能回退首引用（不做偏移追踪/CRDT 锚点，成本高且偏离低风险目标）；多回链用上标字符而非 `<sup>`/额外 CSS，避免改动单引用输出与行高。**验证**：桌面纯函数单测覆盖双向、多引用顺序循环、失效/跨标签来源回退、无定义/无引用/非法偏移；导出单测覆盖单引用输出逐字节不变、多引用回链数量/锚点/顺序/文案；根 workspace 与桌面门禁全绿。 | 确认（Phase 4 脚注打磨） |
 | D85 | 修复导出行内公式显示为 Markdown 图片源码（用户实机验收反馈） | **问题**：用户验收 0.1.109 反馈「行内公式现在显示 markdown 的图片源码了，没有正确显示图片」——块级 `$$…$$` 与 mermaid 图表正常，仅行内 `$…$` 出错。**根因核实**：`mazha-md` 把 `$x^2$` 解析为三个相邻片段：开 `$`(`MathMarker`，`abs..abs+1`)、公式体(`Math`，`abs+1..base+k`)、闭 `$`(`MathMarker`，`base+k..base+k+1`)；D84 的 `collect_from_blocks` 收集行内公式时只取 `Math` 片段的 `sp.range`（**仅公式体，不含两端 `$`**）作为 `RenderRequest::range`，键为 `source[sp.range]`。`prepare_renderables` 把 `![公式](dest)` 替换到公式体后，源码变成 `$![公式](dest)$`——图片语法被夹在 `$…$` 中；导出器 `to_html_document`/Typst 重新解析该副本时又把它识别为行内公式，将 `![公式](dest)` 作为公式**字面文本**输出，于是用户看到 markdown 图片源码。块级公式（覆盖整块含 `$$`）与 mermaid（覆盖整段围栏）替换后无残留定界符，故正常，与反馈一致。**决策**：① `render_assets.rs` 新增纯函数 `inline_math_range(spans, index)`：给定块内 `Math` 片段的下标，仅当紧邻的前一片段为 `MathMarker`、长度为 1 且 `prev.range.end == math.range.start`，以及紧邻的后一片段为 `MathMarker`、长度为 1 且 `next.range.start == math.range.end` 时，才把区间扩到覆盖这两个 `$`；否则保留公式体原区间。边界判定保证只合并与该 `Math` 首尾相接、左右各恰好一个 `$` 的定界符，不误伤其它 marker、不跨公式合并。② `collect_from_blocks` 改用该合并区间作 `RenderRequest::range`，但 `key` 仍取纯公式体 `source[sp.range]`，保证与桌面 RaTeX 渲染键完全一致（不能把 `$` 塞进 key 导致查不到资产而降级）。③ `prepare_renderables` 的倒序 `replace_range` 逻辑不变：所有请求区间在同一次遍历中收集且互不重叠，变长的区间不影响其它区间（由单测覆盖同一行多个公式互不串扰）。**限制**：只修导出副本的替换区间，编辑器源文本/`OffsetMap`/光标/选区零改动；非法/空公式仍保留原字面降级（D34/D84 既有行为）；外嵌 Markdown 中的公式若被自定义语法包裹（非 `mazha-md` 的三片段结构）不在本轮范围；DOCX 字面限制（D84）不变。截图环境不稳定，以纯函数单测 + 全门禁保证契约，待用户实机验收导出行内公式。 | 确认（Phase 4 导出修复） |
+| D91 | `mazha-store` 文件监听（D24 遗留，Phase 5 第一步） | **问题**：D24 把 `watch` 推迟到 Phase 5；MVP 后外部程序修改工作区 `.md` 时编辑器/文件树无感知，store 层缺少能力位与事件契约。**方案取舍**：① 选 `notify` 9（`recommended_watcher`，rust-version 1.91 兼容工作区 1.92，跨平台 FSEvents/inotify/ReadDirectoryChanges/kqueue；纯 Rust 无 GUI），不选自写 std 轮询（延迟高、无事件语义、要自己处理重命名配对与增量扫描）也不选异步 runtime（保持 D24 同步 trait）；监听线程封在 `FileSystemProvider` 内部，对外仍是同步 `StorageProvider::watch(dir) -> StoreResult<Option<Box<dyn WatchHandle>>>`（`Send`，drop 即停）。② `StorageCaps` 增 `watch: bool`，trait 默认返回 `Ok(None)`，不支持的 Provider 不 panic；`FileSystemProvider::watch` 对不存在/非目录返回 `NotDirectory`，后端失败返回 `StoreError::Watch`。③ 事件模型固定四类（Created/Modified/Removed/Renamed{from,to}），路径一律工作区相对 `DocPath`；只上报 `.md`/`.markdown`，忽略目录/非 UTF-8/根外路径；`RenameMode::{From,To}` 降级为 Removed/Created（不跨事件猜配对）。④ 原始事件→规范化事件与「短时间内同一路径重复修改折叠」抽成**纯函数**（`normalize_watch_events`/`coalesce_watch_events`）并配单测，监听线程只负责收事件、打时间戳、调纯函数、投递；窗口固定 150ms，首次发出的事件优先（Created+Modify 折叠为 Created）。⑤ **自写文件反馈**：store 不内部抑制自身 `write`/`rename`/`remove` 产生的事件，一律按真实磁盘事件上报；上层按「路径是否正在编辑且脏」比对内容后决定是否提示/重载，store 不感知编辑器状态（避免过度设计与误抑制外部同档修改）。⑥ **桌面接入边界**：本期只做 store 层，不改 `platforms/desktop/src/main.rs`；外部变更提示/重载与脏文档冲突 UX 留下一期。⑦ 锁文件：根 `Cargo.lock` 与桌面独立 `platforms/desktop/Cargo.lock` 均只**新增** notify 9 及其依赖，不升级既有条目，保留桌面锁中已 yanked 的 `zip 0.5.13`。**限制**：后端运行期错误不进入事件流（回调忽略）；无跨事件重命名配对、无文件内容哈希、无防抖配置；递归监听整棵子树，非 Markdown 事件在纯函数层过滤。 | 确认（Phase 5 第一步，store 层） |
 
 ## 15. 变更记录
 
 | 版本 | 日期 | 变更内容 |
 |------|------|----------|
+| 0.1.116 | 2026-11-23 | **`mazha-store` 文件监听 store 层（Phase 5 第一步，D91；D24 遗留）**：① **契约/文档**——SPEC §5/§6.2/§8/§10 补齐 `StorageCaps::watch`、`StorageProvider::watch`（默认 `Ok(None)`）、`WatchEvent` 四变体（Created/Modified/Removed/Renamed{from,to}）、`WatchHandle`（`Send`，drop 即停）、错误映射与事件过滤/去重语义，新增 D91（方案取舍、自写文件反馈策略、桌面接入边界）；§15 记本版。② **实现（`crates/mazha-store`）**——新增 `watcher.rs`（模块名避开 clippy `module_name_repetitions`）：纯函数 `normalize_watch_events(root, &notify::Event)`（工作区相对路径、仅 Markdown、非 UTF-8/根外/目录忽略；Rename 双路径配对）与 `coalesce_watch_events(&[(Instant, WatchEvent)], window)`（同路径 150ms 内重复修改折叠、Created+Modify 折叠为 Created）；`FileSystemProvider::watch` 用 `notify` 9 `recommended_watcher` 递归监听，内部线程 + `mpsc` 投递，句柄 drop 发停机信号并 join；`StorageCaps.watch = true`（local），`StoreError::Watch` 新变体。③ **自写反馈**——store 不抑制自身写事件，一律上报真实磁盘事件，上层按编辑/脏状态比对过滤（D91）。④ **边界**——不改 `platforms/desktop/src/main.rs`；外部变更提示/重载与脏文档冲突 UX 留下一期；核心 crate 无 GUI 依赖不变，D24 同步接口不翻案。⑤ **依赖/锁**——`notify = "9"` 加入 `mazha-store`；根 `Cargo.lock` 与桌面独立 `platforms/desktop/Cargo.lock` 仅新增依赖，保留桌面锁中 `zip 0.5.13` 等既有 yanked 条目。⑥ **验证**——`mazha-store` 单测 12 → **21**（+8 纯函数映射/去重/自写反馈 +1 真实 FS 监听，5/5 单测隔离、3/3 全套件重复运行稳定）；根 workspace `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全绿（**637** 项：core 205、crdt 11、export 188+3、ffi 1、md 206、plugin 1、store **21**、wasm 1）；桌面 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`（**94** 项不变）、`cargo build` 全绿（构建仅有既有 `__eh_frame section too large` 链接器提示）。SPEC 版本升至 **0.1.116**。 |
 | 0.1.115 | 2026-11-23 | **脚注多引用回跳（D90）**：① **契约/文档**——SPEC §9.1/§11.10 改为「桌面来源引用回跳 + 顺序循环、HTML/EPUB 多回链」，D69/D81 的「只回跳首个」限制标记为已由 D90 细化，新增 D90 决策记录（§14）。② **桌面（`platforms/desktop/src/main.rs`）**——新增 `FootnoteOrigin`（标签 + 下次应回到的引用起始字节偏移）与纯函数 `footnote_jump(index, label, src, origin)`：点引用仍跳定义块起点并把游标重置到该引用；点定义首次回到该来源，之后连续点击按 `references` 顺序循环（末条后回到首条）；游标标签不匹配或偏移失效（编辑漂移）回退首引用，无定义/无引用/非法落点返回 `None` 且游标不变；`DocView.footnote_origin` 只在当前标签会话保存，切换标签清空，GPUI 事件只调用纯函数与 `goto_source`。③ **导出（`crates/mazha-export/src/html.rs`）**——`push_backlinks` 按 `FootnoteIndex` 的全部引用生成多条 `.fnback`，各自指向 `fnref-{偏移}`；单引用仍输出原样单条 `↩`（逐字节不变），多条用 Unicode 上标数字 `↩¹ ↩² …` 区分并以单空格间隔，沿用既有 CSS、不引入 JS；EPUB/XHTML 共用同一渲染路径，Typst/DOCX 不受影响。④ **边界/约束**——编辑器源文本、`OffsetMap`、光标/选区映射零改动；`mazha-md` 索引结构与 `mazha-core` 契约不变；编号/文末归集（D69/D81/D89）不变。⑤ **验证**——桌面 3 条纯函数单测（双向 + 游标、三引用循环、跨标签/漂移回退与无定义/无引用/非法偏移），导出新增 2 条并加强 1 条（单引用逐字节、多引用锚点顺序与文案、XHTML 路径）；根 workspace `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全绿（**628** 项：core 205、crdt 11、export 188+3、ffi 1、md 206、plugin 1、store 12、wasm 1）；桌面 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`（**94** 项）、`cargo build` 全绿（构建仅有既有 `__eh_frame section too large` 链接器提示）。SPEC 版本升至 **0.1.115**。 |
 | 0.1.114 | 2026-11-20 | **脚注多段落定义（容器体，D89；lazy continuation 排除）**：① **契约/文档**——SPEC 同步 §9.1/§11.4/§11.10/§12.2，修订 D69/D81 并新增 D89（§14）；`FootnoteDef` 改为容器块：头部 `[^label]:` 与首行正文保留在定义块 `spans`，定义体解析为子块；缩进 **≥4** 的非空行为续行并在子块解析前剥离 4 空格定义缩进；空行仅在其后存在后续非空且缩进 ≥4 的续行时归属定义（可跨空行连接多段/多块）；首行文本可与后续多块体并存；**不支持惰性续行**。② **解析/模型/序列化（`mazha-md`）**——`block.rs` 将 `FootnoteDef` 纳入容器；`scanner.rs` 实现续行/空行前瞻与子块扫描输入构造；`serialize.rs` 按容器序列化头部与子块并回填定义前缀，保持逐字节往返与幂等；`footnote.rs` 索引兼容容器定义（整块范围、头部标签不计引用）。③ **增量（`mazha-md`）**——可跨空行续接的 `FootnoteDef` 视为可向后延伸构造，安全裁切校验将其判为非安全/未闭合类切点，避免局部重解析破坏块边界。④ **导出（`mazha-export`，D35/D69/D81 兼容）**——`footnotes::prepare` 继续按整块字节范围重编号与文末归集并剥离外层容器前缀；HTML/EPUB/Typst/DOCX 从定义体子块渲染多块内容，保留引用锚点/回链/编号/`<section class="footnotes"><ol>` 等语义。⑤ **核心（`mazha-core`）**——投影与 `Document::footnote_index()` 兼容容器 `FootnoteDef`。⑥ **验证**——根 workspace `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全绿（**626** 项：core 205、crdt 11、export 186+3、ffi 1、md 206、plugin 1、store 12、wasm 1）；未改 `platforms/*`。SPEC 版本升至 **0.1.114**。 |
 | 0.1.113 | 2026-11-20 | **CommonMark 类型 1–5 HTML 块（D88，方言补齐）**：① **解析/模型**——`mazha-md` 新增 `BlockKind::HtmlBlock` 叶子块，识别起始行缩进 ≤3 的类型 1（`<script|pre|style|textarea>`，大小写不敏感，按对应关闭标签闭合）、2（`<!--`→`-->`）、3（`<?`→`?>`）、4（`<!`+大写字母→`>`）、5（`<![CDATA[`→`]]>`）；同起始行可闭合，未闭合延伸至 EOF；扫描位于围栏/公式后、脚注/表格前，`starts_new_block` 纳入以支持段落中断；内容按行产出 `SpanKind::Text`/`SpanRole::Normal` 原文片段，**不做行内 Markdown 解析**，与既有行内 HTML（D56）及单行 `<video>`/`<audio>` 媒体（D64）不冲突。② **序列化/投影**——`html_block_to_md` 按行片段原样拼回并经 `prefix_lines` 回填容器前缀，引用/列表内逐字节往返与幂等；投影复用既有叶子块文本路径，无 `BlockWidgetKind`。③ **增量**——未闭合 `HtmlBlock` 纳入可向后延伸的非安全裁切构造，`is_unclosed_fence` 改为 `(block, source)` 并委托 `scanner::html_block_is_closed` 判定，闭合/删闭合/改写起始行等场景增量与全量一致。④ **导出**——HTML/XHTML/EPUB 按行原样透传（剥离容器前缀、不转义）；Typst raw fence 字面降级；DOCX 纯文本段落降级并保留行间软换行。⑤ **文件/适配**——`crates/mazha-md/src/{block,scanner,incremental,serialize}.rs`、`crates/mazha-core/src/document.rs`、`crates/mazha-export/src/{html,typst,docx}.rs`；clippy：`u8::is_ascii_uppercase`、提取 `html_block_to_md`。⑥ **验证**——根 workspace fmt/clippy/test 全绿（**612** 项：core 204、md **198**、export **181+3**、crdt 11、store 12、ffi/plugin/wasm 各 1）；未改 `platforms/*`。SPEC 版本升至 **0.1.113**。 |

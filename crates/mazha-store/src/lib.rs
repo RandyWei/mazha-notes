@@ -9,8 +9,13 @@ mod error;
 mod local;
 mod path;
 mod provider;
+mod watcher;
 
 pub use error::{StoreError, StoreResult};
 pub use local::FileSystemProvider;
 pub use path::DocPath;
 pub use provider::{Entry, EntryKind, StorageCaps, StorageProvider};
+pub use watcher::{
+    COALESCE_WINDOW, WatchEvent, WatchEventKind, WatchHandle, coalesce_watch_events,
+    normalize_watch_events,
+};

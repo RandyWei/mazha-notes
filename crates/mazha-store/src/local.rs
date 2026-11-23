@@ -3,6 +3,7 @@
 use crate::error::{StoreError, StoreResult};
 use crate::path::DocPath;
 use crate::provider::{Entry, EntryKind, StorageCaps, StorageProvider};
+use crate::watcher::{self, WatchHandle};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ impl StorageProvider for FileSystemProvider {
             streaming: false,
             versioning: false,
             collaboration: false,
+            watch: true,
         }
     }
 
@@ -109,6 +111,16 @@ impl StorageProvider for FileSystemProvider {
         } else {
             fs::remove_file(&abs).map_err(|e| StoreError::from_io(e, path))
         }
+    }
+
+    fn watch(&self, dir: &DocPath) -> StoreResult<Option<Box<dyn WatchHandle>>> {
+        let watch_path = self.resolve(dir);
+        // 显式校验目录：notify 的后端错误会变成不透明的 Watch 错误，这里给出明确语义
+        if !watch_path.is_dir() {
+            return Err(StoreError::NotDirectory(dir.to_string()));
+        }
+        // 事件路径始终相对工作区根（self.root），即使只监听子目录（D91）
+        Ok(Some(watcher::spawn_watch(self.root.clone(), &watch_path)?))
     }
 }
 
@@ -200,5 +212,37 @@ mod tests {
             p.read(&dp("nope.md")),
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn watch_reports_created_markdown_file() {
+        use crate::watcher::WatchEvent;
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new().unwrap();
+        let p = FileSystemProvider::open(dir.path()).unwrap();
+        assert!(p.capabilities().watch);
+        let handle = p.watch(&DocPath::root()).unwrap().expect("local 支持监听");
+        // FSEvents/inotify 注册后需要短暂准备时间；真实事件等待用宽松超时避免 CI 抖动
+        std::thread::sleep(Duration::from_millis(300));
+
+        let target = dp("sub/created.md");
+        p.write(&target, b"hello").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while Instant::now() < deadline {
+            // 用 let-chain 合并条件，避免 clippy::collapsible_if 警告
+            if let Some(WatchEvent::Created { path }) = handle.try_recv()
+                && path == target
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(found, "未在 5s 内收到 created.md 的创建事件");
+        // drop 句柄应停止监听线程；此处只验证 drop 不 panic，后续写入不再有接收端
+        drop(handle);
+        p.write(&dp("after-drop.md"), b"x").unwrap();
     }
 }
