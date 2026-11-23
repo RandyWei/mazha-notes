@@ -132,9 +132,10 @@ cd platforms/desktop && cargo fmt --check && cargo clippy -- -D warnings && carg
 9. **导出图片尺寸/换行优化（D86，0.1.111）已实机验收通过**（2026-11-20，用户确认）：行内公式高度贴近正文且不换行，块级公式/图表保持独占显示尺寸；DOCX 字面仍为已知限制。
 10. **块级公式缩小与导出默认文件名（D87，0.1.112）已实机验收通过**（2026-11-20，用户确认）：块级公式缩小后可读、图表与行内公式尺寸符合预期，导出默认文件名跟随 Markdown 主干。
 
-## 提交历史（近期，共 188 条）
+## 提交历史（近期，共 190 条）
 
 ```
+82ddc5b feat(crdt): 实现多文档名册 CrdtRoster（0.1.119，D94）
 6c00da0 feat(desktop/store): 接入外部文件变更监听并修复 macOS 改名同步（0.1.117/0.1.118，D92/D93）
 296af94 docs: 桌面外部文件变更交互决策（D92）
 823d1e4 feat(store): 实现工作区文件监听 store 层（0.1.116，D91）
@@ -246,7 +247,7 @@ e14e14f feat(export): PDF 编译——Typst World 实现 + to_pdf（PDF 管线�
 d60189c docs: HANDOFF 全面刷新（Phase 1 完成状态）
 ```
 
-> 更早提交见 `git log`；历史累计 = 183（含本次）。
+> 更早提交见 `git log`；历史累计 = 190（含本次）。
 
 - 2026-11-23（0.1.116）：**`mazha-store` 文件监听 store 层（Phase 5 第一步，D91；D24 遗留）**：① **契约/文档**——SPEC §5/§6.2/§8/§10 补齐 `StorageCaps::watch`、`StorageProvider::watch`（默认 `Ok(None)`，不支持时不 panic）、`WatchEvent` 四变体（Created/Modified/Removed/Renamed{from,to}）、`WatchHandle: Send`（`recv`/`try_recv`，drop 即停）、`StoreError::Watch` 与事件过滤/去重语义，新增 D91 决策记录（方案取舍、自写反馈策略、桌面接入边界）；§15 记本版。② **实现（`crates/mazha-store/src/watcher.rs`）**——纯函数 `normalize_watch_events(root, &notify::Event)`（工作区相对 `DocPath`、仅 `.md`/`.markdown`、非 UTF-8/根外/目录 Access/Other 忽略，`Modify::Name(Both)`→Renamed、`From`→Removed、`To`→Created）与 `coalesce_watch_events(&[(Instant, WatchEvent)], Window)`（同路径 150ms 内重复事件折叠、Created+Modify 合并为 Created）；`FileSystemProvider::watch` 用 `notify` 9 `recommended_watcher` 递归监听，内部线程 + `mpsc` 投递，句柄 drop 发停机信号并 join；`FileSystemProvider::capabilities().watch = true`，其它 Provider 走 trait 默认 `Ok(None)`。③ **自写反馈**——store 不抑制自身 `write`/`rename`/`remove` 事件，一律上报真实磁盘事件，上层按编辑/脏状态比对过滤（纯函数测试 `self_writes_are_exposed_as_modified_events` 锁定该契约）。④ **边界**——未改 `platforms/desktop/src/main.rs`；外部变更提示/重载与脏文档冲突 UX 留下一期；核心 crate 无 GUI 依赖不变，D24 同步接口不翻案。⑤ **依赖/锁**——`notify = "9"` 加入 `mazha-store`（rust-version 1.91，兼容工作区 1.92，notify 8 由桌面独立依赖共存）；根 `Cargo.lock` 与桌面 `platforms/desktop/Cargo.lock` 仅新增依赖，桌面锁保留 `zip 0.5.13` 等既有 yanked 条目。⑥ **验证**——`mazha-store` 12 → **21** 单测（+8 纯函数映射/去重/自写反馈 +1 真实 FS 监听，5/5 隔离与 3/3 全套件重复运行稳定）；根 workspace `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全绿（**637**：core 205、crdt 11、export 188+3、ffi 1、md 206、plugin 1、store 21、wasm 1）；桌面 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`（**94** 不变）、`cargo build` 全绿（构建仅有既有 `__eh_frame section too large` 链接器提示）。本轮已提交。
 
