@@ -1,14 +1,16 @@
-//! 桌面同步接入（Phase 5 S5a / D102，契约见 `docs/SYNC-SPEC.md` §5.10/§9.6/§11.4）。
+//! 桌面同步接入（Phase 5 S5a / D102 + S5b 第一批 / D103-D104，契约见
+//! `docs/SYNC-SPEC.md` §5.10/§5.11/§9.6/§9.7/§11.4/§11.5）。
 //!
 //! 本模块分两层：
-//! - **纯函数层**：配置解析（URL/ID/间隔/token）、状态与横幅文案、事件转发过滤；
-//!   不依赖 GPUI、不做网络，沿用 `main.rs` 的 `#[cfg(test)]` 单测风格锁定契约。
+//! - **纯函数层**：配置解析（URL/ID/间隔/token）、状态与横幅文案、事件转发过滤、
+//!   三选一标签与破坏性确认文案；不依赖 GPUI、不做网络，沿用 `main.rs` 的
+//!   `#[cfg(test)]` 单测风格锁定契约。
 //! - **线程层**：`LocalSyncEngine` + `HttpTransport` 只在专用同步线程创建/调用；
 //!   GPUI 主线程只经 `mpsc` 发命令、收状态，UI 回写由 `main.rs` 的
 //!   `cx.spawn` + `WeakView::update` 完成，绝不跨线程改 GPUI 状态。
 //!
-//! 绝不静默覆盖：网络失败保留 outbox 下轮重试，快照需确认只提示“重试同步”，
-//! 墓碑冲突副本只在横幅中可见，真正的“合并/覆盖”交互留 S5b。
+//! 绝不静默覆盖：网络失败保留 outbox 下轮重试；S5b 的“合并/覆盖”必须经横幅三选一，
+//! 破坏性选择需二次确认后才经 `SyncHandle` 发命令，引擎结果由主线程回写文档。
 
 use std::path::Path;
 #[cfg(test)]
@@ -20,7 +22,10 @@ use std::time::Duration;
 use mazha_store::{DocPath, FileSystemProvider, StorageProvider, WatchEvent};
 use mazha_sync::{DeviceId, WorkspaceId};
 use mazha_sync_http::HttpTransport;
-use mazha_sync_local::{LocalSyncEngine, LocalSyncStatus, doc_id_from_path, is_syncable_md};
+use mazha_sync_local::{
+    ConflictChoice, LocalSyncEngine, LocalSyncStatus, ResolveOutcome, SnapshotChoice,
+    doc_id_from_path, is_syncable_md,
+};
 
 use crate::settings::{DEFAULT_SYNC_INTERVAL_SECS, Settings, clamp_sync_interval};
 
@@ -340,24 +345,117 @@ pub enum SyncBannerKind {
     Confirmation,
 }
 
-/// 同步横幅上的动作（S5a 只有“重试同步”，没有“覆盖”）。
+/// 同步横幅上的动作（S5a 的“重试同步”保留原语义，三选一走 `choices`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncBannerAction {
     /// 重新发一条 `SyncNow`，绝不自动丢弃 outbox/本地文件。
     Retry,
 }
 
+/// S5b 横幅三选一：桌面展示用类型，发命令时再映射到引擎的
+/// `ConflictChoice` / `SnapshotChoice`（D104）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncChoice {
+    /// 保留本地：冲突场景用副本文本替换正文，快照场景只清除提示。
+    KeepLocal,
+    /// 采用远端：冲突场景接受删除，快照场景清空 outbox。
+    UseRemote,
+    /// 合并：冲突场景确定性拼接，快照场景保留 outbox 交给下一轮 CRDT 合并。
+    Merge,
+}
+
+impl From<SyncChoice> for ConflictChoice {
+    fn from(choice: SyncChoice) -> Self {
+        match choice {
+            SyncChoice::KeepLocal => Self::KeepLocal,
+            SyncChoice::UseRemote => Self::UseRemote,
+            SyncChoice::Merge => Self::Merge,
+        }
+    }
+}
+
+impl From<SyncChoice> for SnapshotChoice {
+    fn from(choice: SyncChoice) -> Self {
+        match choice {
+            SyncChoice::KeepLocal => Self::KeepLocal,
+            SyncChoice::UseRemote => Self::UseRemote,
+            SyncChoice::Merge => Self::Merge,
+        }
+    }
+}
+
+/// 选择按钮的中文标签（纯函数，UI 只渲染，不自行拼业务文案）。
+#[must_use]
+pub fn sync_choice_label(choice: SyncChoice) -> &'static str {
+    match choice {
+        SyncChoice::KeepLocal => "保留本地",
+        SyncChoice::UseRemote => "采用远端",
+        SyncChoice::Merge => "合并",
+    }
+}
+
+/// 破坏性选择的二次确认文案；非破坏性选择返回 `None`（可直接发送命令）。
+///
+/// 只按“横幅种类 + 选择”判定，不读 GPUI 状态：这样主线程第一次点击只显示文案，
+/// 第二次点击才发命令，且任何覆盖语义都在文案里写明，绝不静默丢弃数据。
+#[must_use]
+pub fn destructive_choice_confirmation_text(
+    kind: SyncBannerKind,
+    choice: SyncChoice,
+) -> Option<String> {
+    match (kind, choice) {
+        (SyncBannerKind::Conflict, SyncChoice::KeepLocal) => Some(
+            "将用同步状态中的冲突副本文本替换当前文档正文，未同步的本地改动会被替换。确认执行？"
+                .to_owned(),
+        ),
+        (SyncBannerKind::Conflict, SyncChoice::UseRemote) => Some(
+            "将接受远端删除：保留墓碑与冲突副本作审计，不写回文档正文。确认执行？"
+                .to_owned(),
+        ),
+        (SyncBannerKind::Confirmation, SyncChoice::UseRemote) => Some(
+            "将清空未推送 outbox，放弃本地未推送批次；本地文件暂不改动，下一轮同步才由服务端快照覆盖。确认执行？"
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 /// 同步横幅的完整展示数据（纯数据，GPUI 只负责渲染）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncBanner {
-    /// 横幅种类（决定颜色/是否常驻）。
+    /// 横幅种类（决定颜色/是否常驻，也用于二次确认文案）。
     pub kind: SyncBannerKind,
     /// 主标题。
     pub title: String,
     /// 详细说明（含冲突 DocId）。
     pub detail: String,
-    /// 操作按钮；冲突横幅在 S5a 没有可执行动作。
+    /// S5a 的“重试同步”按钮，保持 D102 原语义。
     pub action: Option<SyncBannerAction>,
+    /// S5b 三选一按钮（复用 D92 横幅样式，不替换 `action`）。
+    pub choices: Vec<SyncChoice>,
+    /// 本次选择针对的文档 ID；快照横幅取当前文档，仅用于回写路径定位。
+    pub target_doc_id: Option<String>,
+}
+
+/// 横幅三选一的固定顺序（保留本地 / 采用远端 / 合并）。
+const ALL_SYNC_CHOICES: [SyncChoice; 3] = [
+    SyncChoice::KeepLocal,
+    SyncChoice::UseRemote,
+    SyncChoice::Merge,
+];
+
+/// 冲突横幅的目标文档：当前文档在冲突列表中时优先处理它，否则取升序第一项。
+#[must_use]
+pub fn conflict_target_doc_id(
+    status: &LocalSyncStatus,
+    current_doc_id: Option<&str>,
+) -> Option<String> {
+    status
+        .conflict_docs
+        .iter()
+        .find(|id| current_doc_id == Some(id.as_str()))
+        .or_else(|| status.conflict_docs.first())
+        .cloned()
 }
 
 /// 依据引擎状态生成横幅：需确认优先，其次冲突；都没有则不显示。
@@ -378,6 +476,8 @@ pub fn sync_banner(status: &LocalSyncStatus, current_doc_id: Option<&str>) -> Op
             title: "同步快照需用户确认".to_owned(),
             detail,
             action: Some(SyncBannerAction::Retry),
+            choices: ALL_SYNC_CHOICES.to_vec(),
+            target_doc_id: current_doc_id.map(ToOwned::to_owned),
         });
     }
     if !status.conflict_docs.is_empty() {
@@ -386,6 +486,8 @@ pub fn sync_banner(status: &LocalSyncStatus, current_doc_id: Option<&str>) -> Op
             title: format!("同步发现 {} 个冲突文档", status.conflict_docs.len()),
             detail: format!("{docs}：数据已保存在同步状态中，未静默删除。"),
             action: None,
+            choices: ALL_SYNC_CHOICES.to_vec(),
+            target_doc_id: conflict_target_doc_id(status, current_doc_id),
         });
     }
     None
@@ -398,6 +500,20 @@ pub enum SyncCommand {
     SyncNow,
     /// 工作区文件事件；同步线程只标脏，不做 D92 的 reload/横幅判定。
     WatchEvents(Vec<WatchEvent>),
+    /// S5b：显式解决一个墓碑冲突；`local_text` 是当前文档正文（合并用）。
+    ResolveConflict {
+        /// 目标文档 ID（工作区相对路径）。
+        doc_id: String,
+        /// 用户三选一（已过二次确认）。
+        choice: SyncChoice,
+        /// 合并时使用的本地正文。
+        local_text: String,
+    },
+    /// S5b：显式解决快照确认门槛；引擎按选择保留或清空 outbox。
+    ResolveSnapshot {
+        /// 用户三选一（已过二次确认）。
+        choice: SyncChoice,
+    },
     /// 停止线程；当前同步调用结束后退出。
     Shutdown,
 }
@@ -411,6 +527,13 @@ pub enum SyncReply {
     Status(LocalSyncStatus),
     /// 引擎启动失败：主线程显示“未配置/失败”原因，不保留空引擎。
     SetupFailed(String),
+    /// S5b：解决动作的引擎结果；`doc_id` 供主线程把正文写回正确文档。
+    Resolved {
+        /// 目标文档 ID；快照解决为 `None`（引擎不回写正文）。
+        doc_id: Option<String>,
+        /// 引擎返回的解决结果（含待写回正文）。
+        outcome: ResolveOutcome,
+    },
 }
 
 /// 同步线程句柄：drop 即发 `Shutdown` 并在独立等待线程 join，不阻塞 GPUI 主线程。
@@ -433,6 +556,20 @@ impl SyncHandle {
             return;
         }
         let _ = self.tx.send(SyncCommand::WatchEvents(events));
+    }
+
+    /// 请求解决一个墓碑冲突；只发命令，不触碰 GPUI 状态或本地文件。
+    pub fn resolve_conflict(&self, doc_id: String, choice: SyncChoice, local_text: String) {
+        let _ = self.tx.send(SyncCommand::ResolveConflict {
+            doc_id,
+            choice,
+            local_text,
+        });
+    }
+
+    /// 请求解决快照确认门槛；只发命令，不触碰 GPUI 状态或本地文件。
+    pub fn resolve_snapshot(&self, choice: SyncChoice) {
+        let _ = self.tx.send(SyncCommand::ResolveSnapshot { choice });
     }
 }
 
@@ -492,6 +629,45 @@ pub fn spawn_sync(
                 };
                 match command {
                     SyncCommand::Shutdown => break,
+                    SyncCommand::ResolveConflict {
+                        doc_id,
+                        choice,
+                        local_text,
+                    } => {
+                        // 解决动作不触发网络；结果/状态都经同一回执通道交主线程。
+                        match engine.resolve_conflict(&doc_id, &local_text, choice.into()) {
+                            Ok(outcome) => {
+                                let _ = replies.send(SyncReply::Status(engine.status().clone()));
+                                let _ = replies.send(SyncReply::Resolved {
+                                    doc_id: Some(doc_id),
+                                    outcome,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = replies.send(SyncReply::Phase(SyncPhase::Failed {
+                                    reason: error.to_string(),
+                                }));
+                                let _ = replies.send(SyncReply::Status(engine.status().clone()));
+                            }
+                        }
+                    }
+                    SyncCommand::ResolveSnapshot { choice } => {
+                        match engine.resolve_snapshot_confirmation(choice.into()) {
+                            Ok(outcome) => {
+                                let _ = replies.send(SyncReply::Status(engine.status().clone()));
+                                let _ = replies.send(SyncReply::Resolved {
+                                    doc_id: None,
+                                    outcome,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = replies.send(SyncReply::Phase(SyncPhase::Failed {
+                                    reason: error.to_string(),
+                                }));
+                                let _ = replies.send(SyncReply::Status(engine.status().clone()));
+                            }
+                        }
+                    }
                     SyncCommand::WatchEvents(events) => {
                         if engine.handle_watch_events(&events) > 0 {
                             let _ = replies.send(SyncReply::Status(engine.status().clone()));
@@ -747,5 +923,120 @@ mod tests {
             conflict_docs_text(&conflict, Some("b.md")),
             "笔记/a.md、b.md（当前文档）"
         );
+    }
+
+    /// D104：三选一标签/映射固定，桌面展示与引擎选择一一对应。
+    #[test]
+    fn sync_choices_map_to_engine_choices_deterministically() {
+        assert_eq!(sync_choice_label(SyncChoice::KeepLocal), "保留本地");
+        assert_eq!(sync_choice_label(SyncChoice::UseRemote), "采用远端");
+        assert_eq!(sync_choice_label(SyncChoice::Merge), "合并");
+        assert_eq!(
+            ConflictChoice::from(SyncChoice::KeepLocal),
+            ConflictChoice::KeepLocal
+        );
+        assert_eq!(
+            ConflictChoice::from(SyncChoice::UseRemote),
+            ConflictChoice::UseRemote
+        );
+        assert_eq!(
+            ConflictChoice::from(SyncChoice::Merge),
+            ConflictChoice::Merge
+        );
+        assert_eq!(
+            SnapshotChoice::from(SyncChoice::KeepLocal),
+            SnapshotChoice::KeepLocal
+        );
+        assert_eq!(
+            SnapshotChoice::from(SyncChoice::UseRemote),
+            SnapshotChoice::UseRemote
+        );
+        assert_eq!(
+            SnapshotChoice::from(SyncChoice::Merge),
+            SnapshotChoice::Merge
+        );
+    }
+
+    /// D104：只有破坏性选择给出二次确认文案，文案写明后果且含中文。
+    #[test]
+    fn destructive_choices_require_explicit_confirmation_text() {
+        for choice in ALL_SYNC_CHOICES {
+            let text = destructive_choice_confirmation_text(SyncBannerKind::Conflict, choice);
+            if choice == SyncChoice::Merge {
+                assert!(text.is_none());
+            } else {
+                let text = text.unwrap_or_default();
+                assert!(text.contains("确认执行？"), "{choice:?}");
+                assert!(!text.is_empty());
+            }
+        }
+        let snapshot = destructive_choice_confirmation_text(
+            SyncBannerKind::Confirmation,
+            SyncChoice::UseRemote,
+        )
+        .unwrap();
+        assert!(snapshot.contains("清空未推送 outbox"));
+        assert!(
+            destructive_choice_confirmation_text(
+                SyncBannerKind::Confirmation,
+                SyncChoice::KeepLocal
+            )
+            .is_none()
+        );
+        assert!(
+            destructive_choice_confirmation_text(SyncBannerKind::Confirmation, SyncChoice::Merge)
+                .is_none()
+        );
+    }
+
+    /// D104：横幅 additive 带三选一与目标文档；D102 的 action/文案语义保持原样。
+    #[test]
+    fn banners_expose_three_choices_and_target_without_breaking_s5a() {
+        let conflict = status(false, &["b.md", "笔记/a.md"], &[]);
+        let banner = sync_banner(&conflict, Some("笔记/a.md")).unwrap();
+        assert_eq!(banner.choices, ALL_SYNC_CHOICES);
+        assert_eq!(banner.target_doc_id.as_deref(), Some("笔记/a.md"));
+        assert_eq!(banner.action, None);
+        assert!(!format!("{}{}", banner.title, banner.detail).contains("覆盖"));
+
+        let other = sync_banner(&conflict, Some("未冲突.md")).unwrap();
+        assert_eq!(other.target_doc_id.as_deref(), Some("b.md"));
+
+        let confirm = status(true, &[], &[]);
+        let banner = sync_banner(&confirm, Some("当前.md")).unwrap();
+        assert_eq!(banner.choices, ALL_SYNC_CHOICES);
+        assert_eq!(banner.action, Some(SyncBannerAction::Retry));
+        assert_eq!(banner.target_doc_id.as_deref(), Some("当前.md"));
+    }
+
+    /// D104：`SyncHandle` 的解决入口只发命令，不调用引擎、不碰文件。
+    #[test]
+    fn resolve_commands_are_sent_through_the_handle() {
+        let (tx, rx) = mpsc::channel::<SyncCommand>();
+        let handle = SyncHandle { tx, thread: None };
+        handle.resolve_conflict(
+            "笔记/a.md".to_owned(),
+            SyncChoice::Merge,
+            "本地正文".to_owned(),
+        );
+        handle.resolve_snapshot(SyncChoice::UseRemote);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SyncCommand::ResolveConflict {
+                doc_id: "笔记/a.md".to_owned(),
+                choice: SyncChoice::Merge,
+                local_text: "本地正文".to_owned(),
+            }
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SyncCommand::ResolveSnapshot {
+                choice: SyncChoice::UseRemote,
+            }
+        );
+        // Drop 时才发 Shutdown；句柄仍存活时通道应为空。
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(handle);
+        assert!(matches!(rx.try_recv(), Ok(SyncCommand::Shutdown)));
     }
 }

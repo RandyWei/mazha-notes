@@ -75,9 +75,10 @@ mod sync;
 use settings::{FONT_STEP, Settings, ThemePreference, clamp_font_size, clamp_mono_font_size};
 // D102：同步线程层与纯函数层；UI 只发命令/收状态，不直接调用 LocalSyncEngine。
 use sync::{
-    SYNC_TOKEN_ENV, SyncBanner, SyncBannerAction, SyncHandle, SyncPhase, SyncReply, SyncSetupError,
-    doc_id_for_path, forwardable_watch_event, open_provider, resolve_config, spawn_sync,
-    sync_banner, sync_status_is_alert, sync_status_text, token_from_env,
+    SYNC_TOKEN_ENV, SyncBanner, SyncBannerAction, SyncBannerKind, SyncChoice, SyncHandle,
+    SyncPhase, SyncReply, SyncSetupError, destructive_choice_confirmation_text, doc_id_for_path,
+    forwardable_watch_event, open_provider, resolve_config, spawn_sync, sync_banner,
+    sync_choice_label, sync_status_is_alert, sync_status_text, token_from_env,
 };
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -958,6 +959,19 @@ fn watch_tab_by_path<'a>(
 fn watch_path_inside_root(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .is_ok_and(|rel| !rel.as_os_str().is_empty())
+}
+
+/// S5b：把同步 `DocId` 解析为工作区根内的绝对路径，供解决结果写盘。
+///
+/// `DocPath::new` 挡住绝对路径、`..`、空段与反斜杠；根目录先 canonicalize，
+/// 再检查目标（含符号链接解析后的真实路径）仍在根内，避免冲突 DocId 越界写文件。
+/// 目标文件尚不存在时 `canonicalize` 回退为原路径，词法校验仍有效。
+fn sync_write_path_for(root: &Path, doc_id: &str) -> Option<PathBuf> {
+    let root = canonicalize_watch_path(root);
+    let rel = DocPath::new(doc_id.to_owned()).ok()?;
+    let candidate = root.join(rel.as_str());
+    let verified = canonicalize_watch_path(&candidate);
+    watch_path_inside_root(&root, &verified).then_some(candidate)
 }
 
 /// 标签下标的展示目标：活动标签走 `self.*`，其余走 `tabs[i]`。
@@ -3337,6 +3351,12 @@ struct DocView {
     sync_status: Option<LocalSyncStatus>,
     /// 当前同步线程绑定的工作区根（canonicalize 后）。
     sync_root: Option<PathBuf>,
+    /// S5b：待二次确认的选择（第一次点击只记录，第二次才发命令）。
+    sync_pending_choice: Option<SyncChoice>,
+    /// S5b：待确认选择的目标文档（跨标签冲突时用于定位正文）。
+    sync_pending_doc_id: Option<String>,
+    /// S5b：待确认选择所属的横幅种类（区分冲突/快照语义）。
+    sync_pending_kind: Option<SyncBannerKind>,
 }
 
 impl DocView {
@@ -3496,6 +3516,9 @@ impl DocView {
             },
             sync_status: None,
             sync_root: None,
+            sync_pending_choice: None,
+            sync_pending_doc_id: None,
+            sync_pending_kind: None,
         }
     }
 
@@ -6484,6 +6507,8 @@ impl DocView {
         self.sync_rx = None;
         self.sync_root = None;
         self.sync_status = None;
+        // 引擎已重建，旧横幅的待确认选择不再有效。
+        self.clear_sync_pending();
         let Some(root) = root else {
             self.sync_phase = SyncPhase::NotConfigured {
                 reason: "未打开工作区".to_owned(),
@@ -6561,16 +6586,27 @@ impl DocView {
         });
     }
 
-    /// 应用同步线程回传的阶段/状态；`SetupFailed` 视为未配置并释放线程句柄。
+    /// 应用同步线程回传的阶段/状态/解决结果；`SetupFailed` 视为未配置并释放线程句柄。
     fn apply_sync_replies(&mut self, replies: Vec<SyncReply>, cx: &mut Context<Self>) {
         for reply in replies {
             match reply {
                 SyncReply::Phase(phase) => self.sync_phase = phase,
-                SyncReply::Status(status) => self.sync_status = Some(status),
+                SyncReply::Status(status) => {
+                    self.sync_status = Some(status);
+                    // 状态已变化，旧横幅的待确认选择必须失效，防止陈旧按钮误发命令。
+                    self.clear_sync_pending();
+                }
                 SyncReply::SetupFailed(reason) => {
                     self.sync_phase = SyncPhase::Failed { reason };
                     self.sync_handle = None;
                     self.sync_rx = None;
+                    self.clear_sync_pending();
+                }
+                SyncReply::Resolved { doc_id, outcome } => {
+                    if let Some(text) = outcome.document_text {
+                        self.apply_resolved_document(doc_id.as_deref(), &text, cx);
+                    }
+                    self.clear_sync_pending();
                 }
             }
         }
@@ -6622,6 +6658,112 @@ impl DocView {
         let root = self.sync_root.as_deref()?;
         let path = canonicalize_watch_path(self.path.as_deref()?);
         doc_id_for_path(root, &path)
+    }
+
+    /// 按同步 `DocId` 找已打开标签及其当前正文（活动标签实时读 `self.doc`）。
+    fn sync_tab_for_doc_id(&self, doc_id: &str) -> Option<(usize, String)> {
+        let root = self.sync_root.as_deref()?;
+        self.watch_tab_snapshot()
+            .into_iter()
+            .enumerate()
+            .find(|(_, tab)| {
+                tab.path
+                    .as_deref()
+                    .and_then(|path| doc_id_for_path(root, path))
+                    .as_deref()
+                    == Some(doc_id)
+            })
+            .map(|(index, tab)| (index, tab.text))
+    }
+
+    /// S5b 横幅三选一：破坏性选择第一次点只记待确认文案，第二次点“确认执行”才发命令。
+    fn handle_sync_choice(
+        &mut self,
+        kind: SyncBannerKind,
+        choice: SyncChoice,
+        target_doc_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let needs_confirmation = destructive_choice_confirmation_text(kind, choice).is_some();
+        let already_pending = self.sync_pending_choice == Some(choice)
+            && self.sync_pending_kind == Some(kind)
+            && self.sync_pending_doc_id == target_doc_id;
+        if needs_confirmation && !already_pending {
+            // 第一次点击：只记下来，横幅据此显示确认文案与“确认执行”按钮。
+            self.sync_pending_choice = Some(choice);
+            self.sync_pending_kind = Some(kind);
+            self.sync_pending_doc_id = target_doc_id;
+        } else {
+            self.send_sync_choice(kind, choice, target_doc_id);
+            self.clear_sync_pending();
+        }
+        cx.notify();
+    }
+
+    /// 清除待确认状态（发命令后、工作区重建或状态刷新时调用）。
+    fn clear_sync_pending(&mut self) {
+        self.sync_pending_choice = None;
+        self.sync_pending_kind = None;
+        self.sync_pending_doc_id = None;
+    }
+
+    /// 只经 `SyncHandle` 发解决命令；不读/写文件、不改 `Document`，也不触发网络同步。
+    fn send_sync_choice(
+        &self,
+        kind: SyncBannerKind,
+        choice: SyncChoice,
+        target_doc_id: Option<String>,
+    ) {
+        let Some(handle) = self.sync_handle.as_ref() else {
+            return;
+        };
+        match kind {
+            SyncBannerKind::Conflict => {
+                let Some(doc_id) = target_doc_id.or_else(|| self.sync_current_doc_id()) else {
+                    return;
+                };
+                let Some((_, local_text)) = self.sync_tab_for_doc_id(&doc_id) else {
+                    return;
+                };
+                handle.resolve_conflict(doc_id, choice, local_text);
+            }
+            SyncBannerKind::Confirmation => handle.resolve_snapshot(choice),
+        }
+    }
+
+    /// 把解决结果正文写回目标文件并重载对应标签；写盘失败时内存文档保持原样。
+    fn apply_resolved_document(
+        &mut self,
+        doc_id: Option<&str>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = doc_id
+            .map(ToOwned::to_owned)
+            .or_else(|| self.sync_current_doc_id())
+        else {
+            return;
+        };
+        let Some(root) = self.sync_root.clone() else {
+            return;
+        };
+        let Some(path) = sync_write_path_for(&root, &id) else {
+            return;
+        };
+        // 先写盘再换内存文档：失败时保留 UI 原文，避免内存与磁盘出现分歧。
+        if let Err(error) = std::fs::write(&path, text.as_bytes()) {
+            self.sync_phase = SyncPhase::Failed {
+                reason: format!("写入同步解决结果失败：{error}"),
+            };
+            cx.notify();
+            return;
+        }
+        // 文档可能未打开（冲突列表含其它路径）：此时只写盘并刷新文件树。
+        if let Some((index, _)) = self.sync_tab_for_doc_id(&id) {
+            let target = watch_target(index, self.active);
+            self.reload_watch_tab(target, &path, text);
+        }
+        self.refresh_workspace(cx);
     }
 
     /// 把 D91 的工作区相对事件路径解析为规范化绝对路径，供纯函数按同一套规则比对。
@@ -7760,14 +7902,27 @@ impl Render for DocView {
                 }
                 row.into_any_element()
             });
-        // D102：同步横幅复用 D92 的非模态样式与生命周期：由引擎状态推导，
-        // 冲突只列 DocId 并说明“未静默删除”，快照需确认只给“重试同步”，无“覆盖”。
+        // D102 + D104：同步横幅复用 D92 的非模态样式与生命周期；三选一为 additive，
+        // “重试同步”仍保留原语义，冲突/快照的覆盖动作必须经二次确认才发命令。
         let sync_banner_data = self
             .sync_status
             .as_ref()
             .and_then(|status| sync_banner(status, self.sync_current_doc_id().as_deref()));
         let sync_banner_el: Option<gpui::AnyElement> =
             sync_banner_data.map(|banner: SyncBanner| {
+                // 待确认只在“同一横幅种类 + 同一目标文档 + 同一选择”下有效，
+                // 状态刷新或文档切换后自动失效，避免陈旧按钮把正文写到别处。
+                let pending_choice = self
+                    .sync_pending_choice
+                    .filter(|_| self.sync_pending_kind == Some(banner.kind))
+                    .filter(|_| self.sync_pending_doc_id == banner.target_doc_id);
+                let mut detail = format!("{}：{}", banner.title, banner.detail);
+                if let Some(choice) = pending_choice
+                    && let Some(text) = destructive_choice_confirmation_text(banner.kind, choice)
+                {
+                    detail.push_str("\n确认：");
+                    detail.push_str(&text);
+                }
                 let mut row = h_flex()
                     .id("sync-conflict-banner")
                     .w_full()
@@ -7781,12 +7936,7 @@ impl Render for DocView {
                     .bg(palette.subtle)
                     .text_sm()
                     .child(div().flex_none().text_color(palette.accent).child("⚠"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(format!("{}：{}", banner.title, banner.detail)),
-                    );
+                    .child(div().flex_1().min_w(px(0.)).child(detail));
                 if banner.action == Some(SyncBannerAction::Retry) {
                     row = row.child(
                         div()
@@ -7801,6 +7951,56 @@ impl Render for DocView {
                                 view.request_sync_now(cx);
                             }))
                             .child("重试同步"),
+                    );
+                }
+                if pending_choice.is_some() {
+                    row = row.child(
+                        div()
+                            .id("sync-choice-cancel")
+                            .flex_none()
+                            .cursor_pointer()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(3.))
+                            .bg(palette.code_bg)
+                            .on_click(cx.listener(|view, _ev, _window, cx| {
+                                view.clear_sync_pending();
+                                cx.notify();
+                            }))
+                            .child("取消"),
+                    );
+                }
+                for choice in banner.choices {
+                    let is_pending = pending_choice == Some(choice);
+                    let id = if is_pending {
+                        "sync-choice-confirm"
+                    } else {
+                        match choice {
+                            SyncChoice::KeepLocal => "sync-choice-keep",
+                            SyncChoice::UseRemote => "sync-choice-remote",
+                            SyncChoice::Merge => "sync-choice-merge",
+                        }
+                    };
+                    let label = if is_pending {
+                        "确认执行"
+                    } else {
+                        sync_choice_label(choice)
+                    };
+                    let kind = banner.kind;
+                    let target = banner.target_doc_id.clone();
+                    row = row.child(
+                        div()
+                            .id(id)
+                            .flex_none()
+                            .cursor_pointer()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(3.))
+                            .bg(palette.code_bg)
+                            .on_click(cx.listener(move |view, _ev, _window, cx| {
+                                view.handle_sync_choice(kind, choice, target.clone(), cx);
+                            }))
+                            .child(label),
                     );
                 }
                 row.into_any_element()
@@ -12090,7 +12290,8 @@ mod tests {
         math_inline_draw_geom, nearest_cell, oblique, pdf_base_dir, plan_imports,
         quote_block_wrap_width, render_chart_preview, render_chart_svg, render_export,
         render_export_with_assets, render_math_preview, reveal_inline, status_bar_hint,
-        table_arrow_step, table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
+        sync_write_path_for, table_arrow_step, table_entry_snap, to_gpui_runs, typewriter_scroll_y,
+        unique_import_path,
     };
     // D92：外部文件变更的纯函数与类型（无 GPUI 依赖，可直接单测契约）。
     use super::{
@@ -12365,6 +12566,20 @@ mod tests {
         let (text, alert) = status_bar_hint(Some(&export), &sync_idle, Some(&conflict));
         assert!(text.contains("冲突 1"), "{text}");
         assert!(alert);
+    }
+
+    /// D104：解决结果的写回路径必须落在工作区根内，中文 DocId 原样保留。
+    #[test]
+    fn sync_write_path_rejects_escapes_and_keeps_cjk() {
+        let root = std::env::temp_dir();
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        assert_eq!(
+            sync_write_path_for(&root, "笔记/冲突.md").unwrap(),
+            canonical.join("笔记/冲突.md")
+        );
+        for bad in ["", "../逃逸.md", "/abs.md", "a/../b.md", "a\\b.md"] {
+            assert!(sync_write_path_for(&root, bad).is_none(), "{bad}");
+        }
     }
 
     /// D84：桌面侧真实渲染公式/图表，产出可被导出桥接层消费的自包含 SVG。

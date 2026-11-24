@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mazha_crdt::{CrdtRoster, DocId, MetaChange};
+use mazha_crdt::{CrdtDoc, CrdtRoster, DocId, MetaChange};
 use mazha_store::{COALESCE_WINDOW, DocPath, EntryKind, StorageProvider, StoreError, WatchEvent};
 use mazha_sync::{
     DeviceId, SessionCheckpoint, SyncCursor, SyncOnceOutcome, SyncSession, SyncTransport,
@@ -19,6 +19,9 @@ use crate::error::LocalSyncError;
 use crate::mapping::{
     LocalWriteAction, ObservedBytes, is_syncable_md, local_text_to_frames, merge_watch_events,
     remote_frames_to_local_writes, should_ignore_echo,
+};
+use crate::resolve::{
+    ConflictChoice, ResolveOutcome, SnapshotChoice, conflict_copy_text, merged_conflict_text,
 };
 use crate::state::{LocalSyncState, LocalSyncStore};
 
@@ -71,6 +74,13 @@ pub struct LocalSyncEngine {
     dirty: BTreeSet<DocId>,
     /// 自己写回文件后的字节标记：`Some` 为刚写入的字节，`None` 为刚删除。
     write_marks: BTreeMap<DocId, Option<Vec<u8>>>,
+    /// 已显式确认过的冲突副本指纹：`DocId` → 冲突帧字节列表。
+    /// 只有当前墓碑的冲突帧与之一致时才抑制横幅；同一会话内新冲突仍会提示。
+    /// 仅内存有效（重启后指纹丢失，横幅可能重现），不写状态文件。
+    resolved_conflict_frames: BTreeMap<DocId, Vec<Vec<u8>>>,
+    /// 已显式确认过的快照门槛 outbox 指纹（批次 ID 升序集合）。
+    /// 只有当前 outbox 与之一致时才抑制；新批次仍会提示。仅内存有效。
+    resolved_snapshot_batches: Option<BTreeSet<String>>,
     /// 对外状态快照。
     status: LocalSyncStatus,
 }
@@ -130,7 +140,7 @@ impl LocalSyncEngine {
             session.restore_checkpoint(&checkpoint)?;
         }
         let status = LocalSyncStatus {
-            conflict_docs: conflict_docs(&session),
+            conflict_docs: visible_conflict_docs(&session, &BTreeMap::new()),
             ..LocalSyncStatus::default()
         };
         Ok(Self {
@@ -140,6 +150,8 @@ impl LocalSyncEngine {
             coalesce_window,
             dirty: BTreeSet::new(),
             write_marks: BTreeMap::new(),
+            resolved_conflict_frames: BTreeMap::new(),
+            resolved_snapshot_batches: None,
             status,
         })
     }
@@ -262,10 +274,14 @@ impl LocalSyncEngine {
         let sync = match self.session.sync_once(transport) {
             Ok(outcome) => outcome,
             Err(error) => {
-                if error.needs_confirmation() {
+                // 已显式确认过的同一批 outbox 不再重复弹门槛横幅；新批次仍提示。
+                if error.needs_confirmation()
+                    && outbox_fingerprint(&self.session) != self.resolved_snapshot_batches
+                {
                     self.status.needs_confirmation = true;
                 }
-                self.status.conflict_docs = conflict_docs(&self.session);
+                self.status.conflict_docs =
+                    visible_conflict_docs(&self.session, &self.resolved_conflict_frames);
                 self.status.last_cursor = self.session.last_ack_cursor();
                 // 传输失败时也要落盘：握手可能已写入会话 ID，更关键的是已暂定的
                 // outbox/时钟必须跨进程存活，否则断线重启会丢离线编辑（G2）。
@@ -293,7 +309,8 @@ impl LocalSyncEngine {
             }
         }
         self.status.needs_confirmation = false;
-        self.status.conflict_docs = conflict_docs(&self.session);
+        self.status.conflict_docs =
+            visible_conflict_docs(&self.session, &self.resolved_conflict_frames);
         self.status.last_cursor = self.session.last_ack_cursor();
         self.persist()?;
         Ok(LocalSyncOutcome {
@@ -301,6 +318,118 @@ impl LocalSyncEngine {
             writes,
             sync,
         })
+    }
+
+    /// 显式解决一个墓碑冲突（S5b/D104），绝不自动触发网络同步。
+    ///
+    /// 先读取冲突副本帧并**全部解码校验**，任一坏帧直接返回错误且本地状态零改动；
+    /// 选择 `KeepLocal`/`Merge` 时才 stage 一次严格更高 `op_id` 的 upsert 复活文档，
+    /// `UseRemote` 只保留墓碑与副本作审计、不碰本地文件。桌面拿到 `document_text`
+    /// 后走既有保存路径写盘，本方法不依赖 `mazha-core`、不打开任何 UI 文档。
+    ///
+    /// # Errors
+    /// 文档未墓碑化、冲突帧损坏、暂存或落盘失败时返回错误；坏帧路径不改任何状态。
+    pub fn resolve_conflict(
+        &mut self,
+        doc_id: &str,
+        local_text: &str,
+        choice: ConflictChoice,
+    ) -> Result<ResolveOutcome, LocalSyncError> {
+        // 只读取并校验材料，不在此处修改任何状态：坏帧必须整批零改动。
+        let frames = self
+            .session
+            .roster()
+            .tombstones()
+            .get(doc_id)
+            .ok_or_else(|| {
+                LocalSyncError::CorruptState(format!("冲突文档 {doc_id} 不存在或已复活"))
+            })?
+            .conflict_frames()
+            .to_vec();
+        let conflict_text = conflict_copy_text(&frames)?;
+        let document_text = match choice {
+            ConflictChoice::KeepLocal => Some(conflict_text),
+            ConflictChoice::UseRemote => None,
+            ConflictChoice::Merge => Some(merged_conflict_text(&conflict_text, local_text)),
+        };
+        let mut outcome = ResolveOutcome {
+            document_text,
+            ..ResolveOutcome::default()
+        };
+        if let Some(text) = &outcome.document_text {
+            outcome.revived_docs = vec![doc_id.to_owned()];
+            self.stage_revival(doc_id, text)?;
+        }
+        // 记录已确认的指纹：UseRemote 保留墓碑，下一轮 sync_once 才不会重复弹横幅。
+        // 放在所有可能失败的步骤之后，坏帧/暂存失败路径不改任何状态。
+        self.resolved_conflict_frames
+            .insert(doc_id.to_owned(), frames);
+        self.status.needs_confirmation = false;
+        self.status.conflict_docs =
+            visible_conflict_docs(&self.session, &self.resolved_conflict_frames);
+        self.status.last_cursor = self.session.last_ack_cursor();
+        self.persist()?;
+        outcome.confirmation_cleared = true;
+        Ok(outcome)
+    }
+
+    /// 显式解决快照确认门槛（S5b/D104），不拉取快照也不自动重试同步。
+    ///
+    /// `KeepLocal` 保留 outbox 与本地文件；`UseRemote` 只经 checkpoint 显式清空
+    /// outbox（用户已明确选择放弃未推送批次），下一轮 `sync_once` 才由服务端快照
+    /// 覆盖本地；`Merge` 保留 outbox 让 CRDT 在下一轮自行合并本地与远端。
+    ///
+    /// # Errors
+    /// 检查点身份不匹配或状态落盘失败时返回错误。
+    pub fn resolve_snapshot_confirmation(
+        &mut self,
+        choice: SnapshotChoice,
+    ) -> Result<ResolveOutcome, LocalSyncError> {
+        // 先记下本轮门槛的 outbox 指纹，再可能清空；KeepLocal/Merge 保留的 outbox
+        // 下一轮仍会触发同样的门槛，靠此指纹在同一会话内抑制重复横幅。
+        self.resolved_snapshot_batches = outbox_fingerprint(&self.session);
+        let mut outcome = ResolveOutcome::default();
+        if choice == SnapshotChoice::UseRemote {
+            // 不新增 mazha-sync API：复用 additive checkpoint/restore 显式丢弃批次。
+            let mut checkpoint = self.session.checkpoint();
+            checkpoint.outbox.clear();
+            self.session.restore_checkpoint(&checkpoint)?;
+            outcome.outbox_cleared = true;
+        }
+        self.status.needs_confirmation = false;
+        self.status.conflict_docs =
+            visible_conflict_docs(&self.session, &self.resolved_conflict_frames);
+        self.status.last_cursor = self.session.last_ack_cursor();
+        self.persist()?;
+        outcome.confirmation_cleared = true;
+        Ok(outcome)
+    }
+
+    /// stage 一次严格高于墓碑 `op_id` 的 upsert，使被删除文档复活（D98）。
+    fn stage_revival(&mut self, doc_id: &str, text: &str) -> Result<(), LocalSyncError> {
+        let tombstone_clock = self
+            .session
+            .roster()
+            .tombstones()
+            .get(doc_id)
+            .map(|tombstone| tombstone.op_id().clock());
+        let mut checkpoint = self.session.checkpoint();
+        if let Some(clock) = tombstone_clock {
+            checkpoint.op_clock = checkpoint.op_clock.max(clock);
+        }
+        // restore 只推进本地逻辑时钟；随后 next_op_id 得到严格更高的值。
+        self.session.restore_checkpoint(&checkpoint)?;
+        let op_id = self.session.next_op_id()?;
+        // doc_id 来自已校验的墓碑，frame 由本地文本生成，下面的暂存不会失败。
+        let frame = CrdtDoc::from_text(text).encode_update();
+        let change = MetaChange::Upsert {
+            doc_id: doc_id.to_owned(),
+            op_id,
+            frame,
+        };
+        self.session
+            .stage_local_change(&BTreeMap::new(), &[change])?;
+        Ok(())
     }
 
     /// 把当前会话与名册落盘。
@@ -338,13 +467,39 @@ impl LocalSyncEngine {
     }
 }
 
-/// 墓碑中保留了冲突副本的文档 ID（升序），供状态展示。
-fn conflict_docs(session: &SyncSession) -> Vec<DocId> {
+/// 当前 outbox 的批次 ID 指纹（升序去重集合）；空 outbox 返回 `None`。
+///
+/// 用于识别「同一轮」快照确认门槛：用户确认后若 outbox 未变，下一轮不应重复提示；
+/// 新增了本地批次则指纹变化，提示照常出现。批次 ID 来自既有 `PendingBatch::batch_id()`。
+fn outbox_fingerprint(session: &SyncSession) -> Option<BTreeSet<String>> {
+    let batches = session.checkpoint().outbox;
+    if batches.is_empty() {
+        return None;
+    }
+    Some(
+        batches
+            .iter()
+            .map(|batch| batch.batch_id().as_str().to_owned())
+            .collect(),
+    )
+}
+
+/// 仍需在状态中展示的墓碑冲突文档 ID（升序）。
+///
+/// 墓碑的冲突帧字节列表与已确认指纹完全一致时视为「已解决」，本会话内不再弹横幅；
+/// 帧内容变化（同一文档产生新冲突）则照常提示。指纹只存内存，重启后自然重现。
+fn visible_conflict_docs(
+    session: &SyncSession,
+    resolved: &BTreeMap<DocId, Vec<Vec<u8>>>,
+) -> Vec<DocId> {
     session
         .roster()
         .tombstones()
         .iter()
-        .filter(|(_, tombstone)| !tombstone.conflict_frames().is_empty())
+        .filter(|(id, tombstone)| {
+            let frames = tombstone.conflict_frames();
+            !frames.is_empty() && resolved.get(*id).map(Vec::as_slice) != Some(frames)
+        })
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -760,6 +915,216 @@ mod tests {
         }]);
         assert_eq!(engine_b.sync_once(&mut client_b).unwrap().staged_local, 1);
         assert_eq!(server.borrow().text_of("a.md").unwrap(), "原文");
+    }
+
+    /// S5b/D104：造出「远端删除 → 本地看到墓碑冲突」的材料，供 resolve 测试复用。
+    /// 返回设备乙的临时目录、Provider、引擎与对应 transport。
+    fn conflict_fixture() -> (
+        tempfile::TempDir,
+        Arc<dyn StorageProvider>,
+        LocalSyncEngine,
+        mazha_sync::FakeTransport,
+    ) {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let storage_a = provider(dir_a.path());
+        let storage_b = provider(dir_b.path());
+        let server = Rc::new(RefCell::new(InMemorySyncServer::new()));
+        let (ws, dev_a) = ids("设备甲");
+        let dev_b = DeviceId::new("设备乙").unwrap();
+        let (mut client_a, mut client_b) =
+            FakeTransport::pair(&server, ws.clone(), dev_a.clone(), dev_b.clone());
+
+        let mut engine_a =
+            LocalSyncEngine::open(Arc::clone(&storage_a), ws.clone(), dev_a).unwrap();
+        write_md(storage_a.as_ref(), "a.md", "冲突副本内容");
+        engine_a.handle_watch_events(&[WatchEvent::Created {
+            path: DocPath::new("a.md").unwrap(),
+        }]);
+        engine_a.sync_once(&mut client_a).unwrap();
+        storage_a.remove(&DocPath::new("a.md").unwrap()).unwrap();
+        engine_a.handle_watch_events(&[WatchEvent::Removed {
+            path: DocPath::new("a.md").unwrap(),
+        }]);
+        engine_a.sync_once(&mut client_a).unwrap();
+
+        let mut engine_b = LocalSyncEngine::open(Arc::clone(&storage_b), ws, dev_b).unwrap();
+        engine_b.sync_once(&mut client_b).unwrap();
+        assert!(engine_b.status().conflict_docs.contains(&"a.md".to_owned()));
+        (dir_b, storage_b, engine_b, client_b)
+    }
+
+    #[test]
+    fn resolve_conflict_keep_local_revives_tombstone_without_writing_file() {
+        let (_dir, storage, mut engine, _client) = conflict_fixture();
+        let before_batches = engine.session().pending_batches().len();
+        let outcome = engine
+            .resolve_conflict("a.md", "本地补写", ConflictChoice::KeepLocal)
+            .unwrap();
+        assert_eq!(outcome.document_text.as_deref(), Some("冲突副本内容"));
+        assert_eq!(outcome.revived_docs, vec!["a.md".to_owned()]);
+        assert!(outcome.confirmation_cleared);
+        // 复活后墓碑消失，冲突横幅随之消退。
+        assert!(!engine.session().roster().is_tombstoned("a.md"));
+        assert_eq!(
+            engine.session().roster().get("a.md").unwrap().text(),
+            "冲突副本内容"
+        );
+        assert!(engine.status().conflict_docs.is_empty());
+        assert_eq!(engine.session().pending_batches().len(), before_batches + 1);
+        // 引擎不直接写盘：桌面拿到 document_text 后走既有保存路径。
+        assert!(storage.read(&DocPath::new("a.md").unwrap()).is_err());
+    }
+
+    #[test]
+    fn resolve_conflict_merge_and_use_remote_have_distinct_effects() {
+        let (_dir, _storage, mut merged, _client) = conflict_fixture();
+        let outcome = merged
+            .resolve_conflict("a.md", "本地补写", ConflictChoice::Merge)
+            .unwrap();
+        assert_eq!(
+            outcome.document_text.as_deref(),
+            Some("冲突副本内容\n本地补写")
+        );
+        assert_eq!(
+            merged.session().roster().get("a.md").unwrap().text(),
+            "冲突副本内容\n本地补写"
+        );
+
+        let (_dir2, storage2, mut remote, _client2) = conflict_fixture();
+        let before_batches = remote.session().pending_batches().len();
+        let outcome = remote
+            .resolve_conflict("a.md", "本地补写", ConflictChoice::UseRemote)
+            .unwrap();
+        assert!(outcome.document_text.is_none());
+        assert!(outcome.revived_docs.is_empty());
+        // 采用远端：墓碑与冲突副本保留审计，不写回正文、不产生新批次。
+        assert!(remote.session().roster().is_tombstoned("a.md"));
+        // 已确认的同一冲突在本会话内不再重复弹横幅（墓碑仍在，仅横幅被抑制）。
+        assert!(!remote.status().conflict_docs.contains(&"a.md".to_owned()));
+        assert_eq!(remote.session().pending_batches().len(), before_batches);
+        assert!(storage2.read(&DocPath::new("a.md").unwrap()).is_err());
+    }
+
+    /// 已确认的冲突/门槛在同一会话内不得每轮重现；新冲突/新批次仍须提示。
+    #[test]
+    fn acknowledged_conflicts_are_not_repeated_until_content_changes() {
+        // 冲突：确认 UseRemote 后墓碑仍在，下一轮 sync_once 不应再弹横幅。
+        let (_dir, _storage, mut engine, mut client) = conflict_fixture();
+        let outcome = engine
+            .resolve_conflict("a.md", "本地补写", ConflictChoice::UseRemote)
+            .unwrap();
+        assert!(outcome.document_text.is_none());
+        assert!(!engine.status().conflict_docs.contains(&"a.md".to_owned()));
+        engine.sync_once(&mut client).unwrap();
+        assert!(!engine.status().conflict_docs.contains(&"a.md".to_owned()));
+        assert!(engine.session().roster().is_tombstoned("a.md"));
+
+        // 快照门槛：确认 KeepLocal 后 outbox 未变，下一轮不应再置 needs_confirmation。
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let storage_a = provider(dir_a.path());
+        let storage_b = provider(dir_b.path());
+        let server = Rc::new(RefCell::new(InMemorySyncServer::new()));
+        let (ws, dev_a) = ids("设备甲");
+        let dev_b = DeviceId::new("设备乙").unwrap();
+        let (mut client_a, mut client_b) =
+            FakeTransport::pair(&server, ws.clone(), dev_a.clone(), dev_b.clone());
+        let mut a = LocalSyncEngine::open(Arc::clone(&storage_a), ws.clone(), dev_a).unwrap();
+        write_md(storage_a.as_ref(), "a.md", "服务端版");
+        a.handle_watch_events(&[WatchEvent::Created {
+            path: DocPath::new("a.md").unwrap(),
+        }]);
+        a.sync_once(&mut client_a).unwrap();
+        let synced_cursor = server.borrow().cursor();
+
+        let mut b = LocalSyncEngine::open(Arc::clone(&storage_b), ws, dev_b).unwrap();
+        b.sync_once(&mut client_b).unwrap();
+        write_md(storage_b.as_ref(), "a.md", "本地未同步");
+        b.handle_watch_events(&[WatchEvent::Modified {
+            path: DocPath::new("a.md").unwrap(),
+        }]);
+        b.drain_dirty().unwrap();
+        server.borrow_mut().seed_text("b.md", "新增").unwrap();
+        server.borrow_mut().prune_history(synced_cursor);
+        assert!(b.sync_once(&mut client_b).is_err());
+        assert!(b.status().needs_confirmation);
+        b.resolve_snapshot_confirmation(SnapshotChoice::KeepLocal)
+            .unwrap();
+        assert!(!b.status().needs_confirmation);
+        // outbox 未变，同一门槛不应重复出现。
+        assert!(b.sync_once(&mut client_b).is_err());
+        assert!(!b.status().needs_confirmation);
+    }
+
+    #[test]
+    fn resolve_snapshot_confirmation_choices_are_explicit() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let storage_a = provider(dir_a.path());
+        let storage_b = provider(dir_b.path());
+        let server = Rc::new(RefCell::new(InMemorySyncServer::new()));
+        let (ws, dev_a) = ids("设备甲");
+        let dev_b = DeviceId::new("设备乙").unwrap();
+        let (mut client_a, mut client_b) =
+            FakeTransport::pair(&server, ws.clone(), dev_a.clone(), dev_b.clone());
+        let mut engine_a =
+            LocalSyncEngine::open(Arc::clone(&storage_a), ws.clone(), dev_a).unwrap();
+        write_md(storage_a.as_ref(), "a.md", "服务端版");
+        engine_a.handle_watch_events(&[WatchEvent::Created {
+            path: DocPath::new("a.md").unwrap(),
+        }]);
+        engine_a.sync_once(&mut client_a).unwrap();
+        let synced_cursor = server.borrow().cursor();
+
+        let mut engine_b = LocalSyncEngine::open(Arc::clone(&storage_b), ws, dev_b).unwrap();
+        engine_b.sync_once(&mut client_b).unwrap();
+        write_md(storage_b.as_ref(), "a.md", "本地未同步");
+        engine_b.handle_watch_events(&[WatchEvent::Modified {
+            path: DocPath::new("a.md").unwrap(),
+        }]);
+        engine_b.drain_dirty().unwrap();
+        server.borrow_mut().seed_text("b.md", "新增").unwrap();
+        server.borrow_mut().prune_history(synced_cursor);
+        assert!(engine_b.sync_once(&mut client_b).is_err());
+        assert!(engine_b.status().needs_confirmation);
+        let before = engine_b.session().pending_batches().len();
+
+        // KeepLocal / Merge 都不清空 outbox，只消除本轮确认标记。
+        let keep = engine_b
+            .resolve_snapshot_confirmation(SnapshotChoice::KeepLocal)
+            .unwrap();
+        assert!(!keep.outbox_cleared);
+        assert!(keep.confirmation_cleared);
+        assert_eq!(engine_b.session().pending_batches().len(), before);
+        assert!(!engine_b.status().needs_confirmation);
+        assert_eq!(read_md(storage_b.as_ref(), "a.md"), "本地未同步");
+        let merge = engine_b
+            .resolve_snapshot_confirmation(SnapshotChoice::Merge)
+            .unwrap();
+        assert!(!merge.outbox_cleared);
+        assert_eq!(engine_b.session().pending_batches().len(), before);
+
+        // UseRemote 是唯一会显式丢弃未推送批次的分支。
+        let use_remote = engine_b
+            .resolve_snapshot_confirmation(SnapshotChoice::UseRemote)
+            .unwrap();
+        assert!(use_remote.outbox_cleared);
+        assert!(engine_b.session().pending_batches().is_empty());
+        assert_eq!(read_md(storage_b.as_ref(), "a.md"), "本地未同步");
+    }
+
+    #[test]
+    fn resolve_unknown_conflict_leaves_state_unchanged() {
+        let (_dir, _storage, mut engine, _client) = conflict_fixture();
+        let before = engine.status().clone();
+        assert!(
+            engine
+                .resolve_conflict("不存在.md", "文本", ConflictChoice::KeepLocal)
+                .is_err()
+        );
+        assert_eq!(engine.status(), &before);
+        assert!(engine.status().conflict_docs.contains(&"a.md".to_owned()));
     }
 
     /// 断线时已暂存的编辑必须立即落盘，进程重启后仍能重放 outbox。

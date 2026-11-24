@@ -1,9 +1,9 @@
 # 码札（Mazha）同步 SPEC 草案
 
-> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）；S5a 桌面接入第一批契约已定并实现（D102，见 §5.10 / §9.6 / §11.4）**  
+> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）；S5a 桌面接入第一批契约已定并实现（D102，见 §5.10 / §9.6 / §11.4）；S5b 第一批（增量 Document patch + 合并/覆盖交互）契约已定并实现（D103/D104，见 §5.11 / §9.7 / §11.5）**  
 > 日期：2026-11-24  
-> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D102；`HANDOFF.md` 下一步 S5b  
-> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录，S5a 桌面周期/手动同步与状态/冲突提示由 D102 与本文件 §5.10 / §9.6 / §11.4 记录。WS 订阅与体验优化（S5b）仍待实现。
+> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D104；`HANDOFF.md` 下一步 S5b 第二批  
+> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录，S5a 桌面周期/手动同步与状态/冲突提示由 D102 与本文件 §5.10 / §9.6 / §11.4 记录，S5b 第一批的增量 patch 与显式合并/覆盖交互由 D103/D104 与本文件 §5.11 / §9.7 / §11.5 记录。S5b 第二批（WS 订阅、快照压缩、墓碑 GC、平台安全存储）仍待实现。
 
 ---
 
@@ -625,10 +625,78 @@ MetaChange =
 
 #### 5.10.4 S5a / S5b 边界
 
-| 批次 | 本次范围 | 后置（S5b） |
-|------|----------|-------------|
+| 批次 | 本次范围 | 后置 |
+|------|----------|------|
 | S5a | 桌面注入 `HttpTransport`、周期/手动同步、状态栏/冲突横幅、快照需确认提示与重试；配置走 settings.json + 环境变量 | — |
-| S5b | — | S-08 增量 Document patch（减少 undo/选区丢失）、真正的“合并/覆盖”交互动作、WebSocket 订阅、快照压缩、墓碑 GC、平台安全存储（token 不再依赖环境变量） |
+| S5b 第一批 | S-08 增量 Document patch（减少 undo/选区丢失）、真正的“合并/覆盖”交互动作与快照确认选择（D103/D104） | S5b 第二批 |
+| S5b 第二批 | — | WebSocket 订阅、快照压缩、墓碑 GC、平台安全存储（token 不再依赖环境变量） |
+
+---
+
+### 5.11 S5b 第一批契约（已定，D103/D104 / 0.1.126）
+
+> 本批是 **additive**：D95–D102 的既有公开签名与语义零改动。`apply_remote` 仍返回
+> `CrdtResult<bool>`；`LocalSyncEngine::sync_once`/`status` 的行为不变；桌面仍复用
+> D102 的 `SyncHandle` / `poll_sync_replies` / `SyncReply` 与 D92 横幅样式。
+> 不新增根 workspace 依赖；核心 crate 不引入 GUI/网络/async。
+
+#### 5.11.1 S-08 增量 Document patch（D103）
+
+1. **patch 生成**：`apply_remote` 先记录 `Document` 旧文本，把远端帧应用到 `CrdtDoc`
+   后取新文本；对两个 UTF-8 字符串裁剪**最长公共前后缀**（裁剪点必须落在字符边界，
+   禁止切坏 CJK/emoji），得到唯一一个 `Edit::Replace { range, text }` 语义的补丁。
+   `RemotePatch` 暴露 `old_len`、`new_len`、`range`、`text`、`removed`，供校验与偏移重映射。
+2. **应用路径**：新增 `apply_remote_detailed` 返回 `RemoteApplyOutcome { changed, patch }`；
+   `apply_remote` 委托给它并只回传 `changed`，**签名与返回值保持不变**。无变化时不得
+   触碰文档文本、undo/redo 栈与缓存。
+3. **undo/选区契约**：`Document::apply_remote_patch` 经 `apply_and_refresh` 维护块/投影
+   缓存，但**不把远端变更 push 进 undo 栈**；对已有 undo 栈的历史编辑偏移做重映射，
+   规则为：`offset <= range.start` 不变，`offset >= range.end` 平移 `delta = new_len - old_len`，
+   落在被替换区间内则钳到 `range.start + text.len()`。`redo` 栈直接清空：其
+   `original/inverse` 绑定旧文本，偏移重映射不安全。光标/选区由调用方用同一个
+   `RemotePatch::remap_offset` / `remap_range` 纯函数重映射，核心不持有 UI 选区。
+4. **纯 Rust 单测**必须覆盖：CJK 多字节、公共前后缀、纯插入、纯删除、全替换、空文本、
+   无变化不触动 undo/redo、多字节边界安全、undo 栈重映射与 redo 清空。
+
+#### 5.11.2 冲突材料与三种选择的精确定义（D104）
+
+冲突材料来自已有墓碑：`Tombstone::conflict_frames()` 是自包含 Yjs v1 全量帧，可应用到
+空 `CrdtDoc` 恢复“冲突副本文本”；坏帧必须整批拒绝、零改动并返回错误。快照确认材料来自
+`status().needs_confirmation`（本地文件/outbox 已保留，不自动清空）。三种选择：
+
+| 选择 | 墓碑冲突（`resolve_conflict`） | 快照确认（`resolve_snapshot_confirmation`） |
+|------|-------------------------------|--------------------------------------------|
+| `KeepLocal`（保留本地） | 把**冲突副本文本恢复为当前文档正文**（需用户显式确认），墓碑与冲突副本保留；以严格更高 `op_id` stage 一次 upsert 复活该文档 | 放弃快照回退、保留本地文件与 outbox，清除本轮确认标记；下次同步仍可重试 |
+| `UseRemote`（采用远端） | 接受远端删除：保留墓碑与冲突副本作审计，**不写回文档正文**、不静默删本地文件；清除本轮确认标记 | 接受服务端快照覆盖本地文本与 outbox：先以检查点显式清空 outbox，再允许下一轮快照引导 |
+| `Merge`（合并） | **确定性非 CRDT 拼接**：`冲突副本文本 + "\n" + 当前本地正文`，写回本地并 stage 全量帧复活；墓碑与冲突副本保留 | **不拼接服务端快照文本**：保留本地文件与 outbox、只清除本轮确认标记，让下一轮同步由 CRDT 自身合并本地与远端；不清空 outbox |
+
+- `Merge` 只在**墓碑冲突**场景做确定性拼接，**不是 CRDT 语义合并**；快照确认场景的
+  `Merge` 连文本都不拼，只保留 outbox 交给下一轮 CRDT 自行合并，避免把服务端快照硬拼进正文。
+- 任何“覆盖/替换/清空 outbox”都必须由 UI 先给出破坏性确认文案、用户二次确认后才发命令；
+  引擎 API 本身只执行显式传入的选择，**绝不静默丢弃**。
+- 解决动作只改本地状态/文件与会话暂存，**不自动触发网络同步**；`sync_once` 仍由
+  “立即同步/周期超时”驱动。坏帧/非法 DocId/过期冲突材料一律返回错误且零改动。
+- `resolve_conflict` / `resolve_snapshot_confirmation` 返回 `ResolveOutcome`，其中
+  `document_text: Option<String>` 交给桌面通过既有本地保存路径写回；引擎不依赖
+  `mazha-core`、不直接操作已打开的 `Document`。
+- 已确认状态仅存于内存：引擎为冲突副本保存“帧字节指纹”、为快照门槛保存
+  “outbox 批次 ID 指纹”，只有材料完全一致时同一会话内才抑制重复横幅；新冲突/
+  新批次照常提示。指纹不写入 `.mazha/sync-state.bin`，重启后横幅可能重现；
+  持久化确认状态留 S5b 第二批，本批不引入新的状态文件字段。
+
+#### 5.11.3 桌面交互入口（D104）
+
+- `SyncBanner` additive 增加 `choices: Vec<SyncChoice>`（保留本地/采用远端/合并），
+  既有 `action: Option<SyncBannerAction>` 与 `Retry` 保持原语义；冲突横幅与
+  `needs_confirmation` 横幅都显示选择按钮。
+- 破坏性选择（`UseRemote`、`KeepLocal` 的正文替换）第一次点击只切换到确认文案
+  （由纯函数给出），第二次点击才通过 `SyncHandle::resolve_*` 发 `SyncCommand`；
+  `Merge` 为非破坏性选择，可直接发送。UI 只发命令/回写状态，绝不跨线程改 GPUI 状态。
+- 同步线程收到 `ResolveConflict { doc_id, choice, local_text }` /
+  `ResolveSnapshot { choice }` 后调用引擎新 API，把 `ResolveOutcome` 连同目标 `doc_id`
+  经 `SyncReply::Resolved { doc_id, outcome }` 回传；主线程在 `apply_sync_replies` 中
+  按工作区根校验写回路径、应用 `document_text` 到对应标签并刷新状态栏/横幅，写盘失败
+  时保留内存文档并提示失败。
 
 ---
 
@@ -902,6 +970,25 @@ platforms/desktop（独立 workspace；只改本目录与桌面 Cargo.lock）
 - 桌面新增纯函数模块（配置解析、URL 校验、状态文案、横幅文案、事件转发过滤、
   状态栏拼接）不依赖 GPUI，沿用既有 `#[cfg(test)]` 风格测试；无真实网络/端口。
 
+### 9.7 S5b 第一批依赖边界（已定，D103/D104 / 0.1.126）
+
+```text
+mazha-core（additive：remote_patch 模块；无新外部依赖）
+   └─▶ mazha-crdt / mazha-store（既有依赖方向不变）
+
+mazha-sync-local（additive：resolve 模块；仍不依赖 mazha-core）
+   ├─▶ mazha-crdt（冲突副本帧解码、strictly higher op_id 复活）
+   ├─▶ mazha-sync（checkpoint + restore_checkpoint 显式清空 outbox）
+   └─▶ mazha-store（本地文件读写）
+
+platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
+   └─▶ mazha-sync-local（ResolveOutcome.document_text 经 DocId 根路径校验后写盘/重载标签）
+```
+
+- 不新增根 workspace 依赖、不改根 `Cargo.toml`；仅桌面独立锁随新增调用更新。
+- `mazha-sync` 的 `checkpoint` / `restore_checkpoint` 只按既有 additive API 使用，
+  不新增清空 outbox 的方法；`mazha-crdt` 的 D94/D95/D98 语义零改动。
+
 ---
 
 ## 10. 迁移与兼容策略
@@ -983,6 +1070,22 @@ platforms/desktop（独立 workspace；只改本目录与桌面 Cargo.lock）
 - **门禁**：根 workspace 747 → 保持（S5a 只改桌面，核心零改动）；桌面独立
   workspace 112 → 新增纯函数单测，`fmt/clippy/test/build` 四门禁全绿。
 
+### 11.5 S5b 第一批验收标准与测试分层（已定，D103/D104）
+
+- **核心纯 Rust**：`RemotePatch::from_texts` 的前后缀裁剪停在字符边界；`remap_offset`/
+  `remap_range` 在插入/删除/替换/全替换/空文本下满足 §5.11.1 规则；`apply_remote`
+  无变化时不改动文本/undo/redo；有变化时 undo 历史保留且偏移已重映射、redo 清空；
+  `apply_remote_detailed` 返回的 patch 能重放回新文本。
+- **本地编排纯 Rust**：三种冲突选择与快照确认的结果逐项锁死（正文/墓碑/冲突副本/
+  outbox/确认标记）；坏帧或非法 DocId 零改动；`resolve_*` 不调用 `sync_once`、
+  不触发网络；只有快照 `UseRemote` 清空 outbox，且只经 checkpoint/restore 实现，
+  快照 `Merge` 必须保留 outbox。
+- **桌面纯函数**：横幅 choices 文案、破坏性二次确认文案、`ResolveOutcome` 回写后
+  状态刷新；既有 D102 横幅测试（重试同步、非破坏性）继续成立。
+- **门禁**：根 `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
+  `cargo test --workspace` 全绿；桌面 `cargo fmt --check`、`cargo clippy -- -D warnings`、
+  `cargo test`、`cargo build` 全绿；测试计数变化记入 `HANDOFF.md`。
+
 ---
 
 ## 12. 开放问题与建议决策项
@@ -996,12 +1099,12 @@ platforms/desktop（独立 workspace；只改本目录与桌面 Cargo.lock）
 | S-05 | 最小服务端形态？ | **已定（D100）**：`mazha-sync-server`，带持久化的同步中继（temp+rename 落盘、批次去重、服务端 CRDT 校验），不做 Markdown 语义合并。 | 高（已决） |
 | S-06 | 传输 MVP 选型？ | **已定（D100）**：同步 HTTP（ureq client + tiny_http server），请求-响应优先，WebSocket 订阅后置。 | 中（已决） |
 | S-07 | `mazha-sync` 是否独立 crate？ | **已定（D99）**：独立 crate，协议/会话/transport trait/假服务端都在此；核心 crate 保持纯净，无网络/GUI/async。 | 高（已决） |
-| S-08 | `apply_remote` 整体重建导致 undo/选区丢失如何处理？ | **S4 明确不触碰 `mazha-core`/桌面**：引擎只写本地 `.md` 文本，不动已打开 `Document`；D97 的 MVP 重建代价仍成立，增量 patch 与 UI 提示留 S5。 | 中 |
+| S-08 | `apply_remote` 整体重建导致 undo/选区丢失如何处理？ | **已实现（D103，S5b 第一批）**：`apply_remote` 签名/返回值不变，内部生成 `RemotePatch` 并增量应用；远端变更不进 undo，已有 undo 历史偏移重映射、redo 清空，光标/选区用同一个纯函数重映射。 | 中（已决） |
 | S-09 | 认证模型？ | **已定（D100）**：MVP 先设备 token + 工作区授权（`Authorization: Bearer`，工作区隔离），团队/组织权限后置。 | 高（已决） |
 | S-10 | 是否需要 E2EE？ | MVP 不承诺；协议预留密文载荷字段。 | 中 |
 | S-11 | 快照与增量日志的本地存储格式？ | **已定（D100）**：先复用 wire 小端/长度前缀助手做单文件 hex 持久化（temp+rename），后续引入 append-only log + compaction。 | 中（已决） |
 | S-12 | 结构性并发（表格/块）冲突提示？ | 继续沿用 §6.5 `[待确认]`；先记录冲突事件，不自动重写语义结构。S4 只在 `status().conflict_docs` 暴露墓碑冲突副本所在的 `DocId`。 | 低（S4 仅暴露 DocId） |
-| S-13 | 桌面何时接入本地引擎与冲突 UI？ | **已实现（D102，S5a）**：S4 只交付纯 Rust crate 与测试；S5a 在桌面注入 `HttpTransport`、周期/手动同步，把 `needs_confirmation`/`conflict_docs` 显示为状态栏/横幅，并提供“重试同步”，绝不静默覆盖。真正的“合并/覆盖”动作留 S5b。 | 高（已决） |
+| S-13 | 桌面何时接入本地引擎与冲突 UI？ | **已实现（D102，S5a；D104，S5b 第一批）**：S5a 注入 `HttpTransport`、周期/手动同步与状态/冲突提示；S5b 第一批补上“保留本地/采用远端/合并”三选一与破坏性二次确认，所有覆盖均需用户显式确认，绝不静默丢弃。 | 高（已决） |
 
 建议 ADR 拆分：
 
@@ -1063,10 +1166,19 @@ platforms/desktop（独立 workspace；只改本目录与桌面 Cargo.lock）
   冲突横幅列 `DocId` 并说明数据未静默删除；“重试同步”只发 `SyncNow`。
 - 只改 `platforms/desktop/*` 与桌面 `Cargo.lock`；核心 crate 与 D95-D101 语义零改动。
 
-### Phase S5b：体验优化与产品化（后置）
+### Phase S5b 第一批：增量 patch 与显式合并/覆盖（D103/D104，0.1.126 已落地）
 
-- S-08 增量 Document patch（减少 undo/选区丢失）、真正的“合并/覆盖”交互动作。
+- `mazha-core` additive `RemotePatch` / `apply_remote_detailed` / `Document::apply_remote_patch`：
+  S-08 落地，远端变更不进 undo，undo 历史重映射、redo 清空，选区由纯函数重映射。
+- `mazha-sync-local` additive `resolve_conflict` / `resolve_snapshot_confirmation`：
+  三选一精确语义、坏帧零改动、不自动触发网络；只用既有 checkpoint/restore API 清 outbox。
+- 桌面横幅加三选一按钮与破坏性二次确认，复用 `SyncHandle`/`SyncReply`/D92 样式；
+  D95–D102 签名与语义零改动，根依赖不变。
+
+### Phase S5b 第二批：产品化（后置）
+
 - WebSocket 订阅、快照压缩、墓碑 GC、平台安全存储（token 不再从环境变量读取）。
+- 已确认状态持久化（避免重启后横幅重现）与确认后的自动重试策略。
 
 ---
 
@@ -1098,3 +1210,7 @@ platforms/desktop（独立 workspace；只改本目录与桌面 Cargo.lock）
 - **S5a 回填（0.1.125）**：本文 §5.10（桌面线程/配置/状态契约）/§9.6（桌面依赖边界）/
   §11.4（验收）/§12 S-13/§13 S5a/S5b 拆分；`SPEC.md` §6.5 增 S5a 段、
   §14 新增 D102、§15 记 0.1.125；`HANDOFF.md` 同步版本/平台状态/测试数/下一步 S5b。
+- **S5b 第一批回填（0.1.126）**：本文 §5.11（增量 patch/三选一/桌面入口）/§9.7（依赖边界）/
+  §11.5（验收）/§12 S-08/S-13/§13 S5b 第一批与第二批拆分；`SPEC.md` §5 crate 表补
+  `mazha-core`/`mazha-sync-local` 的 additive 能力、§6.5 增 S5b 第一批段、
+  §14 新增 D103/D104、§15 记 0.1.126；`HANDOFF.md` 同步版本/状态/测试数/下一步 S5b 第二批。

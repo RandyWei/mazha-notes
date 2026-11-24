@@ -11,6 +11,7 @@
 
 use crate::edit::{ChangeSummary, Edit};
 use crate::error::{EditError, Result};
+use crate::remote_patch::RemotePatch;
 use ropey::Rope;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -60,6 +61,34 @@ fn old_range_of(edit: &Edit) -> Range<usize> {
         | Edit::Replace { range, .. }
         | Edit::ToggleInline { range, .. }
         | Edit::ToggleBlock { range, .. } => range.clone(),
+    }
+}
+
+/// 把一条历史编辑从远端补丁前的坐标系搬到补丁后的坐标系（D103）。
+///
+/// `Insert.at`、`Delete/Replace.range` 等都在旧文本中，逐项按补丁的纯函数 remap；
+/// 高层 `Toggle*` 理论上不会入栈（`apply` 会先 resolve），这里仍兜底处理。
+fn remap_edit(edit: &Edit, patch: &RemotePatch) -> Edit {
+    match edit {
+        Edit::Insert { at, text } => Edit::Insert {
+            at: patch.remap_offset(*at),
+            text: text.clone(),
+        },
+        Edit::Delete { range } => Edit::Delete {
+            range: patch.remap_range(range.clone()),
+        },
+        Edit::Replace { range, text } => Edit::Replace {
+            range: patch.remap_range(range.clone()),
+            text: text.clone(),
+        },
+        Edit::ToggleInline { range, mark } => Edit::ToggleInline {
+            range: patch.remap_range(range.clone()),
+            mark: *mark,
+        },
+        Edit::ToggleBlock { range, target } => Edit::ToggleBlock {
+            range: patch.remap_range(range.clone()),
+            target: target.clone(),
+        },
     }
 }
 
@@ -261,6 +290,40 @@ impl Document {
         if self.undo_stack.len() > self.max_history {
             self.undo_stack.remove(0);
         }
+        Ok(summary)
+    }
+
+    /// 应用远端增量补丁（S5b/D103）：更新文本与缓存，但**不产生新的 undo 记录**。
+    ///
+    /// 远端变更不是用户编辑，推入 undo 会让「撤销」把远端内容当成自己的操作撤销掉；
+    /// 但已有 undo 历史的偏移仍指向旧坐标系，必须重映射后再保留。redo 的
+    /// `original/inverse` 绑定的是旧文本快照，重映射无法保证逆编辑正确，因此清空。
+    /// 光标/选区不在核心内，调用方用同一个 [`RemotePatch`] 的 `remap_*` 方法处理。
+    ///
+    /// # Errors
+    /// 补丁的 `old_len` 或被替换片段与当前文本不符（过期/错位补丁）时返回
+    /// [`EditError::InvalidRange`]，文档与历史均不改动。
+    pub fn apply_remote_patch(&mut self, patch: &RemotePatch) -> Result<ChangeSummary> {
+        // 两阶段：先校验补丁与当前文本完全匹配，再做任何修改，坏补丁零改动。
+        if !patch.matches(&self.text()) {
+            return Err(EditError::InvalidRange {
+                start: patch.range.start,
+                end: patch.range.end,
+                doc_len: self.len(),
+            });
+        }
+        let edit = Edit::Replace {
+            range: patch.range.clone(),
+            text: patch.text.clone(),
+        };
+        self.validate_edit(&edit)?;
+        let summary = self.apply_and_refresh(&edit);
+        // 历史编辑发生在远端变更之前：整体搬到新坐标系，否则下一次 undo 会改错位置。
+        for change in &mut self.undo_stack {
+            change.original = remap_edit(&change.original, patch);
+            change.inverse = remap_edit(&change.inverse, patch);
+        }
+        self.redo_stack.clear();
         Ok(summary)
     }
 

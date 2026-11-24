@@ -19,6 +19,7 @@ mod highlight;
 mod intent;
 mod offset_map;
 mod projection;
+mod remote_patch;
 mod selection;
 mod table;
 mod workspace;
@@ -36,6 +37,7 @@ pub use projection::{
     Projection, RunStyle, TableLine, TextRun, Widget, WidgetKind, build as build_projection,
     build_from as build_projection_from,
 };
+pub use remote_patch::RemotePatch;
 pub use selection::Selection;
 pub use table::{TableOp, cell_index_at, cell_step, edit_table, table_cells};
 pub use workspace::{Workspace, WorkspaceError, WorkspaceResult};
@@ -45,8 +47,8 @@ pub use mazha_md::Align;
 
 // CRDT 桥接（core → mazha-crdt）
 pub use crdt::{
-    CrdtSyncError, CrdtSyncResult, apply_edit_to_crdt, apply_remote, crdt_to_document,
-    document_to_crdt, load_crdt, save_crdt,
+    CrdtSyncError, CrdtSyncResult, RemoteApplyOutcome, apply_edit_to_crdt, apply_remote,
+    apply_remote_detailed, crdt_to_document, document_to_crdt, load_crdt, save_crdt,
 };
 
 // 便捷重导出存储层类型（依赖方向 core → store）

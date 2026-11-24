@@ -10,9 +10,11 @@
 //! ## 集成方式
 //! - 本地编辑：`Document::apply` 成功后，用 [`apply_edit_to_crdt`] 把同一编辑
 //!   同步到 `CrdtDoc`（经状态向量/更新帧可再同步给远端）。
-//! - 远端更新：远端更新应用到 `CrdtDoc` 后，用 [`crdt_to_document`] 把源文本
-//!   重新载入 `Document`（MVP 采用"整体重建"策略，不做字符级合并）。
+//! - 远端更新：远端帧并入 `CrdtDoc` 后，用 [`crdt_to_document`] 取新文本，再经
+//!   S5b/D103 的 [`crate::RemotePatch`] 增量应用到 `Document`；整体重建只作为
+//!   `crdt_to_document` 的独立工具保留（默认同步路径不再走它，以免丢 undo/选区）。
 
+use crate::remote_patch::RemotePatch;
 use crate::{Document, Edit, Workspace};
 use mazha_crdt::CrdtDoc;
 use mazha_store::{DocPath, StorageProvider, StoreError};
@@ -106,26 +108,66 @@ fn byte_to_char(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())].chars().count()
 }
 
-/// 应用一个远端更新帧：先并入 `crdt`，若源文本变化则重建 `doc`。
+/// 一次远端应用的详细结果：是否变化，以及供 UI remap 光标/选区的补丁。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteApplyOutcome {
+    /// 文档文本是否被远端帧改变；`false` 时所有历史与缓存均未被触动。
+    pub changed: bool,
+    /// 实际应用的增量补丁；无变化时为 `None`。
+    pub patch: Option<RemotePatch>,
+}
+
+/// 应用一个远端更新帧并返回补丁（S5b/D103）。
 ///
-/// 这是 MVP 的"远端 → 本地"通道：`bytes` 为 Yjs v1 编码的更新（由对端的
-/// [`mazha_crdt::CrdtDoc::encode_diff`] / `encode_update` 产出）。返回是否发生实际变化
-/// （无变化时不会触动本地 undo/redo 历史）。
+/// `bytes` 为 Yjs v1 编码的更新（由对端的 `CrdtDoc::encode_diff` / `encode_update`
+/// 产出）。先记下旧文本，再把帧并入 `crdt`；仅当新文本与旧文本不同才生成
+/// [`RemotePatch`] 并增量应用到 `doc`，远端变更不进 undo、已有 undo 历史重映射、
+/// redo 清空（契约见 `docs/SYNC-SPEC.md` §5.11.1）。
 ///
 /// # Errors
-/// 更新帧解码失败时返回 [`mazha_crdt::CrdtError`]。
+/// 更新帧解码失败时返回 [`mazha_crdt::CrdtError`]，此时 `crdt`/`doc` 均不变；
+/// 若 `doc` 与 `crdt` 的旧文本本就不一致（调用方绕过了同步路径），补丁无法匹配时
+/// 返回 [`mazha_crdt::CrdtError::OutOfBounds`] 且不修改 `doc`。
+pub fn apply_remote_detailed(
+    doc: &mut Document,
+    crdt: &mut CrdtDoc,
+    bytes: &[u8],
+) -> mazha_crdt::CrdtResult<RemoteApplyOutcome> {
+    let before = doc.text();
+    // CRDT 自带两阶段校验：坏帧在这里被拒绝，后面的文档改动不会发生。
+    crdt.apply_update(bytes)?;
+    let after = crdt.text();
+    let Some(patch) = RemotePatch::from_texts(&before, &after) else {
+        return Ok(RemoteApplyOutcome {
+            changed: false,
+            patch: None,
+        });
+    };
+    doc.apply_remote_patch(&patch)
+        .map_err(|_| mazha_crdt::CrdtError::OutOfBounds {
+            index: patch.range.start,
+            len: doc.len(),
+        })?;
+    Ok(RemoteApplyOutcome {
+        changed: true,
+        patch: Some(patch),
+    })
+}
+
+/// 应用一个远端更新帧：先并入 `crdt`，若源文本变化则增量更新 `doc`。
+///
+/// D97/D95 的对外签名保持不变（返回 `CrdtResult<bool>`），内部改走
+/// [`apply_remote_detailed`]：远端变更不再整体重建 `Document`，因此不会丢
+/// undo/redo 与选区坐标（由调用方用返回的补丁 remap）。无变化时不触碰历史。
+///
+/// # Errors
+/// 同 [`apply_remote_detailed`]。
 pub fn apply_remote(
     doc: &mut Document,
     crdt: &mut CrdtDoc,
     bytes: &[u8],
 ) -> mazha_crdt::CrdtResult<bool> {
-    crdt.apply_update(bytes)?;
-    let latest = crdt.text();
-    if latest == doc.text() {
-        return Ok(false);
-    }
-    *doc = crdt_to_document(crdt);
-    Ok(true)
+    Ok(apply_remote_detailed(doc, crdt, bytes)?.changed)
 }
 
 #[cfg(test)]
@@ -306,5 +348,83 @@ mod tests {
         let path = DocPath::new(".mazha/bad.yrs").unwrap();
         ws.store().write(&path, &[0xFF, 0xFF, 0x00]).unwrap();
         assert!(matches!(load_crdt(&ws, &path), Err(CrdtSyncError::Crdt(_))));
+    }
+
+    /// D103：远端帧不再整体重建 `Document`，undo/redo 语义必须保持。
+    #[test]
+    fn apply_remote_keeps_undo_history_and_remaps_offsets() {
+        let mut doc = Document::new("你好世界");
+        let mut local = document_to_crdt(&doc);
+        // 本地先有一条可撤销编辑（在 "你好" 后插入 "A"），并同步进本地 CRDT。
+        let edit = Edit::Insert {
+            at: 6,
+            text: "A".to_owned(),
+        };
+        doc.apply(edit.clone()).unwrap();
+        apply_edit_to_crdt(&mut local, &edit).unwrap();
+        assert!(doc.can_undo());
+
+        // 远端副本在文首插入中文：历史里 "A" 的偏移必须随之平移 3 字节。
+        let mut remote = local.fork();
+        remote.insert(0, "前").unwrap();
+        let bytes = remote.encode_diff(&local.state_vector()).unwrap();
+        let outcome = apply_remote_detailed(&mut doc, &mut local, &bytes).unwrap();
+        assert!(outcome.changed);
+        let patch = outcome.patch.expect("变化必须给出补丁");
+        assert_eq!(patch.remap_offset(7), 10);
+        assert_eq!(doc.text(), "前你好A世界");
+
+        // 远端变更不入栈：undo 只撤销本地插入，而不是撤销远端插入。
+        doc.undo().unwrap();
+        assert_eq!(doc.text(), "前你好世界");
+        assert!(!doc.can_undo());
+        // 撤销后产生 redo 项；再应用远端变更时 redo 必须清空。
+        assert!(doc.can_redo());
+        remote.insert(remote.text().chars().count(), "？").unwrap();
+        let more = remote.encode_diff(&local.state_vector()).unwrap();
+        assert!(apply_remote(&mut doc, &mut local, &more).unwrap());
+        assert!(!doc.can_redo());
+    }
+
+    /// D103：无变化的远端帧不能触动文本、undo 与 redo（含空文档边界）。
+    #[test]
+    fn apply_remote_no_change_is_noop() {
+        let mut doc = Document::new("");
+        let mut remote = document_to_crdt(&doc);
+        doc.apply(Edit::Insert {
+            at: 0,
+            text: "甲".to_owned(),
+        })
+        .unwrap();
+        doc.undo().unwrap();
+        assert!(doc.can_redo());
+        let bytes = remote.encode_update();
+        let outcome = apply_remote_detailed(&mut doc, &mut remote, &bytes).unwrap();
+        assert!(!outcome.changed);
+        assert!(outcome.patch.is_none());
+        assert_eq!(doc.text(), "");
+        assert!(doc.can_redo());
+        let bytes = remote.encode_update();
+        assert!(!apply_remote(&mut doc, &mut remote, &bytes).unwrap());
+    }
+
+    /// D103：CJK 前后缀、纯插入/删除、全替换都走同一补丁路径且文本与 CRDT 收敛。
+    #[test]
+    fn apply_remote_patch_replays_cjk_and_replace_cases() {
+        let mut doc = Document::new("前缀hello后缀");
+        let mut local = document_to_crdt(&doc);
+        let mut remote = local.fork();
+        remote.replace(2, 5, "世界🌿").unwrap();
+        let bytes = remote.encode_diff(&local.state_vector()).unwrap();
+        let outcome = apply_remote_detailed(&mut doc, &mut local, &bytes).unwrap();
+        assert_eq!(doc.text(), "前缀世界🌿后缀");
+        assert_eq!(outcome.patch.unwrap().removed, "hello");
+
+        // 删除 CJK 片段：补丁的 removed 必须是完整字符，不能切在字节中间。
+        remote.delete(2, 2).unwrap();
+        let bytes = remote.encode_diff(&local.state_vector()).unwrap();
+        let outcome = apply_remote_detailed(&mut doc, &mut local, &bytes).unwrap();
+        assert_eq!(outcome.patch.unwrap().removed, "世界");
+        assert_eq!(doc.text(), "前缀🌿后缀");
     }
 }

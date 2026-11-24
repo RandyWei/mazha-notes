@@ -17,6 +17,7 @@
 mod engine;
 mod error;
 mod mapping;
+mod resolve;
 mod state;
 
 pub use engine::{LocalSyncEngine, LocalSyncOutcome, LocalSyncStatus};
@@ -24,5 +25,8 @@ pub use error::LocalSyncError;
 pub use mapping::{
     LocalWriteAction, ObservedBytes, doc_id_from_path, is_syncable_md, local_text_to_frames,
     merge_watch_events, remote_frames_to_local_writes, should_ignore_echo,
+};
+pub use resolve::{
+    ConflictChoice, ResolveOutcome, SnapshotChoice, conflict_copy_text, merged_conflict_text,
 };
 pub use state::{LocalSyncState, LocalSyncStore};
