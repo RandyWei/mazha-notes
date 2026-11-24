@@ -63,6 +63,29 @@ pub struct PendingBatch {
 }
 
 impl PendingBatch {
+    /// 用已有部件构造待推送批次（状态恢复/测试用，D101）。
+    ///
+    /// 正常同步流程请使用 `SyncSession::stage_*`：那里会先原子应用到本地名册再入队。
+    /// 本入口只构造数据，不校验内容，调用方需保证部件来自可信的检查点。
+    #[must_use]
+    pub const fn new(
+        batch_id: BatchId,
+        frames: DocFrameMap,
+        meta_changes: Vec<MetaChange>,
+    ) -> Self {
+        Self {
+            batch_id,
+            frames,
+            meta_changes,
+        }
+    }
+
+    /// 拆出全部部件（状态持久化用），消费自身以避免半拷贝。
+    #[must_use]
+    pub fn into_parts(self) -> (BatchId, DocFrameMap, Vec<MetaChange>) {
+        (self.batch_id, self.frames, self.meta_changes)
+    }
+
     /// 批次号。
     #[must_use]
     pub const fn batch_id(&self) -> &BatchId {
@@ -80,6 +103,35 @@ impl PendingBatch {
     pub fn meta_changes(&self) -> &[MetaChange] {
         &self.meta_changes
     }
+}
+
+/// 会话可持久化检查点：只含会话层状态与 outbox，不含 CRDT 名册（D101）。
+///
+/// 名册内容/墓碑由调用方（`mazha-sync-local`）单独落盘并在构造 `SyncSession` 时传入；
+/// 这里保存游标、逻辑时钟、批次计数器、会话身份与未确认批次，避免重启后批次号从 0 重来
+/// 被服务端 `(workspace, device, batch)` 去重吞掉新编辑。本类型是纯数据，D99 语义零改动。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCheckpoint {
+    /// 构造会话时的工作区 ID（恢复时校验，防止串工作区）。
+    pub workspace_id: String,
+    /// 构造会话时的设备 ID（恢复时校验，防止串设备导致批次前缀错乱）。
+    pub device_id: String,
+    /// 最后确认的游标。
+    pub last_ack_cursor: SyncCursor,
+    /// 服务端最近告知的游标（诊断）。
+    pub server_cursor: SyncCursor,
+    /// 未确认出站批次（FIFO，顺序不可重排）。
+    pub outbox: Vec<PendingBatch>,
+    /// 服务端会话 ID；`None` 表示尚未握手。
+    pub session_id: Option<String>,
+    /// 是否仍需握手。
+    pub needs_handshake: bool,
+    /// 是否服务端要求快照引导。
+    pub requires_snapshot: bool,
+    /// 本地 `OpId` 逻辑时钟。
+    pub op_clock: u64,
+    /// 本地批次计数器（与设备 ID 共同构成确定性 `BatchId`）。
+    pub batch_counter: u64,
 }
 
 /// 握手结果。
@@ -251,6 +303,58 @@ impl SyncSession {
     #[must_use]
     pub const fn op_clock(&self) -> u64 {
         self.op_clock
+    }
+
+    /// 导出会话检查点（不含名册，名册由调用方单独持久化，D101）。
+    ///
+    /// 本方法只读、不改变会话状态；outbox 按 FIFO 原序克隆，重启后可无损重放。
+    #[must_use]
+    pub fn checkpoint(&self) -> SessionCheckpoint {
+        SessionCheckpoint {
+            workspace_id: self.workspace_id.as_str().to_owned(),
+            device_id: self.device_id.as_str().to_owned(),
+            last_ack_cursor: self.last_ack_cursor,
+            server_cursor: self.server_cursor,
+            outbox: self.outbox.iter().cloned().collect(),
+            session_id: self.session_id.clone(),
+            needs_handshake: self.needs_handshake,
+            requires_snapshot: self.requires_snapshot,
+            op_clock: self.op_clock,
+            batch_counter: self.batch_counter,
+        }
+    }
+
+    /// 从检查点恢复会话层状态（不触碰名册，D101）。
+    ///
+    /// # Errors
+    /// 检查点的工作区/设备与当前会话不一致时返回 `Protocol`，避免批次号前缀错乱
+    /// 或把 A 工作区的游标/会话 ID 用到 B 工作区；调用方应丢弃该检查点而非强行恢复。
+    pub fn restore_checkpoint(
+        &mut self,
+        checkpoint: &SessionCheckpoint,
+    ) -> Result<(), ProtocolError> {
+        if checkpoint.workspace_id != self.workspace_id.as_str() {
+            return Err(ProtocolError::InvalidId {
+                field: "checkpoint.workspace_id",
+                value: checkpoint.workspace_id.clone(),
+            });
+        }
+        if checkpoint.device_id != self.device_id.as_str() {
+            return Err(ProtocolError::InvalidId {
+                field: "checkpoint.device_id",
+                value: checkpoint.device_id.clone(),
+            });
+        }
+        // 名册由调用方独立载入；这里只恢复会话自己的状态，保持 D99 同步语义不变。
+        self.last_ack_cursor = checkpoint.last_ack_cursor;
+        self.server_cursor = checkpoint.server_cursor;
+        self.outbox = checkpoint.outbox.iter().cloned().collect();
+        self.session_id.clone_from(&checkpoint.session_id);
+        self.needs_handshake = checkpoint.needs_handshake;
+        self.requires_snapshot = checkpoint.requires_snapshot;
+        self.op_clock = checkpoint.op_clock;
+        self.batch_counter = checkpoint.batch_counter;
+        Ok(())
     }
 
     /// 产生下一个 `OpId`：时钟单调 +1，设备固定为本会话设备（D98）。
@@ -690,11 +794,7 @@ mod tests {
         assert_eq!(server.borrow().text_of("笔记/a.md").unwrap(), "你好，世界");
 
         // 同一个 batch_id 再投递一次：服务端去重、不记新日志、ack 游标不变。
-        let pending = PendingBatch {
-            batch_id: batch,
-            frames: BTreeMap::new(),
-            meta_changes: Vec::new(),
-        };
+        let pending = PendingBatch::new(batch, BTreeMap::new(), Vec::new());
         let request = SyncEnvelope::new(
             ws,
             dev,
@@ -915,5 +1015,64 @@ mod tests {
         assert!(outcome.pull.is_none());
         assert_eq!(client.roster().get("a.md").unwrap().text(), "快照内容");
         assert_eq!(client.last_ack_cursor(), SyncCursor::new(1));
+    }
+
+    /// 检查点往返：outbox/时钟/游标/会话身份必须原样恢复，重启后批次号不能回退到 0。
+    #[test]
+    fn checkpoint_roundtrip_preserves_outbox_clocks_and_replays_without_dedupe_loss() {
+        let server = Rc::new(RefCell::new(InMemorySyncServer::new()));
+        let (ws, dev) = ids("设备甲");
+        let mut transport = FakeTransport::new(&server, ws.clone(), dev.clone());
+        let mut client = SyncSession::new(ws.clone(), dev.clone(), CrdtRoster::new());
+        client.handshake(&mut transport).unwrap();
+        let first = client.stage_text("a.md", "第一版").unwrap();
+        let second = client.stage_text("b.md", "第二版").unwrap();
+        let checkpoint = client.checkpoint();
+
+        // 模拟重启：新会话用相同身份/名册，恢复检查点后仍按原批次号重放。
+        let mut revived = SyncSession::new(ws, dev, CrdtRoster::new());
+        revived.restore_checkpoint(&checkpoint).unwrap();
+        assert_eq!(revived.last_ack_cursor(), client.last_ack_cursor());
+        assert_eq!(revived.session_id(), client.session_id());
+        assert!(!revived.needs_handshake());
+        assert_eq!(revived.op_clock(), client.op_clock());
+        assert_eq!(revived.batch_counter, client.batch_counter);
+        assert_eq!(revived.pending_batches().len(), 2);
+        assert_eq!(revived.pending_batches()[0].batch_id(), &first);
+        assert_eq!(revived.pending_batches()[1].batch_id(), &second);
+
+        let outcome = revived.push(&mut transport).unwrap();
+        assert_eq!(outcome.confirmed, vec![first, second]);
+        assert_eq!(server.borrow().text_of("a.md").unwrap(), "第一版");
+        assert_eq!(server.borrow().text_of("b.md").unwrap(), "第二版");
+
+        // 恢复后新暂存批次必须接着旧计数器，不能被服务端误判为重复投递。
+        let third = revived.stage_text("c.md", "第三版").unwrap();
+        assert_eq!(third.as_str(), "设备甲-00000000000000000002");
+    }
+
+    /// 检查点身份校验：串工作区/串设备的检查点必须拒绝，避免状态污染。
+    #[test]
+    fn restore_checkpoint_rejects_foreign_identity() {
+        let (ws, dev) = ids("设备甲");
+        let client = SyncSession::new(ws.clone(), dev.clone(), CrdtRoster::new());
+        let mut checkpoint = client.checkpoint();
+        checkpoint.workspace_id = "别的workspace".to_owned();
+        let mut other = SyncSession::new(ws.clone(), dev.clone(), CrdtRoster::new());
+        assert!(matches!(
+            other.restore_checkpoint(&checkpoint),
+            Err(ProtocolError::InvalidId { .. })
+        ));
+
+        checkpoint.workspace_id = ws.as_str().to_owned();
+        checkpoint.device_id = "设备乙".to_owned();
+        assert!(matches!(
+            other.restore_checkpoint(&checkpoint),
+            Err(ProtocolError::InvalidId { .. })
+        ));
+        // 拒绝后会话状态未被改动。
+        assert_eq!(other.op_clock(), 0);
+        assert_eq!(other.batch_counter, 0);
+        assert!(other.pending_batches().is_empty());
     }
 }

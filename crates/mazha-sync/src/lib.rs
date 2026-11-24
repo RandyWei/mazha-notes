@@ -28,7 +28,7 @@ pub use protocol::{
     SyncErrorCode, SyncErrorPayload, SyncMessage, SyncMessageKind, WorkspaceId, error_code_for,
 };
 pub use session::{
-    HandshakeOutcome, PendingBatch, PullOutcome, PushOutcome, SnapshotOutcome, SyncOnceOutcome,
-    SyncSession, SyncSessionError,
+    HandshakeOutcome, PendingBatch, PullOutcome, PushOutcome, SessionCheckpoint, SnapshotOutcome,
+    SyncOnceOutcome, SyncSession, SyncSessionError,
 };
 pub use transport::{SyncTransport, TransportError};

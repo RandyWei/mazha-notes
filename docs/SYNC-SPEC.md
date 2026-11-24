@@ -1,15 +1,15 @@
 # 码札（Mazha）同步 SPEC 草案
 
-> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）**  
+> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）**  
 > 日期：2026-11-24  
-> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D100；`HANDOFF.md` 下一步 S4  
-> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录。S4 WS 订阅仍待实现。
+> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D101；`HANDOFF.md` 下一步 S5  
+> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录。WS 订阅与桌面 UI 接入仍待实现。
 
 ---
 
 ## 0. 文档说明
 
-1. 本文是 Phase 5 同步方向的**独立设计文档**：S0/S1 为已确认的设计契约；S2（§5.7 / §6.4）与 S3（§5.8 / §7.4 / §9.4）均已在新 crate `mazha-sync` 及其上层独立 crate 中落地。WS 订阅（S4）仍不在本文契约范围内。
+1. 本文是 Phase 5 同步方向的**独立设计文档**：S0/S1 为已确认的设计契约；S2（§5.7 / §6.4）与 S3（§5.8 / §7.4 / §9.4）均已在新 crate `mazha-sync` 及其上层独立 crate 中落地；S4（§5.9 / §9.5）把会话层接到本地文件监听与名册落盘（新 crate `mazha-sync-local`），仍不接桌面 UI。WS 订阅与桌面状态展示（S5）不在本文 S4 契约范围内。
 2. 任何结论在落地前需评审；确认后应：
    - 在 `SPEC.md` §6.5 增加“详见 `docs/SYNC-SPEC.md`”索引；
    - 将关键决策拆成 `docs/ADR/*` 或 `SPEC.md` §14 的 Dxx；
@@ -467,6 +467,113 @@ MetaChange =
 
 ---
 
+### 5.9 S4 本地工作区同步编排契约（已定，D101 / 0.1.124）
+
+> 本节把 §5.7 的 `SyncSession` 接到 D91/D92 已有的文件监听与本地 `.md` 文件，
+> 定义“本地文件 ⇄ 名册 ⇄ 远端帧”的编排边界。实现位于**新 crate `mazha-sync-local`**：
+> 依赖 `mazha-sync` + `mazha-crdt` + `mazha-store`，不依赖 `mazha-core`、不依赖
+> GUI/网络/async runtime、不反向依赖 `mazha-sync-server` / `mazha-sync-http`；
+> 真正的网络实现通过调用方传入的 `&mut dyn SyncTransport` 注入（S3 的
+> `HttpTransport` / `FakeTransport` 均可），因此本 crate 本身仍属纯 Rust 核心边界。
+
+#### 5.9.1 职责边界与触发/调度模型
+
+- 本地引擎负责五件事：① 消费工作区文件监听事件；② 把本地 `.md` 文本暂存进
+  `SyncSession`；③ 按调用方策略调用 `sync_once(&mut dyn SyncTransport)`；④ 把远端
+  变更写回本地 `.md`（含删除）；⑤ 把名册帧、墓碑元数据、游标、会话 ID 与会话进度
+  持久化到工作区隐藏目录。
+- **不引入后台线程 / async runtime**：`SyncTransport` 与 `SyncSession` 已是同步
+  `&mut self` 接口（D24/D99），引擎所有方法均同步阻塞。事件到达时**只标脏**
+  （`BTreeSet<DocId>`），去重/合并窗口由纯函数 `merge_watch_events` 完成；
+  真正的读文件、`stage_text`、网络同步统一由 `sync_once` 驱动。可选周期同步
+  由上层 S5 的调度器调用 `sync_once`，本 crate 不自行起定时器。
+- `handle_watch_events(&[WatchEvent])` 只过滤 + 合并 + 标脏，**不读文件**；
+  `drain_dirty()`/`sync_once()` 才读盘并把内容暂存进会话。这样同一文件在窗口内的
+  N 次写入只会产生一次 CRDT 更新与一个出站批次。
+- 重命名按 D95 “删旧建新”处理：`Renamed{from,to}` 同时标脏旧路径（删除 →
+  `stage_delete` 墓碑 `rename-source` 语义）与新路径（新建 → `stage_text`），
+  不隐式保留文档身份。
+
+#### 5.9.2 本地文件 ⇄ 名册帧映射
+
+- `DocId` 沿用 D95：工作区**相对路径**（`/` 分隔、UTF-8），中文路径合法。
+  `doc_id_from_path(root, absolute)` 先 `strip_prefix(root)` 拒绝越界，再按 `/`
+  规范化为 `DocPath`；非 UTF-8、`..` 逃逸、绝对路径一律拒绝。
+- `is_syncable_md(path)` 只接受 `.md`/`.markdown`（不区分大小写）且**任一路径段
+  都不以 `.` 开头**；因此 `.mazha/`、`.obsidian/`、`.hidden.md` 等内部/隐藏文件
+  全部忽略。该函数是纯函数，路径合法性由 `DocPath` 校验（D24）。
+- 本地 → CRDT：读到的 UTF-8 文本经 `local_text_to_frames(doc_id, base, text)` 生成
+  标准 Yjs v1 全量帧；`base` 是名册中**现有 `CrdtDoc` 的 fork**，在其上整段
+  `replace` 后再 `encode_update`，因此保留原 CRDT client id、不会把整篇文本当作
+  新文档合并。文档已存在且文本与磁盘一致时不 stage（避免无意义批次）；文档已
+  墓碑化时 `base` 取不到、生成自包含全量帧，并携带 `Upsert` 经 `stage_local_change`
+  入队（等价于 `stage_text`，高 `op_id` 才复活）。
+- CRDT → 本地：`remote_frames_to_local_writes(before, after, before_tombstones)` 比较
+  `sync_once` 前后的名册文本，产出 `Write{doc_id,bytes}` / `Remove{doc_id}`：
+  新增或文本变化 → 写回；新出现的墓碑 → 删本地文件。写回直接把 `CrdtDoc::text()`
+  的 UTF-8 字节交给 `StorageProvider::write`（文本即源真相，等价于
+  `mazha-core::to_md`/`serialize_source` 的逐字节身份语义），**CJK 与
+  `\r\n`（CRLF）原样保留**，不引入 Markdown 重排或 BOM。
+- 删除按 `stage_delete` 走墓碑；远端墓碑到达后本地文件被删除且不再复活；
+  被墓碑取代的离线编辑帧由 `apply_updates_with_meta` 留在 `conflict_frames`，
+  引擎在 `status().conflict_docs` 暴露这些 `DocId`，不静默丢数据（D95）。
+
+#### 5.9.3 回声抑制与去抖
+
+- 引擎维护 `write_marks: BTreeMap<DocId, Option<Vec<u8>>>`：`Some(bytes)` 表示
+  “刚写过这些字节”，`None` 表示“刚删除该文件”。纯函数
+  `should_ignore_echo(path, observed, marks)` 做字节比对：磁盘字节与标记相同
+  （或都缺失）才判为回声；命中后**消费标记**，避免后续真实编辑被永久忽略。
+  非回声观察（含删除标记不匹配）必须由引擎清除该文档的旧标记，否则用户把文件
+  改回旧字节时会被误判为回声而漏推；纯函数只判定，清理在 `drain_dirty` 完成。
+- 即使用户在远端写回后立刻把文件改回同名同内容，`drain_dirty` 还会再次比对
+  磁盘文本与名册文本，相同则不 stage，形成第二层保护。
+- 合并窗口默认 150ms（与 store 的 `COALESCE_WINDOW` 对齐），可由 `load` 的参数
+  覆盖；只影响“事件 → 脏集合”的标脏阶段，不影响同步协议的游标与批次语义。
+
+#### 5.9.4 本地持久化与坏文件处理
+
+- 状态文件固定为工作区内 `.mazha/sync-state.bin`，通过 `StorageProvider` 以
+  `DocPath` 读写（D24），不另造 IO 抽象。写入顺序：`write(.mazha/sync-state.tmp)`
+  → `rename(tmp, sync-state.bin)`，与 D100 服务端 `FileSyncStore` 同思路的
+  **temp+rename 原子替换**；失败时清理临时文件，成功后不留临时文件。
+- 磁盘格式为版本化字节：`magic(b"MZLS") | version(u32 LE=1) | last_cursor(u64 LE)
+  | op_clock(u64 LE) | batch_counter(u64 LE) | session_id(u8 标志 + UTF-8)
+  | frames（wire `put_frame_map`）| meta（wire `put_meta`）
+  | outbox（数量 + `BatchId`/frames/`MetaChange`，复用 wire 助手）
+  | crc32(u32 LE)`。与线上 `MZS0` 帧 magic 区分，复用 `mazha-sync::wire` 的
+  小端/长度前缀/CRC32 助手，不新增依赖。
+- `LocalSyncState` = `{frames, meta, last_cursor, session_id, op_clock,
+  batch_counter, outbox}`。除名册与墓碑外，**必须**持久化 `op_clock` /
+  `batch_counter` / 未确认 outbox：否则进程重启后批次号从 0 重来会被服务端按
+  `(workspace, device, batch)` 去重而吞掉新编辑，逻辑时钟回退也会破坏 D98 全序。
+- 落盘时机：`drain_dirty` 暂存成功即写盘，`sync_once` 的传输失败/快照确认失败
+  路径同样写盘；因此断线或进程崩溃后 outbox、逻辑时钟与批次号仍可恢复（G2），
+  离线编辑不会只留在内存中丢失。
+- 为支持上述恢复，`mazha-sync` 增加**非破坏性** additive API：
+  `PendingBatch::new/into_parts`、`SyncSession::checkpoint() ->
+  SessionCheckpoint`、`SyncSession::restore_checkpoint(SessionCheckpoint)`。
+  D99 的消息、游标、去重、快照确认门槛与 stage 行为语义均不变；恢复后
+  `needs_handshake = true`（下次 `sync_once` 重新握手），会话 ID 仅保留作诊断。
+- 坏文件（magic/版本/CRC/长度/UTF-8/帧非法）**拒绝加载并返回错误**
+  `LocalSyncError::CorruptState`，不 panic、不回退为空状态以免静默丢数据；
+  调用方可据此提示用户修复/删除状态文件后重建。首次启动状态文件不存在时
+  返回空状态并扫描工作区 Markdown 建初始名册（不自动 stage 删除）。
+
+#### 5.9.5 冲突与保护边界
+
+- `SyncSession::apply_snapshot` 在 outbox 非空时返回
+  `SnapshotNeedsConfirmation`，本地引擎捕获后设置
+  `status().needs_confirmation = true`、保留全部本地改动与 outbox、写盘后
+  把错误原样返回给调用方；**绝不静默覆盖**本地文件/名册。S5 UI 据此显示
+  “需用户确认”的合并/覆盖选择。
+- 远端删除 vs 本地未同步编辑：墓碑 wins，但被取代帧进入 `conflict_frames`
+  并在 `status().conflict_docs` 可见；本地不被静默覆盖为“文件消失且无记录”。
+- `platforms/*` 本阶段零改动；桌面状态栏/横幅与调度留 S5。文档整体重建的
+  undo/选区代价（S-08）仍按 D97 MVP 接受，S4 不触碰 `mazha-core`。
+
+---
+
 ## 6. 传输层抽象
 
 ### 6.1 目标
@@ -696,6 +803,29 @@ mazha-crdt ┘      ▲
 - 新依赖（`tiny_http` / `ureq` 及其传递依赖）只进入根 `Cargo.lock`，不污染桌面锁文件；
   同步风格沿用 D24，不引入 async runtime（与 `SyncTransport` 的四方法 `&mut self` 同步签名一致）。
 
+### 9.5 S4 本地编排 crate 边界（已定，D101 / 0.1.124）
+
+```text
+mazha-store (StorageProvider / WatchEvent)
+        ├─▶ mazha-sync-local (mapping / state / engine；同步阻塞、无 IO 抽象新增)
+        │        ├─▶ mazha-sync (SyncSession / SyncTransport trait / wire 助手 / checkpoint)
+        │        └─▶ mazha-crdt (CrdtDoc / CrdtRoster / RosterMeta)
+        └─▶ mazha-core（既有桌面路径，S4 零改动）
+
+调用方注入 &mut dyn SyncTransport ─▶ mazha-sync-http (ureq) 或 FakeTransport
+                                      └─▶ mazha-sync-server / InMemorySyncServer
+```
+
+- `mazha-sync-local` **不依赖** `mazha-core`：本阶段只做“文件字节 ⇄ Yjs 文本”
+  的编排，不需要 `Document`/`Workspace` 的块结构能力，因此没有 `core → sync-local →
+  core` 的环；`mazha-core` 与 `platforms/*` 均零改动。
+- 核心 crate（`mazha-crdt` / `mazha-core` / `mazha-store` / `mazha-sync` /
+  `mazha-sync-local`）均不含网络、GUI、async runtime；`mazha-sync-local` 只在
+  方法参数中持有 `&mut dyn SyncTransport`  trait object，不依赖 `ureq`/`tiny_http`。
+- 反向依赖只允许向上：HTTP/server 依赖 `mazha-sync`；本地编排依赖 store/sync/crdt，
+  不被 server/http 依赖。新增依赖仅 `thiserror`（与既有 crate 一致）及测试用
+  `tempfile`；只进根 `Cargo.lock`，桌面独立锁不动。
+
 ---
 
 ## 10. 迁移与兼容策略
@@ -732,7 +862,7 @@ mazha-crdt ┘      ▲
 | `mazha-core` 单测 | 本地编辑→CRDT→远端应用→Document 投影一致；冲突场景不丢数据 | 覆盖 CJK、删除、重命名、离线重放。 |
 | 传输契约测试 | 使用假 transport/in-memory server 验证握手、拉取、推送、重试 | 不依赖真实网络。 |
 | 集成测试 | 两设备+一服务端（本地进程）最终一致性 | 包含离线、断线重连、墓碑传播。 |
-| 桌面手测 | 同步状态提示、冲突横幅、删除/重命名体验 | 仅在 UI 接入阶段要求。 |
+| 桌面手测 | 同步状态提示、冲突横幅、删除/重命名体验 | 仅在 UI 接入阶段要求（S5）。 |
 
 ### 11.2 MVP 验收标准
 
@@ -742,6 +872,26 @@ mazha-crdt ┘      ▲
 - 重复投递同一批次更新不会产生重复内容或错误状态。
 - 坏帧/非法墓碑不会部分污染本地名册。
 - 新设备通过快照引导可加入现有工作区。
+
+### 11.3 S4 验收标准与测试分层（已定，D101）
+
+- **纯函数**：`doc_id_from_path` 覆盖中文路径、`../` 越界、非 UTF-8、非 Markdown；
+  `is_syncable_md` 覆盖 `.markdown`/大小写/隐藏目录；`local_text_to_frames` 经
+  空文档/中文/CRLF/长文本往返；`remote_frames_to_local_writes` 只输出变化的
+  写入与新墓碑删除；`should_ignore_echo` 验证相同字节抑制、改动放行、删除标记；
+  `merge_watch_events` 验证同路径去重与 rename 旧删新建。
+- **本地状态存储**：save → drop → load 后 frames/meta/游标/会话 ID/时钟/批次计数/
+  outbox 全部保持；版本/magic/CRC 损坏返回错误且不 panic；原子写后无 `.tmp` 残留。
+- **引擎端到端（FakeTransport + InMemorySyncServer，无真实网络/端口）**：
+  1. A 工作区中文 `.md` → watch 事件 → `sync_once` 推送 → B 工作区
+     `sync_once` 拉取 → 两端 `.md` 字节一致；
+  2. 删除文件 → 墓碑传播 → 对端本地文件删除且不复活；
+  3. 断线离线编辑 → 重连重放；注入 `CursorTooOld` + 非空 outbox 时
+     `needs_confirmation` 可见、本地改动与 outbox 不被覆盖；
+  4. drop 后从磁盘 `load`，游标/墓碑/时钟/批次号继续有效且不重复推送；
+  5. 写回标记在非回声后失效（用户改回旧字节仍产生新批次）；断线时已暂存的
+     编辑在重启后仍能重放 outbox。
+- 每个用例独立临时目录（进程 ID + 测试名），结束清理；无外部网络、无线程定时器。
 
 ---
 
@@ -756,11 +906,12 @@ mazha-crdt ┘      ▲
 | S-05 | 最小服务端形态？ | **已定（D100）**：`mazha-sync-server`，带持久化的同步中继（temp+rename 落盘、批次去重、服务端 CRDT 校验），不做 Markdown 语义合并。 | 高（已决） |
 | S-06 | 传输 MVP 选型？ | **已定（D100）**：同步 HTTP（ureq client + tiny_http server），请求-响应优先，WebSocket 订阅后置。 | 中（已决） |
 | S-07 | `mazha-sync` 是否独立 crate？ | **已定（D99）**：独立 crate，协议/会话/transport trait/假服务端都在此；核心 crate 保持纯净，无网络/GUI/async。 | 高（已决） |
-| S-08 | `apply_remote` 整体重建导致 undo/选区丢失如何处理？ | MVP 可接受但需明示；后续做增量 patch 到 `Document`。 | 中 |
+| S-08 | `apply_remote` 整体重建导致 undo/选区丢失如何处理？ | **S4 明确不触碰 `mazha-core`/桌面**：引擎只写本地 `.md` 文本，不动已打开 `Document`；D97 的 MVP 重建代价仍成立，增量 patch 与 UI 提示留 S5。 | 中 |
 | S-09 | 认证模型？ | **已定（D100）**：MVP 先设备 token + 工作区授权（`Authorization: Bearer`，工作区隔离），团队/组织权限后置。 | 高（已决） |
 | S-10 | 是否需要 E2EE？ | MVP 不承诺；协议预留密文载荷字段。 | 中 |
 | S-11 | 快照与增量日志的本地存储格式？ | **已定（D100）**：先复用 wire 小端/长度前缀助手做单文件 hex 持久化（temp+rename），后续引入 append-only log + compaction。 | 中（已决） |
-| S-12 | 结构性并发（表格/块）冲突提示？ | 继续沿用 §6.5 `[待确认]`；先记录冲突事件，不自动重写语义结构。 | 低（S3 未触碰） |
+| S-12 | 结构性并发（表格/块）冲突提示？ | 继续沿用 §6.5 `[待确认]`；先记录冲突事件，不自动重写语义结构。S4 只在 `status().conflict_docs` 暴露墓碑冲突副本所在的 `DocId`。 | 低（S4 仅暴露 DocId） |
+| S-13 | 桌面何时接入本地引擎与冲突 UI？ | **S5**：S4 只交付纯 Rust crate 与测试，`platforms/*` 零改动；S5 注入 `HttpTransport` 与周期调度，并把 `needs_confirmation`/`conflict_docs` 显示为状态栏/横幅。 | 中（已排期） |
 
 建议 ADR 拆分：
 
@@ -804,14 +955,19 @@ mazha-crdt ┘      ▲
 - 测试覆盖 wire 编解码、store 重启/去重/裁剪、service 鉴权/隔离/墓碑不复活、
   HTTP 状态码纯映射、本地真实 HTTP 集成与 CJK 全链路；新依赖只进根 `Cargo.lock`。
 
-### Phase S4：桌面/核心集成
+### Phase S4：本地工作区同步编排（D101，0.1.124 已落地）
 
-- `mazha-core` 编排本地文件、CRDT、远端变更。
-- 桌面状态栏/横幅显示同步状态与冲突。
+- 新 crate `mazha-sync-local`：`mapping.rs` 纯函数（路径/DocId、文本⇄帧、回声、事件合并）、
+  `state.rs`（版本化字节 + temp/rename 原子写 + 坏文件拒绝）与 `engine.rs`
+  （标脏 → stage → `sync_once` → 写回 → 落盘 + 状态暴露）。
+- `mazha-sync` 只做 additive checkpoint API（`PendingBatch::new/into_parts`、
+  `SessionCheckpoint`、`checkpoint`/`restore_checkpoint`），D99 语义零改动。
+- 测试见 §11.3；`platforms/*` 与 `mazha-core` 零改动，桌面 UI 留 S5。
 
-### Phase S5：体验优化
+### Phase S5：桌面接入与体验优化
 
-- 增量应用减少 Document 重建。
+- 桌面状态栏/横幅显示 `needs_confirmation` / `conflict_docs`，接入周期调度与
+  `HttpTransport`；增量应用减少 Document 重建（S-08）。
 - WebSocket 推送、快照压缩、墓碑 GC。
 
 ---
@@ -838,3 +994,6 @@ mazha-crdt ┘      ▲
 - `SPEC.md` §10 Phase 5：细化为 S0-S5 子阶段。
 - `SPEC.md` §14：新增 D95（DocId/墓碑策略）、D96（最小服务端/传输）、D97（本地集成策略）等决策。
 - `SPEC.md` §15：记录草案创建与后续实现版本。
+- **S4 回填（0.1.124）**：本文 §5.9（本地编排契约）/§9.5（crate 边界）/§11.3（验收）、
+  §12 S-08/S-13；`SPEC.md` §5 增 `mazha-sync-local` 行与依赖图、§6.5 增 S4 段、
+  §14 新增 D101；`HANDOFF.md` 同步版本/状态/测试数/下一步 S5。

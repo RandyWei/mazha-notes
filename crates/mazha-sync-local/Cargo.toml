@@ -1,0 +1,20 @@
+[package]
+name = "mazha-sync-local"
+description = "码札本地同步编排：文件监听标脏、会话统一同步、状态持久化与回声抑制"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mazha-crdt = { path = "../mazha-crdt" }
+mazha-store = { path = "../mazha-store" }
+mazha-sync = { path = "../mazha-sync" }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1516,6 +1516,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mazha-sync-local"
+version = "0.1.0"
+dependencies = [
+ "mazha-crdt",
+ "mazha-store",
+ "mazha-sync",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mazha-sync-server"
 version = "0.1.0"
 dependencies = [

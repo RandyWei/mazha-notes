@@ -5,6 +5,7 @@ members = [
     "crates/mazha-md",
     "crates/mazha-crdt",
     "crates/mazha-sync",
+    "crates/mazha-sync-local",
     "crates/mazha-sync-http",
     "crates/mazha-sync-server",
     "crates/mazha-store",
