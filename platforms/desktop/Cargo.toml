@@ -13,8 +13,14 @@ description = "码札桌面端（GPUI + gpui-kit，见 SPEC §7.1）"
 mazha-core = { path = "../../crates/mazha-core" }
 # 行内解析：光标在链接内时展开原文、Cmd+点击取链接目标（见 `inline_links`）
 mazha-md = { path = "../../crates/mazha-md" }
-# 存储抽象（Workspace/FileSystemProvider/DocPath）
+# 存储抽象（Workspace/FileSystemProvider/DocPath/WatchEvent）
 mazha-store = { path = "../../crates/mazha-store" }
+# Phase 5 S5a：本地同步编排引擎（纯 Rust 同步阻塞，只在专用同步线程调用）
+mazha-sync-local = { path = "../../crates/mazha-sync-local" }
+# Phase 5 S5a：真实同步 HTTP 传输（ureq 同步请求-响应，token 仅来自环境变量）
+mazha-sync-http = { path = "../../crates/mazha-sync-http" }
+# Phase 5 S5a：WorkspaceId / DeviceId 身份校验（空 ID 回退也走这里）
+mazha-sync = { path = "../../crates/mazha-sync" }
 # PDF 导出
 mazha-export = { path = "../../crates/mazha-export" }
 # 文件对话框

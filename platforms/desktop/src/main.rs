@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::time::Duration;
 
@@ -65,11 +66,19 @@ use mazha_md::{FootnoteIndex, MediaElement, MediaKind, SpanKind, SpanRole, parse
 use mazha_store::{
     DocPath, Entry, EntryKind, FileSystemProvider, StorageProvider, WatchEvent, WatchHandle,
 };
+use mazha_sync_local::LocalSyncStatus;
 mod media;
 mod oblique;
 mod settings;
+mod sync;
 
 use settings::{FONT_STEP, Settings, ThemePreference, clamp_font_size, clamp_mono_font_size};
+// D102：同步线程层与纯函数层；UI 只发命令/收状态，不直接调用 LocalSyncEngine。
+use sync::{
+    SYNC_TOKEN_ENV, SyncBanner, SyncBannerAction, SyncHandle, SyncPhase, SyncReply, SyncSetupError,
+    doc_id_for_path, forwardable_watch_event, open_provider, resolve_config, spawn_sync,
+    sync_banner, sync_status_is_alert, sync_status_text, token_from_env,
+};
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
 const SAMPLE: &str = "\
@@ -2592,6 +2601,8 @@ enum PaletteAction {
     ToggleTypewriterMode,
     ToggleSourceMode,
     MoveCurrentFile,
+    /// D102：立即同步（只发 `SyncNow`，不自动丢弃 outbox/本地文件）。
+    SyncNow,
     SetTheme(ThemePreference),
     CycleUiFont,
     CycleMonoFont,
@@ -2731,6 +2742,32 @@ fn export_failure_text(format: ExportFormat, reason: &str) -> String {
 /// 纯函数：定时清理是否仍然匹配当前状态（仅当前序号才允许清空）。
 fn export_status_should_clear(status: Option<&ExportStatus>, seq: u64) -> bool {
     status.is_some_and(|status| status.seq == seq)
+}
+
+/// 默认状态栏快捷键提示（无导出/无同步时用）。
+const DEFAULT_STATUS_HINT: &str =
+    "Cmd+O 打开 · Cmd+S 保存 · Cmd+F 查找替换 · Cmd+Shift+F 全工作区搜索";
+
+/// 纯函数：D83 导出状态与 D102 同步状态共用状态栏右侧提示位。
+///
+/// 取舍：不做两行或抢占式显示，而是按固定顺序用 ` · ` 拼接——两者互不覆盖且
+/// 信息密度可控；任一方是失败/需确认/冲突时返回 `alert = true`，用强调色显示。
+fn status_bar_hint(
+    export: Option<&ExportStatus>,
+    sync_phase: &SyncPhase,
+    sync_status: Option<&LocalSyncStatus>,
+) -> (String, bool) {
+    let mut parts = Vec::new();
+    let mut alert = false;
+    if let Some(status) = export {
+        parts.push(status.text.clone());
+        alert |= status.kind == ExportStatusKind::Failure;
+    } else {
+        parts.push(DEFAULT_STATUS_HINT.to_owned());
+    }
+    parts.push(sync_status_text(sync_phase, sync_status));
+    alert |= sync_status_is_alert(sync_phase, sync_status);
+    (parts.join(" · "), alert)
 }
 
 /// 把 Markdown 渲染为所选格式的字节（D82；不含对话框/文件系统写入）。
@@ -3009,6 +3046,7 @@ fn app_menus(settings: &Settings) -> Vec<Menu> {
             menu_item("关闭全部标签页", Palette(CloseAllTabs)),
             MenuItem::separator(),
             menu_item("移动当前文件…", Palette(MoveCurrentFile)),
+            menu_item("立即同步", Palette(SyncNow)),
         ]),
         Menu::new("编辑").items([
             menu_item("撤销", MenuCommand::Undo),
@@ -3285,6 +3323,20 @@ struct DocView {
     export_status_seq: u64,
     /// 导出完成后的自动清理定时任务（替换即取消上一个）。
     _export_status_task: Task<()>,
+    /// D102：专用同步线程句柄；drop 即 `Shutdown` 并在独立线程 join。
+    sync_handle: Option<SyncHandle>,
+    /// 同步线程回传状态的收端（与轮询任务共享）。
+    sync_rx: Option<Arc<Mutex<mpsc::Receiver<SyncReply>>>>,
+    /// 旧轮询任务的停止标志：工作区根变化时让旧任务退出，避免旧状态串到新引擎。
+    sync_poll_stop: Option<Arc<AtomicBool>>,
+    /// 同步状态轮询任务（替换即取消上一个）。
+    sync_reply_task: Task<()>,
+    /// 同步阶段（未配置/空闲/同步中/成功/失败）。
+    sync_phase: SyncPhase,
+    /// 最近一次引擎状态快照（脏文档/需确认/冲突/游标）。
+    sync_status: Option<LocalSyncStatus>,
+    /// 当前同步线程绑定的工作区根（canonicalize 后）。
+    sync_root: Option<PathBuf>,
 }
 
 impl DocView {
@@ -3435,6 +3487,15 @@ impl DocView {
             export_status: None,
             export_status_seq: 0,
             _export_status_task: Task::ready(()),
+            sync_handle: None,
+            sync_rx: None,
+            sync_poll_stop: None,
+            sync_reply_task: Task::ready(()),
+            sync_phase: SyncPhase::NotConfigured {
+                reason: SyncSetupError::NotConfigured.message(),
+            },
+            sync_status: None,
+            sync_root: None,
         }
     }
 
@@ -5511,6 +5572,7 @@ impl DocView {
                 ToggleSourceMode,
             ),
             mk("移动当前文件…", "", MoveCurrentFile),
+            mk("立即同步", "", SyncNow),
             mk(
                 "主题：跟随系统",
                 theme_hint(ThemePreference::System),
@@ -5621,6 +5683,7 @@ impl DocView {
             ToggleTypewriterMode => self.toggle_typewriter_mode(cx),
             ToggleSourceMode => self.toggle_source_mode(cx),
             MoveCurrentFile => self.move_current_file_dialog(window, cx),
+            SyncNow => self.request_sync_now(cx),
             SetTheme(preference) => self.set_theme_preference(preference, window, cx),
             CycleUiFont => self.cycle_ui_font(cx),
             CycleMonoFont => self.cycle_mono_font(cx),
@@ -6334,6 +6397,8 @@ impl DocView {
         if root == self.watch_root {
             return;
         }
+        // D102：根变化时先重建同步引擎（停旧线程），与 D92 watcher 生命周期保持一致。
+        self.restart_sync(root.as_deref(), cx);
         // 先停旧根：标志让后台线程从轮询中退出，再 drop 共享句柄（D91 drop 即停）。
         if let Some(stop) = self.watch_stop.take() {
             stop.store(true, Ordering::SeqCst);
@@ -6390,13 +6455,13 @@ impl DocView {
                     let Ok(rx) = rx.lock() else { break };
                     std::iter::from_fn(|| rx.try_recv().ok()).take(16).collect()
                 };
-                for event in batch {
-                    if this
-                        .update(cx, |view, cx| view.apply_watch_event(event, cx))
-                        .is_err()
-                    {
-                        return;
-                    }
+                // D102：同一批事件既走 D92 的 reload/横幅判定，也转发给同步线程只标脏；
+                // 两个消费者互不干扰，不另开 watcher。
+                if this
+                    .update(cx, |view, cx| view.apply_watch_batch(batch, cx))
+                    .is_err()
+                {
+                    return;
                 }
                 cx.background_executor()
                     .timer(Duration::from_millis(20))
@@ -6404,6 +6469,159 @@ impl DocView {
             }
         })
         .detach();
+    }
+
+    /// D102：工作区根变化时重建同步线程；无配置/无 token 时只显示“未配置”，不启线程。
+    ///
+    /// 引擎与 `HttpTransport` 都在同步线程里创建，主线程只做配置解析与状态展示。
+    fn restart_sync(&mut self, root: Option<&Path>, cx: &mut Context<Self>) {
+        // 旧轮询任务先置停止标志，旧线程随 `sync_handle = None` 收到 Shutdown。
+        if let Some(stop) = self.sync_poll_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        self.sync_reply_task = Task::ready(());
+        self.sync_handle = None;
+        self.sync_rx = None;
+        self.sync_root = None;
+        self.sync_status = None;
+        let Some(root) = root else {
+            self.sync_phase = SyncPhase::NotConfigured {
+                reason: "未打开工作区".to_owned(),
+            };
+            cx.notify();
+            return;
+        };
+        let provider = match open_provider(root) {
+            Ok(provider) => provider,
+            Err(reason) => {
+                self.sync_phase = SyncPhase::NotConfigured {
+                    reason: SyncSetupError::Provider(reason).message(),
+                };
+                cx.notify();
+                return;
+            }
+        };
+        let token = token_from_env();
+        let config = match resolve_config(&self.settings, root, token.as_deref()) {
+            Ok(config) => config,
+            Err(error) => {
+                self.sync_phase = SyncPhase::NotConfigured {
+                    reason: error.message(),
+                };
+                cx.notify();
+                return;
+            }
+        };
+        // hostname 回退的设备 ID 写回 settings.json，重启后身份保持稳定（D102）。
+        if let Some(device_id) = config.generated_device_id.clone() {
+            self.settings.sync_device_id = Some(device_id);
+            // 写盘失败不阻断同步：本轮仍用内存中的 ID，下轮启动会再次尝试持久化。
+            let _ = self.settings.save();
+        }
+        let (reply_tx, reply_rx) = mpsc::channel::<SyncReply>();
+        let handle = spawn_sync(config, provider, reply_tx);
+        self.sync_handle = Some(handle);
+        self.sync_rx = Some(Arc::new(Mutex::new(reply_rx)));
+        self.sync_root = Some(root.to_path_buf());
+        self.sync_phase = SyncPhase::Idle { last_cursor: 0 };
+        self.poll_sync_replies(cx);
+        cx.notify();
+    }
+
+    /// 从同步线程收状态：短间隔轮询 + `WeakView::update` 回写，绝不跨线程改 GPUI 状态。
+    fn poll_sync_replies(&mut self, cx: &mut Context<Self>) {
+        let Some(rx) = self.sync_rx.clone() else {
+            return;
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        self.sync_poll_stop = Some(Arc::clone(&stop));
+        self.sync_reply_task = Task::ready(());
+        self.sync_reply_task = cx.spawn(async move |this, cx| {
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let batch: Vec<SyncReply> = {
+                    let Ok(rx) = rx.lock() else { break };
+                    std::iter::from_fn(|| rx.try_recv().ok()).take(16).collect()
+                };
+                if batch.is_empty() {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    continue;
+                }
+                if this
+                    .update(cx, |view, cx| view.apply_sync_replies(batch, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// 应用同步线程回传的阶段/状态；`SetupFailed` 视为未配置并释放线程句柄。
+    fn apply_sync_replies(&mut self, replies: Vec<SyncReply>, cx: &mut Context<Self>) {
+        for reply in replies {
+            match reply {
+                SyncReply::Phase(phase) => self.sync_phase = phase,
+                SyncReply::Status(status) => self.sync_status = Some(status),
+                SyncReply::SetupFailed(reason) => {
+                    self.sync_phase = SyncPhase::Failed { reason };
+                    self.sync_handle = None;
+                    self.sync_rx = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// “立即同步”入口：只发一条命令，不直接读写 outbox，也不清冲突横幅。
+    fn request_sync_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.sync_handle.as_ref() {
+            handle.sync_now();
+        } else {
+            // 未配置时命令面板仍可用：保留已有原因（如地址非法/token 缺失），
+            // 避免把 restart_sync 的精确提示覆盖成一个孤零零的环境变量名。
+            let reason = match &self.sync_phase {
+                SyncPhase::NotConfigured { reason } | SyncPhase::Failed { reason } => {
+                    reason.clone()
+                }
+                _ => format!("同步未启动（检查 sync_server_url 与 {SYNC_TOKEN_ENV}）"),
+            };
+            self.sync_phase = SyncPhase::NotConfigured { reason };
+        }
+        cx.notify();
+    }
+
+    /// D92 watcher 的同一批事件转发给同步线程：先过滤，再由引擎只标脏。
+    fn forward_watch_events_to_sync(&self, events: &[WatchEvent]) {
+        let Some(handle) = self.sync_handle.as_ref() else {
+            return;
+        };
+        // 路径边界由 D91 事件与引擎的 `doc_id_from_path` 共同保证，这里只做格式过滤。
+        let filtered: Vec<WatchEvent> = events
+            .iter()
+            .filter(|event| forwardable_watch_event(event))
+            .cloned()
+            .collect();
+        handle.forward_events(filtered);
+    }
+
+    /// 一批 watch 事件的两个消费者：D92 语义保持原样，S5a 只追加同步标脏。
+    fn apply_watch_batch(&mut self, events: Vec<WatchEvent>, cx: &mut Context<Self>) {
+        self.forward_watch_events_to_sync(&events);
+        for event in events {
+            self.apply_watch_event(event, cx);
+        }
+    }
+
+    /// 当前文档的同步 `DocId`（工作区相对路径），供冲突横幅标注“当前文档”。
+    fn sync_current_doc_id(&self) -> Option<String> {
+        let root = self.sync_root.as_deref()?;
+        let path = canonicalize_watch_path(self.path.as_deref()?);
+        doc_id_for_path(root, &path)
     }
 
     /// 把 D91 的工作区相对事件路径解析为规范化绝对路径，供纯函数按同一套规则比对。
@@ -6687,14 +6905,23 @@ impl DocView {
 
 /// 视图释放时停掉 D91 监听：置停止标志让后台线程与前台轮询任务尽快退出，
 /// `watch_handle` 字段随视图一起 drop（D91 的 `WatchHandle` drop 即注销监听）。
-/// 用 `Drop` 而非 `on_release` 回调，保证任何释放路径（关窗、切根）都不遗留 OS 监听器。
+/// D102 同步线程同样随 `sync_handle = None` 收到 `Shutdown`（在独立线程 join），
+/// 轮询任务由停止标志退出。用 `Drop` 而非 `on_release` 回调，保证任何释放路径
+/// （关窗、切根）都不遗留 OS 监听器或同步线程。
 impl Drop for DocView {
     fn drop(&mut self) {
         if let Some(stop) = self.watch_stop.take() {
             stop.store(true, Ordering::SeqCst);
         }
+        if let Some(stop) = self.sync_poll_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        self.sync_reply_task = Task::ready(());
         self.watch_handle = None;
         self.watch_root = None;
+        self.sync_handle = None;
+        self.sync_rx = None;
+        self.sync_root = None;
     }
 }
 
@@ -7533,21 +7760,68 @@ impl Render for DocView {
                 }
                 row.into_any_element()
             });
-        // D83：导出进行中/完成/失败时，状态栏右侧让出快捷键提示位展示反馈；
-        // 失败用强调色突出，其余状态用链接色，6s 后自动回到默认提示。
-        let (export_hint, export_hint_color) = match &self.export_status {
-            Some(status) => (
-                status.text.clone(),
-                if status.kind == ExportStatusKind::Failure {
-                    palette.accent
-                } else {
-                    palette.link
-                },
-            ),
-            None => (
-                "Cmd+O 打开 · Cmd+S 保存 · Cmd+F 查找替换 · Cmd+Shift+F 全工作区搜索".to_string(),
-                palette.muted,
-            ),
+        // D102：同步横幅复用 D92 的非模态样式与生命周期：由引擎状态推导，
+        // 冲突只列 DocId 并说明“未静默删除”，快照需确认只给“重试同步”，无“覆盖”。
+        let sync_banner_data = self
+            .sync_status
+            .as_ref()
+            .and_then(|status| sync_banner(status, self.sync_current_doc_id().as_deref()));
+        let sync_banner_el: Option<gpui::AnyElement> =
+            sync_banner_data.map(|banner: SyncBanner| {
+                let mut row = h_flex()
+                    .id("sync-conflict-banner")
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(palette.accent)
+                    .bg(palette.subtle)
+                    .text_sm()
+                    .child(div().flex_none().text_color(palette.accent).child("⚠"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(format!("{}：{}", banner.title, banner.detail)),
+                    );
+                if banner.action == Some(SyncBannerAction::Retry) {
+                    row = row.child(
+                        div()
+                            .id("sync-retry")
+                            .flex_none()
+                            .cursor_pointer()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(3.))
+                            .bg(palette.code_bg)
+                            .on_click(cx.listener(|view, _ev, _window, cx| {
+                                view.request_sync_now(cx);
+                            }))
+                            .child("重试同步"),
+                    );
+                }
+                row.into_any_element()
+            });
+        // D83 + D102：导出与同步提示在同一提示位拼接，互不覆盖；异常用强调色。
+        let (status_hint, status_hint_alert) = status_bar_hint(
+            self.export_status.as_ref(),
+            &self.sync_phase,
+            self.sync_status.as_ref(),
+        );
+        let status_hint_color = if status_hint_alert {
+            palette.accent
+        } else if self.export_status.is_some()
+            || matches!(
+                self.sync_phase,
+                SyncPhase::Running | SyncPhase::Success { .. }
+            )
+        {
+            palette.link
+        } else {
+            palette.muted
         };
         // 底部状态栏：文件信息 + 行数/光标 + 导出状态（或快捷键），横跨整个窗口。
         let status_bar = h_flex()
@@ -7600,8 +7874,8 @@ impl Render for DocView {
                     .flex_none()
                     .min_w(px(0.))
                     .truncate()
-                    .text_color(export_hint_color)
-                    .child(export_hint),
+                    .text_color(status_hint_color)
+                    .child(status_hint),
             );
         div()
             .id("app")
@@ -7694,6 +7968,8 @@ impl Render for DocView {
                             .child(tabbar_el)
                             // D92：外部变更横幅紧随标签栏，不随正文滚动（非模态）。
                             .children(external_banner)
+                            // D102：同步冲突/需确认横幅并列展示，同样不随正文滚动。
+                            .children(sync_banner_el)
                             .key_context("mazha-doc")
                             .on_action(cx.listener(|view, _: &InsertTab, _window, cx| {
                                 view.handle_tab_action(false, cx);
@@ -11800,9 +12076,10 @@ fn main() {
 mod tests {
     // 只引入被测项：`use super::*` 会把 gpui 的 `test` 宏带进来，导致 `#[test]` 递归展开
     use super::{
-        BASE, BlockStyle, CHART_VERTICAL_PAD, CODE_RIGHT_INSET, CODE_TEXT_INSET, DisplayPos,
-        Document, ExportFormat, ExportStatus, ExportStatusKind, FootnoteOrigin, MATH_VERTICAL_PAD,
-        QUOTE_BAND_INSET, QUOTE_TEXT_RIGHT_INSET, RunStyle, SAMPLE, Settings, app_menus,
+        BASE, BlockStyle, CHART_VERTICAL_PAD, CODE_RIGHT_INSET, CODE_TEXT_INSET,
+        DEFAULT_STATUS_HINT, DisplayPos, Document, ExportFormat, ExportStatus, ExportStatusKind,
+        FootnoteOrigin, LocalSyncStatus, MATH_VERTICAL_PAD, QUOTE_BAND_INSET,
+        QUOTE_TEXT_RIGHT_INSET, RunStyle, SAMPLE, Settings, SyncPhase, app_menus,
         block_line_px_with_mono, char_col_to_byte, chart_cache_key, chart_hit_rect,
         chart_source_body, clipboard_markdown, code_block_wrap_width, collect_inline_texes,
         collect_render_assets, copy_entry, dropped_link_markdown, export_default_file_name,
@@ -11812,8 +12089,8 @@ mod tests {
         is_markdown_file, join_math_body, markdown_image_path, math_cache_key, math_hit_rect,
         math_inline_draw_geom, nearest_cell, oblique, pdf_base_dir, plan_imports,
         quote_block_wrap_width, render_chart_preview, render_chart_svg, render_export,
-        render_export_with_assets, render_math_preview, reveal_inline, table_arrow_step,
-        table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
+        render_export_with_assets, render_math_preview, reveal_inline, status_bar_hint,
+        table_arrow_step, table_entry_snap, to_gpui_runs, typewriter_scroll_y, unique_import_path,
     };
     // D92：外部文件变更的纯函数与类型（无 GPUI 依赖，可直接单测契约）。
     use super::{
@@ -12050,6 +12327,44 @@ mod tests {
         assert!(export_status_should_clear(Some(&status), 7));
         assert!(!export_status_should_clear(Some(&status), 6));
         assert!(!export_status_should_clear(None, 7));
+    }
+
+    /// D102：导出与同步提示共用一个状态栏位，二者互不覆盖且异常态用强调色。
+    #[test]
+    fn status_bar_hint_combines_export_and_sync_without_overwrite() {
+        let sync_idle = SyncPhase::Idle { last_cursor: 4 };
+        let (text, alert) = status_bar_hint(None, &sync_idle, None);
+        assert!(text.contains(DEFAULT_STATUS_HINT), "{text}");
+        assert!(text.contains("同步空闲 · 游标 4"), "{text}");
+        assert!(!alert);
+
+        let export = ExportStatus {
+            seq: 1,
+            kind: ExportStatusKind::Progress,
+            text: export_progress_text(ExportFormat::Pdf),
+        };
+        let (text, alert) = status_bar_hint(Some(&export), &sync_idle, None);
+        assert!(text.contains("正在导出 PDF"), "{text}");
+        assert!(text.contains("同步空闲 · 游标 4"), "{text}");
+        assert!(!text.contains(DEFAULT_STATUS_HINT), "{text}");
+        assert!(!alert);
+
+        let failure = ExportStatus {
+            seq: 2,
+            kind: ExportStatusKind::Failure,
+            text: export_failure_text(ExportFormat::Html, "磁盘满"),
+        };
+        let (text, alert) = status_bar_hint(Some(&failure), &sync_idle, None);
+        assert!(text.contains("导出 HTML 失败：磁盘满"), "{text}");
+        assert!(alert);
+
+        let conflict = LocalSyncStatus {
+            conflict_docs: vec!["中文.md".into()],
+            ..LocalSyncStatus::default()
+        };
+        let (text, alert) = status_bar_hint(Some(&export), &sync_idle, Some(&conflict));
+        assert!(text.contains("冲突 1"), "{text}");
+        assert!(alert);
     }
 
     /// D84：桌面侧真实渲染公式/图表，产出可被导出桥接层消费的自包含 SVG。

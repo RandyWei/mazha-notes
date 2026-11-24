@@ -1,15 +1,15 @@
 # 码札（Mazha）同步 SPEC 草案
 
-> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）**  
+> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）；S5a 桌面接入第一批契约已定并实现（D102，见 §5.10 / §9.6 / §11.4）**  
 > 日期：2026-11-24  
-> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D101；`HANDOFF.md` 下一步 S5  
-> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录。WS 订阅与桌面 UI 接入仍待实现。
+> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D102；`HANDOFF.md` 下一步 S5b  
+> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录，S5a 桌面周期/手动同步与状态/冲突提示由 D102 与本文件 §5.10 / §9.6 / §11.4 记录。WS 订阅与体验优化（S5b）仍待实现。
 
 ---
 
 ## 0. 文档说明
 
-1. 本文是 Phase 5 同步方向的**独立设计文档**：S0/S1 为已确认的设计契约；S2（§5.7 / §6.4）与 S3（§5.8 / §7.4 / §9.4）均已在新 crate `mazha-sync` 及其上层独立 crate 中落地；S4（§5.9 / §9.5）把会话层接到本地文件监听与名册落盘（新 crate `mazha-sync-local`），仍不接桌面 UI。WS 订阅与桌面状态展示（S5）不在本文 S4 契约范围内。
+1. 本文是 Phase 5 同步方向的**独立设计文档**：S0/S1 为已确认的设计契约；S2（§5.7 / §6.4）与 S3（§5.8 / §7.4 / §9.4）均已在新 crate `mazha-sync` 及其上层独立 crate 中落地；S4（§5.9 / §9.5）把会话层接到本地文件监听与名册落盘（新 crate `mazha-sync-local`）。S5a（§5.10 / §9.6 / §11.4）只把引擎接到桌面 UI：注入 `HttpTransport`、周期/手动同步、状态栏与冲突横幅；WS 订阅、增量 Document patch 与“合并/覆盖”交互（S5b）不在 S5a 契约范围内。
 2. 任何结论在落地前需评审；确认后应：
    - 在 `SPEC.md` §6.5 增加“详见 `docs/SYNC-SPEC.md`”索引；
    - 将关键决策拆成 `docs/ADR/*` 或 `SPEC.md` §14 的 Dxx；
@@ -572,6 +572,64 @@ MetaChange =
 - `platforms/*` 本阶段零改动；桌面状态栏/横幅与调度留 S5。文档整体重建的
   undo/选区代价（S-08）仍按 D97 MVP 接受，S4 不触碰 `mazha-core`。
 
+### 5.10 S5a 桌面接入第一批契约（已定，D102 / 0.1.125）
+
+> 只改 `platforms/desktop/*` 与桌面独立 `Cargo.lock`；根 workspace 依赖与
+> `Cargo.lock` 不改。本节的“引擎”指 S4 的 `LocalSyncEngine`，其 D101 语义零改动。
+
+#### 5.10.1 线程模型与生命周期
+
+- `LocalSyncEngine` 与 `HttpTransport` **只在专用同步线程**上创建/调用；
+  GPUI 主线程只发命令、收状态。验证方式：桌面纯 Rust 单测用泛型
+  `assert_send::<LocalSyncEngine>()` 编译期断言引擎可跨线程转移
+  （`StorageProvider: Send + Sync`，会话/名册均为可 `Send` 的同步结构）。
+- 命令通道：`SyncNow`（手动/周期）、`WatchEvents(Vec<WatchEvent>)`（只标脏）、
+  `Shutdown`；回传通道：`SyncState`（未配置/同步中/成功/失败与游标）、
+  `SyncStatus`（`LocalSyncStatus` 快照）与启动失败原因。
+- 工作区根确定后（`sync_workspace_watch`）启动一条线程；根变化时先 `Shutdown`
+  旧线程再用当前 `FileSystemProvider`/root 重建引擎。`DocView` drop 时发
+  `Shutdown` 并 join（join 放到独立等待线程，避免阻塞 GPUI 主线程）。
+- 周期调度在同步线程内用 `recv_timeout(interval)`：收到 `SyncNow` 或超时都执行
+  `sync_once`；网络失败只回传错误并保留 outbox，下个周期继续重试，线程不退出。
+- 文件监听沿用 D92/D93 的**唯一**工作区根 watcher：在既有 `cx.spawn` 事件派发处
+  把同一批 `WatchEvent` 过滤后转发给同步线程（只标脏），不另起 watcher；
+  D92 的回声抑制、脏标签横幅与保存拦截语义不变。
+- UI 回写统一走 `cx.spawn` + `WeakView::update`，禁止跨线程直接改 GPUI 状态；
+  无配置/无 token 时不启动线程，状态显示“未配置”。
+
+#### 5.10.2 配置与密钥边界
+
+- `Settings`（`settings.json`）只存非敏感项：`sync_server_url`、
+  `sync_workspace_id`、`sync_device_id`、`sync_interval_secs`（默认 30s，
+  normalize 夹到 5–3600s），全部 `#[serde(default)]` 兼容旧配置。
+- token **不明文落盘**（D97）：仅从环境变量 `MAZHA_SYNC_TOKEN` 读取；平台
+  密钥链与设置 UI 留 S5b。`workspace_id` 省略时回退为规范化工作区根字符串，
+  `device_id` 省略时取 hostname（非法时回退固定串）并**持久化回 settings**，
+  保证重启身份稳定；两者最终都要通过 `WorkspaceId::new`/`DeviceId::new` 校验，
+  非法配置在状态栏明确提示、不 panic。
+- `server_url` 只接受 `http://` / `https://`，且必须有非空 host、无空白/控制
+  字符；生产 TLS 由反向代理终结（D100），代码不做自签证书。
+
+#### 5.10.3 状态、冲突与保护边界
+
+- 底部状态栏与 D83 `ExportStatus` 共用右侧提示位：用纯函数拼接两段文案，
+  任一段为失败即用强调色，避免二者互相覆盖。文案覆盖：未配置、空闲游标、
+  同步中、上次同步成功游标、离线/失败原因、需确认、冲突 N。
+- `needs_confirmation = true` 时显示明确提示与“重试同步”按钮（`SyncNow`）：
+  “本地有未推送改动，已保留文件与 outbox”；**绝不自动丢弃 outbox 或本地文件**。
+- `conflict_docs` 非空时复用 D92 `ExternalChange` 横幅样式与生命周期，列出冲突
+  `DocId`（中文路径原样显示）并说明“数据已保存在同步状态中，未静默删除”；
+  不提供“覆盖”按钮（S5b 才做真正的合并/覆盖交互）。
+- 同步路径仍只走 `apply_updates_with_meta`；S5a 不引入 S-08 的增量 Document
+  patch，远端写回后打开文档的 undo/选区代价按 D97 MVP 接受。
+
+#### 5.10.4 S5a / S5b 边界
+
+| 批次 | 本次范围 | 后置（S5b） |
+|------|----------|-------------|
+| S5a | 桌面注入 `HttpTransport`、周期/手动同步、状态栏/冲突横幅、快照需确认提示与重试；配置走 settings.json + 环境变量 | — |
+| S5b | — | S-08 增量 Document patch（减少 undo/选区丢失）、真正的“合并/覆盖”交互动作、WebSocket 订阅、快照压缩、墓碑 GC、平台安全存储（token 不再依赖环境变量） |
+
 ---
 
 ## 6. 传输层抽象
@@ -826,6 +884,24 @@ mazha-store (StorageProvider / WatchEvent)
   不被 server/http 依赖。新增依赖仅 `thiserror`（与既有 crate 一致）及测试用
   `tempfile`；只进根 `Cargo.lock`，桌面独立锁不动。
 
+### 9.6 S5a 桌面接入依赖边界（已定，D102 / 0.1.125）
+
+```text
+platforms/desktop（独立 workspace；只改本目录与桌面 Cargo.lock）
+   ├─▶ mazha-sync-local（LocalSyncEngine；纯 Rust、同步阻塞）
+   ├─▶ mazha-sync-http（HttpTransport；ureq 同步 HTTP，token 仅来自环境变量）
+   ├─▶ mazha-sync（WorkspaceId / DeviceId 身份校验）
+   └─▶ mazha-store（FileSystemProvider / WatchEvent；与 D92 共用同一 watcher）
+```
+
+- 根 `Cargo.toml` / 根 `Cargo.lock` **不新增依赖**：三个 crate 已是根成员，
+  桌面只加 path 依赖并更新桌面独立锁。
+- 核心 crate（`mazha-core` / `mazha-crdt` / `mazha-store` / `mazha-sync` /
+  `mazha-sync-local`）仍无 GUI、网络实现与 async runtime；网络只在
+  `mazha-sync-http` / `mazha-sync-server`，GUI 只在桌面。
+- 桌面新增纯函数模块（配置解析、URL 校验、状态文案、横幅文案、事件转发过滤、
+  状态栏拼接）不依赖 GPUI，沿用既有 `#[cfg(test)]` 风格测试；无真实网络/端口。
+
 ---
 
 ## 10. 迁移与兼容策略
@@ -893,6 +969,20 @@ mazha-store (StorageProvider / WatchEvent)
      编辑在重启后仍能重放 outbox。
 - 每个用例独立临时目录（进程 ID + 测试名），结束清理；无外部网络、无线程定时器。
 
+### 11.4 S5a 验收标准与测试分层（已定，D102）
+
+- **纯函数**：server URL 只收 `http(s)://` 且有 host；workspace/device ID 回退与
+  `WorkspaceId::new`/`DeviceId::new` 校验；`Settings` 同步字段默认/normalize
+  与 5–3600s 夹取；状态文案覆盖未配置/空闲/同步中/成功/失败/需确认/冲突计数；
+  冲突横幅列出 `DocId` 且不含“覆盖”；事件转发过滤隐藏文件与非 Markdown；
+  状态栏同步提示与 D83 导出提示共存且失败用强调色。
+- **线程边界**：`assert_send::<LocalSyncEngine>()` 编译期断言；同步线程只在
+  `recv_timeout` 超时或 `SyncNow` 时调用 `sync_once`，`WatchEvents` 只标脏；
+  失败后线程继续存活。
+- **无真实网络**：全部测试用临时目录/纯函数/假数据，不启动服务端、不访问外网。
+- **门禁**：根 workspace 747 → 保持（S5a 只改桌面，核心零改动）；桌面独立
+  workspace 112 → 新增纯函数单测，`fmt/clippy/test/build` 四门禁全绿。
+
 ---
 
 ## 12. 开放问题与建议决策项
@@ -911,7 +1001,7 @@ mazha-store (StorageProvider / WatchEvent)
 | S-10 | 是否需要 E2EE？ | MVP 不承诺；协议预留密文载荷字段。 | 中 |
 | S-11 | 快照与增量日志的本地存储格式？ | **已定（D100）**：先复用 wire 小端/长度前缀助手做单文件 hex 持久化（temp+rename），后续引入 append-only log + compaction。 | 中（已决） |
 | S-12 | 结构性并发（表格/块）冲突提示？ | 继续沿用 §6.5 `[待确认]`；先记录冲突事件，不自动重写语义结构。S4 只在 `status().conflict_docs` 暴露墓碑冲突副本所在的 `DocId`。 | 低（S4 仅暴露 DocId） |
-| S-13 | 桌面何时接入本地引擎与冲突 UI？ | **S5**：S4 只交付纯 Rust crate 与测试，`platforms/*` 零改动；S5 注入 `HttpTransport` 与周期调度，并把 `needs_confirmation`/`conflict_docs` 显示为状态栏/横幅。 | 中（已排期） |
+| S-13 | 桌面何时接入本地引擎与冲突 UI？ | **已实现（D102，S5a）**：S4 只交付纯 Rust crate 与测试；S5a 在桌面注入 `HttpTransport`、周期/手动同步，把 `needs_confirmation`/`conflict_docs` 显示为状态栏/横幅，并提供“重试同步”，绝不静默覆盖。真正的“合并/覆盖”动作留 S5b。 | 高（已决） |
 
 建议 ADR 拆分：
 
@@ -964,11 +1054,19 @@ mazha-store (StorageProvider / WatchEvent)
   `SessionCheckpoint`、`checkpoint`/`restore_checkpoint`），D99 语义零改动。
 - 测试见 §11.3；`platforms/*` 与 `mazha-core` 零改动，桌面 UI 留 S5。
 
-### Phase S5：桌面接入与体验优化
+### Phase S5a：桌面接入第一批（D102，0.1.125 已落地）
 
-- 桌面状态栏/横幅显示 `needs_confirmation` / `conflict_docs`，接入周期调度与
-  `HttpTransport`；增量应用减少 Document 重建（S-08）。
-- WebSocket 推送、快照压缩、墓碑 GC。
+- 桌面注入 `HttpTransport`（token 仅环境变量 `MAZHA_SYNC_TOKEN`），
+  专用同步线程 + `mpsc` 命令/状态通道，`recv_timeout(interval)` 周期同步与
+  “立即同步”命令；复用 D92 唯一 watcher 转发事件只标脏。
+- 状态栏显示未配置/同步中/成功游标/离线失败/需确认/冲突 N，与 D83 导出状态拼接；
+  冲突横幅列 `DocId` 并说明数据未静默删除；“重试同步”只发 `SyncNow`。
+- 只改 `platforms/desktop/*` 与桌面 `Cargo.lock`；核心 crate 与 D95-D101 语义零改动。
+
+### Phase S5b：体验优化与产品化（后置）
+
+- S-08 增量 Document patch（减少 undo/选区丢失）、真正的“合并/覆盖”交互动作。
+- WebSocket 订阅、快照压缩、墓碑 GC、平台安全存储（token 不再从环境变量读取）。
 
 ---
 
@@ -997,3 +1095,6 @@ mazha-store (StorageProvider / WatchEvent)
 - **S4 回填（0.1.124）**：本文 §5.9（本地编排契约）/§9.5（crate 边界）/§11.3（验收）、
   §12 S-08/S-13；`SPEC.md` §5 增 `mazha-sync-local` 行与依赖图、§6.5 增 S4 段、
   §14 新增 D101；`HANDOFF.md` 同步版本/状态/测试数/下一步 S5。
+- **S5a 回填（0.1.125）**：本文 §5.10（桌面线程/配置/状态契约）/§9.6（桌面依赖边界）/
+  §11.4（验收）/§12 S-13/§13 S5a/S5b 拆分；`SPEC.md` §6.5 增 S5a 段、
+  §14 新增 D102、§15 记 0.1.125；`HANDOFF.md` 同步版本/平台状态/测试数/下一步 S5b。

@@ -15,6 +15,12 @@ pub const MIN_MONO_FONT_SIZE: f32 = 10.0;
 pub const MAX_MONO_FONT_SIZE: f32 = 24.0;
 /// 每次调整的步长（px）。
 pub const FONT_STEP: f32 = 1.0;
+/// 同步周期默认值（秒）；D102：太长会让离线编辑迟迟不推送，太短会频繁唤醒网络。
+pub const DEFAULT_SYNC_INTERVAL_SECS: u64 = 30;
+/// 同步周期下限（秒）：防止手工配置把同步线程变成忙循环。
+pub const MIN_SYNC_INTERVAL_SECS: u64 = 5;
+/// 同步周期上限（秒）：超过一小时实际等同于手动同步。
+pub const MAX_SYNC_INTERVAL_SECS: u64 = 3600;
 
 /// 主题偏好：跟随系统 / 固定浅色 / 固定深色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -88,6 +94,14 @@ pub struct Settings {
     pub source_mode: bool,
     /// 文件树展开状态：键为工作区根目录字符串，值为已展开的相对目录路径列表（D72）。
     pub tree_expanded: BTreeMap<String, Vec<String>>,
+    /// 同步服务端根 URL（S5a/D102）；仅 `http(s)://`，token 不放在此处。
+    pub sync_server_url: Option<String>,
+    /// 同步工作区 ID；为空时回退为规范化工作区根路径。
+    pub sync_workspace_id: Option<String>,
+    /// 同步设备 ID；为空时回退为 hostname 并写回本文件，保证重启身份稳定。
+    pub sync_device_id: Option<String>,
+    /// 同步周期（秒）；`None` 表示使用 [`DEFAULT_SYNC_INTERVAL_SECS`]。
+    pub sync_interval_secs: Option<u64>,
 }
 
 impl Default for Settings {
@@ -102,6 +116,10 @@ impl Default for Settings {
             typewriter_mode: false,
             source_mode: false,
             tree_expanded: BTreeMap::new(),
+            sync_server_url: None,
+            sync_workspace_id: None,
+            sync_device_id: None,
+            sync_interval_secs: None,
         }
     }
 }
@@ -134,10 +152,15 @@ impl Settings {
 
     /// 校正手工编辑配置可能带来的越界值/空白字体名。
     pub fn normalize(&mut self) {
-        self.font_family = normalize_font(self.font_family.take());
-        self.mono_font_family = normalize_font(self.mono_font_family.take());
+        self.font_family = trim_non_empty(self.font_family.take());
+        self.mono_font_family = trim_non_empty(self.mono_font_family.take());
         self.font_size = self.font_size.map(clamp_font_size);
         self.mono_font_size = self.mono_font_size.map(clamp_mono_font_size);
+        // D102：同步配置全部来自手工编辑的 settings.json，同样要做范围/空白校正。
+        self.sync_server_url = trim_non_empty(self.sync_server_url.take());
+        self.sync_workspace_id = trim_non_empty(self.sync_workspace_id.take());
+        self.sync_device_id = trim_non_empty(self.sync_device_id.take());
+        self.sync_interval_secs = self.sync_interval_secs.map(clamp_sync_interval);
     }
 
     /// 正文字体显示名（用于命令面板/状态栏）。
@@ -160,17 +183,30 @@ impl Settings {
         self.mono_font_family = next_font(MONO_FONT_CHOICES, self.mono_font_family.as_deref());
     }
 
-    /// 恢复默认外观（跟随系统 + 主题默认字体/字号），保留视图模式开关与文件树展开状态。
+    /// 恢复默认外观（跟随系统 + 主题默认字体/字号），保留视图模式、文件树展开状态与同步配置。
     pub fn reset_appearance(&mut self) {
         let focus_mode = self.focus_mode;
         let typewriter_mode = self.typewriter_mode;
         let source_mode = self.source_mode;
         let tree_expanded = std::mem::take(&mut self.tree_expanded);
+        // D102：外观重置绝不能丢同步配置（尤其持久化后的 device_id，丢了会换设备身份）。
+        let sync = (
+            self.sync_server_url.take(),
+            self.sync_workspace_id.take(),
+            self.sync_device_id.take(),
+            self.sync_interval_secs.take(),
+        );
         *self = Self::default();
         self.focus_mode = focus_mode;
         self.typewriter_mode = typewriter_mode;
         self.source_mode = source_mode;
         self.tree_expanded = tree_expanded;
+        (
+            self.sync_server_url,
+            self.sync_workspace_id,
+            self.sync_device_id,
+            self.sync_interval_secs,
+        ) = sync;
     }
 
     /// 取某工作区已保存的文件树展开目录列表（无记录时为空）。
@@ -198,8 +234,16 @@ pub fn clamp_mono_font_size(size: f32) -> f32 {
     size.clamp(MIN_MONO_FONT_SIZE, MAX_MONO_FONT_SIZE).round()
 }
 
-fn normalize_font(font: Option<String>) -> Option<String> {
-    font.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+/// 去掉首尾空白；空白串按“未配置”处理（字体与同步 ID/URL 共用）。
+fn trim_non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 把同步周期夹到 5–3600s，避免手工配置造成忙循环或近乎禁用同步。
+pub fn clamp_sync_interval(secs: u64) -> u64 {
+    secs.clamp(MIN_SYNC_INTERVAL_SECS, MAX_SYNC_INTERVAL_SECS)
 }
 
 fn font_label(
@@ -324,6 +368,10 @@ mod tests {
                 "/tmp/ws".to_string(),
                 vec!["sub".to_string(), "sub/deep".to_string()],
             )]),
+            sync_server_url: Some("https://sync.example.com".into()),
+            sync_workspace_id: Some("中文工作区".into()),
+            sync_device_id: Some("my-mac".into()),
+            sync_interval_secs: Some(45),
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();
@@ -339,6 +387,73 @@ mod tests {
             parsed.tree_expanded_for("/tmp/ws"),
             vec!["sub".to_string(), "sub/deep".to_string()]
         );
+        assert_eq!(
+            parsed.sync_server_url.as_deref(),
+            Some("https://sync.example.com")
+        );
+        assert_eq!(parsed.sync_workspace_id.as_deref(), Some("中文工作区"));
+        assert_eq!(parsed.sync_device_id.as_deref(), Some("my-mac"));
+        assert_eq!(parsed.sync_interval_secs, Some(45));
+    }
+
+    /// D102：旧版 settings.json 没有同步字段时必须按默认加载，不能整体反序列化失败。
+    #[test]
+    fn sync_fields_default_and_old_json_still_loads() {
+        let settings = Settings::default();
+        assert_eq!(settings.sync_server_url, None);
+        assert_eq!(settings.sync_workspace_id, None);
+        assert_eq!(settings.sync_device_id, None);
+        assert_eq!(settings.sync_interval_secs, None);
+        let old = r#"{"theme":"dark","font_size":18}"#;
+        let parsed: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.theme, ThemePreference::Dark);
+        assert_eq!(parsed.font_size, Some(18.0));
+        assert_eq!(parsed.sync_interval_secs, None);
+    }
+
+    /// D102：手工编辑的同步配置要裁剪空白/控制越界值，并把空串视为未配置。
+    #[test]
+    fn normalize_sync_fields_trims_and_clamps_interval() {
+        let mut settings = Settings {
+            sync_server_url: Some("  https://sync.example.com  ".into()),
+            sync_workspace_id: Some("   ".into()),
+            sync_device_id: Some("  my-mac  ".into()),
+            sync_interval_secs: Some(7200),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(
+            settings.sync_server_url.as_deref(),
+            Some("https://sync.example.com")
+        );
+        assert_eq!(settings.sync_workspace_id, None);
+        assert_eq!(settings.sync_device_id.as_deref(), Some("my-mac"));
+        assert_eq!(settings.sync_interval_secs, Some(MAX_SYNC_INTERVAL_SECS));
+        settings.sync_interval_secs = Some(1);
+        settings.normalize();
+        assert_eq!(settings.sync_interval_secs, Some(MIN_SYNC_INTERVAL_SECS));
+        assert_eq!(
+            clamp_sync_interval(DEFAULT_SYNC_INTERVAL_SECS),
+            DEFAULT_SYNC_INTERVAL_SECS
+        );
+    }
+
+    /// D102：外观重置不能把持久化的设备身份清掉（否则每次重置都换设备 ID）。
+    #[test]
+    fn reset_appearance_preserves_sync_config() {
+        let mut settings = Settings {
+            sync_server_url: Some("https://sync.example.com".into()),
+            sync_device_id: Some("my-mac".into()),
+            sync_interval_secs: Some(60),
+            ..Settings::default()
+        };
+        settings.reset_appearance();
+        assert_eq!(
+            settings.sync_server_url.as_deref(),
+            Some("https://sync.example.com")
+        );
+        assert_eq!(settings.sync_device_id.as_deref(), Some("my-mac"));
+        assert_eq!(settings.sync_interval_secs, Some(60));
     }
 
     /// 文件树展开状态按工作区根存取：空列表删除键，恢复默认外观不清空（D72）。
