@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 mazha-crdt = { path = "../mazha-crdt" }
 mazha-sync = { path = "../mazha-sync" }
+mazha-sync-ws = { path = "../mazha-sync-ws" }
 tiny_http = "0.12"
 thiserror = "2"
 

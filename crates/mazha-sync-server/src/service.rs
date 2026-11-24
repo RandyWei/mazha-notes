@@ -4,6 +4,7 @@
 //! 并调用 `apply_updates_with_meta`：校验或落盘失败时服务端状态零改动（与 S2 假服务端同语义）。
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use mazha_crdt::{CrdtRoster, DeviceAcks, MetaChange, RosterMeta, TombstoneGcReport};
 use mazha_sync::TransportError;
@@ -13,9 +14,11 @@ use mazha_sync::{
     PullResponse, PushAck, PushRequest, SnapshotPayload, SyncCapability, SyncCursor, SyncEnvelope,
     SyncErrorCode, SyncErrorPayload, WorkspaceId, compact_snapshot_payload, error_code_for,
 };
+use mazha_sync_ws::SyncEvent;
 
 use crate::auth::{AuthError, TokenAuth};
 use crate::store::{LogEntry, StoreError, SyncStore, WorkspaceState};
+use crate::subscription::{SubscriptionHub, SubscriptionSession, new_subscription};
 
 /// 与 HTTP 层无关的同步服务：组合存储与鉴权，复用 S2 的协议类型。
 #[derive(Debug)]
@@ -26,6 +29,8 @@ pub struct SyncService<S> {
     auth: TokenAuth,
     /// 单帧大小上限（握手时回报给客户端）。
     max_frame_bytes: u64,
+    /// D108 订阅总线：只在 push 成功后发布轻量变更提示。
+    subscriptions: Arc<Mutex<SubscriptionHub>>,
 }
 
 impl<S: SyncStore> SyncService<S> {
@@ -36,6 +41,7 @@ impl<S: SyncStore> SyncService<S> {
             store,
             auth,
             max_frame_bytes: u64::try_from(MAX_FRAME_BYTES).unwrap_or(u64::MAX),
+            subscriptions: Arc::new(Mutex::new(SubscriptionHub::default())),
         }
     }
 
@@ -50,6 +56,32 @@ impl<S: SyncStore> SyncService<S> {
     #[must_use]
     pub const fn store(&self) -> &S {
         &self.store
+    }
+
+    /// D108：登记一个工作区变更订阅（先鉴权再登记）。
+    ///
+    /// 返回的句柄 `Drop` 即注销；订阅只接收 `SyncEvent` 提示，不改变任何既有同步语义。
+    ///
+    /// # Errors
+    /// 未授权返回 `Unauthorized`；总线锁被污染时返回 `Internal`（不 panic）。
+    pub fn subscribe(
+        &self,
+        workspace: &WorkspaceId,
+        token: Option<&str>,
+    ) -> Result<SubscriptionSession, TransportError> {
+        self.authorize(token, workspace)?;
+        let (sender, receiver) = std::sync::mpsc::channel::<SyncEvent>();
+        let id = {
+            let mut hub = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hub.subscribe(workspace.clone(), sender)
+        };
+        Ok(SubscriptionSession::new(
+            receiver,
+            new_subscription(&self.subscriptions, id),
+        ))
     }
 
     /// 握手：校验能力、登记会话并回报当前游标。
@@ -176,6 +208,20 @@ impl<S: SyncStore> SyncService<S> {
         self.store
             .save(&req.workspace_id, &next)
             .map_err(|error| server_from_store(&error))?;
+        // D108：只有真正推进了游标（非重复批次）才发布订阅提示；重复 push 不改变状态。
+        let doc_ids = req.payload.frames.keys().cloned().collect();
+        let event = SyncEvent::WorkspaceChanged {
+            workspaces: vec![req.workspace_id.to_string()],
+            doc_ids,
+            cursor_hint: Some(cursor.get()),
+        };
+        {
+            let mut hub = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hub.publish(&req.workspace_id, &event);
+        }
         Ok(PushAck {
             cursor,
             duplicate: false,
@@ -585,6 +631,40 @@ mod tests {
             state.dedup.values().next().copied(),
             Some(SyncCursor::new(1))
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn push_publishes_subscription_event_only_once_per_batch() {
+        let root = temp_root("subscribe");
+        let service = service(&root);
+        let ws = WorkspaceId::new("ws-1").unwrap();
+        let session = service.subscribe(&ws, Some("dev-token")).unwrap();
+        assert!(service.subscribe(&ws, None).is_err());
+
+        let mut frames = DocFrameMap::new();
+        frames.insert(
+            "notes/甲.md".to_owned(),
+            CrdtDoc::from_text("甲内容").encode_update(),
+        );
+        let request = envelope(PushPayload {
+            batch_id: BatchId::new(&DeviceId::new("dev-a").unwrap(), 1).unwrap(),
+            frames,
+            meta_changes: Vec::new(),
+        });
+        service.push(&request, Some("dev-token")).unwrap();
+        let event = session.receiver.try_recv().unwrap();
+        assert_eq!(
+            event,
+            SyncEvent::WorkspaceChanged {
+                workspaces: vec!["ws-1".to_owned()],
+                doc_ids: vec!["notes/甲.md".to_owned()],
+                cursor_hint: Some(1),
+            }
+        );
+        // 重复批次没有状态变化，不应再次打扰订阅者。
+        service.push(&request, Some("dev-token")).unwrap();
+        assert!(session.receiver.try_recv().is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

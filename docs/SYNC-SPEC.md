@@ -775,7 +775,94 @@ MetaChange =
   指纹，用于初始 `conflict_docs` 与后续 `needs_confirmation` 抑制；`persist()` 与原路径一致
   （暂存成功、传输/快照失败、resolve 成功均落盘）。重启后已确认材料不再重现横幅；
   新冲突帧或新 outbox 批次因指纹不匹配照常提示。
-- **不改**桌面 UI、不改 `resolve_*` 签名/三选一语义；token 仍只从环境变量读取（第三批替换）。
+- **不改**桌面 UI、不改 `resolve_*` 签名/三选一语义；token 仍只从环境变量读取（**D109 已替换，见 §5.13.4**；本条历史结论本身不改）。
+
+### 5.13 S5b 第三批契约（已实现，D108/D109 / 0.1.128）
+
+> 本批是 **additive 旁路**：D24/D95–D107 的结论与公开签名/语义零改动；`SyncTransport`
+> 仍只有四个请求-响应方法，九种 `SyncMessage`、`MZS0` wire、`LocalSyncEngine`/
+> `RemotePatch`/GC/压缩 API 都不变。WebSocket 只下发“有变更”的轻量提示，收到提示后
+> 仍由调用方走既有非破坏性 `SyncNow`；平台密钥链只替换 token 的**来源**，不改变
+> `Authorization: Bearer` 与工作区授权模型。
+
+#### 5.13.1 WS 订阅 crate 与纯函数边界（D108）
+
+1. **新 crate `mazha-sync-ws`** 加入根 workspace，独立承担“服务端有变更”的通知，与
+   `SyncTransport` 完全解耦：不复用九种同步消息、不碰 `MZS0` wire、不参与 CRDT 合并。
+   依赖仅标准库 + `base64`/`sha1`/`serde`/`serde_json`/`thiserror`；同步阻塞，
+   无 async runtime、无 GUI、无平台密钥链。
+2. **trait 形态**（与 §6.2 草案里的 `SyncTransport::subscribe` 不是同一个东西）：
+   ```
+   SyncSubscription::next_event(&mut self) -> Result<Option<SyncEvent>, SubscriptionError>
+   SyncSubscription::next_event_timeout(&mut self, Duration) -> Result<Option<SyncEvent>, SubscriptionError>
+   SyncSubscription::close(&mut self)
+   ```
+   `None` 仅表示底层正常结束；超时是 `SubscriptionError::Timeout`，**不是**关闭。
+   带超时读取让桌面线程能在等待期间检查停止标志；`InMemorySubscription` 提供无 socket
+   的确定性假实现（有事件立即返回，无事件按超时处理，测试不 `sleep`）。
+3. **事件**：只有 `SyncEvent::WorkspaceChanged { workspaces, doc_ids, cursor_hint }`，
+   不含文档正文/CRDT 操作；JSON 种类固定 `workspace_changed`，未知种类/空工作区/
+   控制字符 ID 一律拒绝。`cursor_hint` 只是提示，客户端不得据此跳过拉取。
+4. **协议纯函数**（不启端口即可单测）：`accept_key`（RFC6455 GUID + SHA1 + base64）、
+   `validate_upgrade`（GET、`/sync/v0/subscribe`、`Upgrade: websocket`、Connection 含
+   Upgrade、版本 13、16 字节 base64 key）、`subscription_url`（`http→ws` / `https→wss`
+   + 固定路径，保留反向代理前缀，非法 URL 返回错误不 panic）、`parse_ws_endpoint`
+   （host/端口/IPv6/userinfo 边界）、`workspace_from_subscribe_path` /
+   `percent_encode_component`（单个 workspace、百分号编解码）、`validate_handshake_response`
+   （101 + Accept + Connection 校验）、`decode_ws_frame` / `FrameReader`（text/emoji、
+   分片拼装、Ping/Pong/Close、半包缓存、坏帧与超限拒绝）、`encode_event_json` /
+   `decode_event_json`。
+5. **客户端实现**：`TcpSubscription::connect` 用 `TcpStream` 完成 Upgrade 后循环读帧，
+   `set_read_timeout` 实现超时；客户端帧按 RFC6455 掩码，服务端帧不掩码；只支持文本
+   事件，不支持 binary/扩展/压缩。单测覆盖 text/emoji、分片、ping/pong、坏帧、超时；
+   不启动真实端口、不访问真实服务。
+
+#### 5.13.2 服务端第 5 路由（D108，additive）
+
+- `mazha-sync-server` 增加 `GET /sync/v0/subscribe`，`handle_request` 的**四个 POST 分支
+  与状态码映射零改动**；`serve` 在读取 body 之前拦截 `GET` + 该路径，交给
+  `serve_subscription`：纯函数 `subscribe_handshake` 校验 → `WorkspaceId` 校验 →
+  `SyncService::subscribe`（复用既有 `TokenAuth` 工作区授权）→ 101 升级 → 阻塞推帧。
+- 新增 `SubscriptionHub`（工作区 → 订阅者 mpsc 通道）与 `ActiveSubscription`：
+  `SyncService::push` **成功提交后**才 `publish` 一条 `WorkspaceChanged`；只发给同工作区
+  且仍在线的订阅者，断线通道顺手摘除；`Drop` 即注销。发布失败不影响 push 结果与游标。
+- 服务端只发事件文本帧与空闲 15s 的空 Ping 探测，**不读取客户端帧**；不替客户端决定
+  合并/覆盖，不写本地文件，不推进游标/去重表/日志。四路由的持久化与语义完全不变。
+
+#### 5.13.3 桌面订阅线程（D108）
+
+- `platforms/desktop` 用 `mazha-sync-ws` 起**专用阻塞订阅线程**，复用 D102 的 `mpsc`
+  回执通道；`SyncConfig.subscription_url` 由已校验的 `http(s)` 服务端地址推导，非法地址
+  在配置推导阶段返回错误（不 panic）。`subscription_config` 只做纯数据变换，
+  `SubscriptionConfig` 的手写 `Debug` 把 token 显示为 `<redacted>`。
+- `SyncReply` additive 增加 `RemoteChanged { workspaces, doc_ids, cursor_hint }` 与
+  `SubscriptionFailed(String)`。主线程收到 `RemoteChanged` **只触发一次非破坏性
+  `SyncNow`**：绝不自动覆盖本地文本、不清 outbox、不自动解决冲突/快照确认。
+- 连接失败/断线只回传失败文案后退出订阅线程；周期同步线程独立存活并继续按
+  `recv_timeout(interval)` 重试，状态栏显示“订阅不可用（已回退周期同步）”。
+  `restart_sync` 与 `SyncHandle::drop` 都先置停止标志再回收线程，不留残留 socket。
+
+#### 5.13.4 平台安全 token 存储（D109）
+
+- 桌面新增 `token_store`：`TokenStore: Send + Sync` 只暴露 `get()` / `set(&str)`；
+  `TokenResolution { token, source, diagnostic }` 只源信息、不回显 token。`InMemoryTokenStore`
+  与 `UnsupportedTokenStore` 供无真实密钥链的单测使用。
+- **读取优先级**：平台密钥链 → `MAZHA_SYNC_TOKEN`；密钥链无条目而 env 有值时**一次性迁移**
+  到密钥链（迁移失败保留 env 回退与非阻断诊断），两者都无时沿用 `MissingToken`。
+  密钥链读取故障不直接失败，保留诊断并回退 env，保证周期同步不被阻断。
+- **平台边界**：macOS 用 `security-framework` 的 generic password API
+  （service `com.mazha-notes.sync`，account `sync-token`），不引入 `keyring`；
+  Windows/Linux 由 `#[cfg]` 切到 `UnsupportedTokenStore` + env 回退，并给出
+  “平台密钥链不可用”诊断。任何路径都不 panic。
+- **token 绝不明文落盘**：不写 `settings.json`、日志、命令行参数或任何普通文件；
+  `resolve_config_with_diagnostic` 只接收入参 token，不读取任何文件/环境变量。
+  保留兼容入口 `token_from_env()`，但其内部经 `TokenStore` 优先级链解析。
+- **写入入口**：命令面板“设置同步令牌（从剪贴板）”/ `SetSyncToken`，只从剪贴板读入内存，
+  先 `validate_token`（非空白、无控制字符、≤4096 字节），已有 token 或读取失败无法判断时
+  用 `rfd` Yes/No 弹窗二次确认；写成功重启同步并提示“已存入系统密钥链”，取消/失败只给原因。
+- **依赖方向**：密钥链依赖只在 `platforms/desktop` 与桌面独立锁；核心 crate
+  （`mazha-core`/`mazha-crdt`/`mazha-store`/`mazha-sync`/`mazha-sync-local`/`mazha-sync-ws`）
+  不依赖 GUI、async runtime、网络实现或平台密钥链。
 
 ---
 
@@ -804,7 +891,9 @@ pub trait SyncSubscription: Send {
 约束：
 
 - 协议类型应可序列化（`serde`/JSON/CBOR/二进制待定），但 **CRDT 内容帧字段保持原始 Yjs v1 bytes**。
-- MVP 可只实现请求-响应；`subscribe` 为可选能力。
+- MVP 可只实现请求-响应；`subscribe` 为可选能力。**D108 已落实为独立 crate 的旁路 trait
+  `SyncSubscription`（见 §5.13.1），并未把 `subscribe` 加回 `SyncTransport`**；上方草案签名
+  只保留历史记录，最终签名以 §6.4 为准。
 - 传输实现可放独立 crate，避免核心 crate 引入网络/async runtime。
 
 ### 6.3 传输候选
@@ -830,6 +919,8 @@ pub trait SyncTransport {
 
 - 四个方法全部**同步**、拿 `&mut self`；MVP 不放 `subscribe`/`next_event`，
   也不允许 async runtime、网络 IO 与 GUI 依赖进入 `mazha-sync`。
+  **D108 补充**：变更订阅放在独立的 `mazha-sync-ws` crate，以独立 trait
+  `SyncSubscription` 表达；本 trait 的四方法、九种消息与 wire 一律不改（见 §5.13.1）。
 - `TransportError` 只表达传输/协议层失败：`Disconnected`（断线，outbox 必须保留）、
   `Server { code, message }`（服务端协议错误码）、`InvalidResponse`（如对端回包自相矛盾）、
   `Protocol`（ID/信封校验失败）。协议错误码包括 `CursorTooOld`、`BadFrame`、
@@ -923,7 +1014,8 @@ pub trait SyncTransport {
 - **TLS/证书由反向代理或部署层终结**，代码不实现自签证书、不绑定 HTTPS；
   本地集成测试只绑定 `127.0.0.1:0` 的明文端口。
 - **WebSocket 订阅（S4）后置**：本阶段只有请求-响应，无 `subscribe`，`SyncMessage`
-  九种顺序与 `SyncTransport` 四方法不变。
+  九种顺序与 `SyncTransport` 四方法不变。**D108 已以独立旁路实现订阅（见 §7.4.6），
+  不翻本条结论**：四个 POST 路由与九种消息依旧不变。
 
 #### 7.4.5 S5b 第二批服务端维护契约（D105/D106 / 0.1.127）
 
@@ -939,6 +1031,20 @@ pub trait SyncTransport {
   语义完全不变；归档只服务于审计/恢复，不进入 pull 日志、不伪装成内容帧。
 - **磁盘兼容**：`MZWS` 版本 1 → 2，在 dedup 之后追加 `device_acks` 与 `gc_archive`
   两段（均受 CRC 覆盖）；v1 仍可读并把新字段初始化为空，未知版本/坏 CRC/截断照旧拒绝。
+
+#### 7.4.6 S5b 第三批服务端订阅路由（D108 / 0.1.128）
+
+- 端点总数从四个 POST 增为**四个 POST + 一个 GET Upgrade**：新增
+  `GET /sync/v0/subscribe?workspace=<percent-encoded>`，鉴权仍复用
+  `Authorization: Bearer <token>` 与既有工作区授权表。`handle_request` 的四分支、
+  `HttpResponse` 与状态码映射均不变；Upgrade 在 `serve` 中读取 body 前接管，
+  握手/事件编码由 `mazha-sync-ws` 的纯函数完成（见 §5.13.1/§5.13.2）。
+- `subscribe_handshake` 是**纯函数**：校验 Upgrade 请求并返回 `(workspace, accept)`；
+  握手失败、非法 workspace、未授权一律不升级连接，只回 400 文本原因（不含 token）。
+- `SubscriptionHub` 按 `WorkspaceId` 隔离订阅者，`SyncService::push` 成功落盘后发布
+  轻量 `SyncEvent`；断线订阅者自动摘除，`ActiveSubscription::drop` 幂等注销。
+  服务端**不读取客户端帧**，空闲 15s 发空 Ping 探测；事件只提示“工作区有变更”，
+  服务端不合并、不覆盖、不推进游标。
 
 ---
 
@@ -1083,6 +1189,28 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 - `mazha-sync` 的 `checkpoint` / `restore_checkpoint` 只按既有 additive API 使用，
   不新增清空 outbox 的方法；`mazha-crdt` 的 D94/D95/D98 语义零改动。
 
+### 9.8 S5b 第三批依赖边界（已定，D108/D109 / 0.1.128）
+
+```text
+mazha-sync-ws（新 crate：握手/帧/事件/订阅 trait/TCP 客户端；无 async、无 GUI）
+       ▲                              ▲
+       │                              │
+mazha-sync-server（第 5 路由）        platforms/desktop（订阅线程 + token 存储）
+       │                              ├─▶ mazha-sync-ws（订阅 trait / TCP 客户端）
+       └─▶ mazha-sync（四方法不变）    ├─▶ mazha-sync-local / mazha-sync-http（既有）
+                                      └─▶ security-framework（仅 macOS，密钥链）
+```
+
+- `mazha-sync-ws` 加入**根 workspace**，只依赖标准库 + 小型编解码/序列化库；
+  **不依赖** `mazha-sync` 的九种消息/wire，也不反向依赖任何平台或 UI crate。
+- 服务端只新增对本 crate 的依赖与第 5 路由；`handle_request` 四路由、存储格式与
+  既有 `SyncService` 方法语义不变。
+- 桌面独立 workspace 新增 `mazha-sync-ws` path 依赖；macOS 另加 `security-framework`，
+  其余平台用 `#[cfg]` 占位实现 + env 回退。根 `Cargo.lock` 与
+  `platforms/desktop/Cargo.lock` 各自更新，两把锁文件互不混用。
+- 核心 crate（`mazha-core` / `mazha-crdt` / `mazha-store` / `mazha-sync` /
+  `mazha-sync-local`）仍无 GUI、async runtime、网络实现与平台密钥链依赖。
+
 ---
 
 ## 10. 迁移与兼容策略
@@ -1194,6 +1322,27 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
   三选一语义零改动。
 - **门禁**：与 §11.5 相同；桌面 UI 本批零改动但仍须跑独立 workspace 四门禁。
 
+### 11.7 S5b 第三批验收标准与测试分层（已定，D108/D109）
+
+- **WS 纯函数**：`accept_key` 匹配 RFC6455 示例且拒绝非法 key；`validate_upgrade` 接受
+  `Connection: keep-alive, Upgrade` 并拒绝错误方法/路径/版本/头；`subscription_url`
+  完成 `http→ws`、`https→wss` + 路径与反向代理前缀保留，空/空白/控制字符/非 http(s)
+  全部返回错误；`parse_ws_endpoint` 默认 80/443、IPv6 与非法端口/userinfo 边界；
+  workspace query 百分号编解码与重复参数拒绝；帧解析覆盖 text/emoji/分片拼装、
+  Ping/Pong/Close、半包、坏帧/超长帧、客户端 mask 校验；事件 JSON 覆盖 CJK/emoji
+  往返与未知种类/空 ID 拒绝；超时由 `next_event_timeout` 与 `InMemorySubscription` 验证。
+- **服务端**：`subscribe_handshake` 纯函数校验与 Accept 计算；`SubscriptionHub` 只投递
+  同工作区事件、断线通道自动清理、`Drop` 注销；push 成功才发布事件，四路由的
+  去重/游标/状态码/持久化测试继续成立。不启动真实 WS 端口做单测。
+- **桌面**：`subscription_config` 从配置推导 ws URL 且 token 不出现在 `Debug`；
+  订阅失败只回退周期同步且不阻断同步线程；`RemoteChanged` 只触发 `SyncNow`；
+  `token_store` 覆盖密钥链优先、env 一次性迁移、写失败回退、非法 token 拒绝、
+  两处皆空沿用 `MissingToken`；测试只用内存/失败假后端 + env guard，不访问真实 Keychain。
+- **门禁**：根 `cargo fmt --all --check`、
+  `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`
+  全绿；桌面 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`、
+  `cargo build` 全绿；测试计数与锁变化记入 `HANDOFF.md`。
+
 ---
 
 ## 12. 开放问题与建议决策项
@@ -1213,6 +1362,7 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 | S-11 | 快照与增量日志的本地存储格式？ | **已定（D100）**：先复用 wire 小端/长度前缀助手做单文件 hex 持久化（temp+rename）；**S5b 第二批（D106/D107）** 加 CRDT 级快照压缩与 `MZLS` v2 已确认指纹（v1 可读），append-only log + compaction 仍属后续。 | 中（已决） |
 | S-12 | 结构性并发（表格/块）冲突提示？ | 继续沿用 §6.5 `[待确认]`；先记录冲突事件，不自动重写语义结构。S4 只在 `status().conflict_docs` 暴露墓碑冲突副本所在的 `DocId`。 | 低（S4 仅暴露 DocId） |
 | S-13 | 桌面何时接入本地引擎与冲突 UI？ | **已实现（D102，S5a；D104，S5b 第一批）**：S5a 注入 `HttpTransport`、周期/手动同步与状态/冲突提示；S5b 第一批补上“保留本地/采用远端/合并”三选一与破坏性二次确认，所有覆盖均需用户显式确认，绝不静默丢弃。 | 高（已决） |
+| S-14 | 实时变更通知与本地 token 存储怎么做？ | **已定（D108/D109，S5b 第三批）**：`mazha-sync-ws` 旁路订阅只下发轻量 `WorkspaceChanged`，收到后走既有非破坏性 `SyncNow`；服务端 additive 第 5 路由，四路由零改动。token 走 `TokenStore`，密钥链优先、env 一次性迁移，绝不明文落盘；覆盖需二次确认。S-06 的“WebSocket 后置”结论不变——D108 是独立旁路，不替换 HTTP 请求-响应主通道。 | 中（已决） |
 
 建议 ADR 拆分：
 
@@ -1290,10 +1440,22 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 - `MZWS` v2 记录设备 ack 与归档，显式 `gc_tombstones` 调度入口不推进游标/日志。
 - `MZLS` v2 持久化已确认冲突帧/快照批次指纹，v1 可读为空，重启后横幅不重现。
 
-### Phase S5b 第三批：平台化（后置）
+### Phase S5b 第三批：平台化（D108/D109，0.1.128 已落地）
 
-- WebSocket 订阅（`subscribe`/推送）与平台安全存储（token 不再从环境变量读取）。
-- 确认后的自动重试策略与 GC 调度策略产品化（周期/阈值/归档审计导出）。
+- 新 crate `mazha-sync-ws`：手写最小 RFC6455（握手/帧/分片/心跳/坏帧），提供与
+  `SyncTransport` 完全解耦的阻塞 `SyncSubscription` 与 `InMemorySubscription`；
+  纯函数单测覆盖 text/emoji、分片、ping/pong、坏帧、超时与 URL 推导，不启动真实端口。
+- 服务端 additive 增加 `GET /sync/v0/subscribe` 第 5 路由；`handle_request` 四路由、
+  九种消息/wire、存储格式与 push/pull 语义零改动；push 成功后发布轻量变更事件，
+  空闲 Ping 探测，不读取客户端帧。
+- 桌面专用订阅线程复用 `mpsc`，远端变更只发非破坏性 `SyncNow`，断线回退周期同步
+  并在状态栏提示；`restart_sync`/`Drop` 负责停止线程。
+- 桌面 `token_store` 以 `TokenStore` 抽象平台密钥链（macOS `security-framework`，
+  其余平台 env 回退 + 诊断）；密钥链优先、env 一次性迁移、两处皆空沿用
+  `MissingToken`；命令面板剪贴板写入 + 覆盖二次确认，token 绝不明文落盘。
+
+> 未纳入本批：确认后的自动重试策略与 GC 调度策略产品化（周期/阈值/归档审计导出）
+> 仍属后续产品化事项，不改变 D105 的 GC 门槛。
 
 ---
 
@@ -1308,6 +1470,8 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 | 服务端过早产品化 | 范围膨胀 | MVP 只做带持久化中继。 |
 | 安全边界不清 | 数据泄露或越权 | TLS + 工作区授权 + 最小日志作为上线门槛。 |
 | GC/快照压缩误删可恢复数据 | 旧冲突副本丢失或压缩帧被当增量重放 | D105 全设备确认才转储归档并保留墓碑；D106 压缩帧只走快照引导，普通 pull 零改动。 |
+| 订阅事件被误当成合并指令 | 远端提示直接覆盖本地文本/清 outbox | D108 事件只含工作区/文档 ID 与游标提示，桌面只发非破坏性 `SyncNow`；冲突/快照仍需用户显式选择。 |
+| token 写入明文文件或被静默覆盖 | 凭据泄露/旧令牌丢失 | D109 只用平台密钥链（macOS）或 env 回退，`settings.json`/日志/命令行不含 token；覆盖已有 token 必须二次确认，写成功才提示已存入系统密钥链。 |
 
 ---
 
@@ -1335,3 +1499,8 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
   `SPEC.md` §5 crate 表补 `mazha-crdt`/`mazha-sync`/`mazha-sync-local`/`mazha-sync-server`
   的 additive 能力、§6.5 增 S5b 第二批段、§14 新增 D105/D106/D107、§15 记 0.1.127；
   `HANDOFF.md` 同步版本/状态/测试数/下一步 S5b 第三批。
+- **S5b 第三批回填（0.1.128）**：本文 §5.13（WS 订阅/桌面线程/token 存储）/
+  §6.2/§6.4（订阅与 `SyncTransport` 解耦）/§7.4.6（第 5 路由）/§9.8（依赖边界）/
+  §11.7（验收）/§12 S-14/§13 S5b 第三批/§14 风险；`SPEC.md` §5 增 `mazha-sync-ws`
+  行与依赖图、§6.5 增 S5b 第三批段、§14 新增 D108/D109、§15 记 0.1.128；
+  `HANDOFF.md` 同步版本/状态/测试数/锁变化/提交状态。D24/D95–D107 原始结论不变。

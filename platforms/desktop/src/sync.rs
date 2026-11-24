@@ -15,6 +15,7 @@
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -26,10 +27,15 @@ use mazha_sync_local::{
     ConflictChoice, LocalSyncEngine, LocalSyncStatus, ResolveOutcome, SnapshotChoice,
     doc_id_from_path, is_syncable_md,
 };
+use mazha_sync_ws::{
+    SubscriptionConfig, SubscriptionError, SyncEvent, SyncSubscription, TcpSubscription,
+    subscription_url,
+};
 
 use crate::settings::{DEFAULT_SYNC_INTERVAL_SECS, Settings, clamp_sync_interval};
+use crate::token_store::{InMemoryTokenStore, resolve_token};
 
-/// token 只从环境变量读取（D97）：绝不在 `settings.json` 或命令行中落盘。
+/// token 的默认环境变量名（D97/D109）：secret 只在内存，绝不写入 `settings.json`、日志或命令行。
 pub const SYNC_TOKEN_ENV: &str = "MAZHA_SYNC_TOKEN";
 /// hostname 也不可用时使用的固定设备回退串（仍经 `DeviceId::new` 校验）。
 const DEVICE_FALLBACK: &str = "mazha-device";
@@ -45,8 +51,14 @@ pub enum SyncSetupError {
     InvalidWorkspaceId(String),
     /// 设备 ID 非法（空/控制字符）。
     InvalidDeviceId(String),
-    /// 环境变量里没有 token。
+    /// 密钥链与环境变量都没有 token（D109 保持原枚举语义）。
     MissingToken,
+    /// token 空白/含控制字符/超长（D109）。
+    ///
+    /// 实际校验发生在 `token_store::validate_token`；该变体保留给未来的配置入口，
+    /// 当前生产路径只展示存储层错误，避免重复校验改变既有配置语义。
+    #[allow(dead_code)]
+    InvalidToken(String),
     /// 工作区 Provider 打不开。
     Provider(String),
     /// 引擎初始化失败（含本地状态文件损坏，必须显性提示）。
@@ -64,7 +76,10 @@ impl SyncSetupError {
             }
             Self::InvalidWorkspaceId(id) => format!("同步工作区 ID 无效：{id}"),
             Self::InvalidDeviceId(id) => format!("同步设备 ID 无效：{id}"),
-            Self::MissingToken => format!("缺少环境变量 {SYNC_TOKEN_ENV}"),
+            Self::MissingToken => {
+                format!("缺少同步令牌（请存入系统密钥链或设置环境变量 {SYNC_TOKEN_ENV}）")
+            }
+            Self::InvalidToken(reason) => format!("同步令牌无效：{reason}"),
             Self::Provider(reason) => format!("同步工作区打开失败：{reason}"),
             Self::Engine(reason) => format!("同步引擎启动失败：{reason}"),
         }
@@ -113,6 +128,10 @@ pub struct SyncConfig {
     pub token: String,
     /// 由 hostname 回退生成、需要写回设置文件的设备 ID。
     pub generated_device_id: Option<String>,
+    /// D108：从 http(s) 根 URL 推导出的 ws(s) 订阅 URL。
+    pub subscription_url: String,
+    /// D109：非阻断诊断（如平台密钥链不可用、env 回退中）。
+    pub token_diagnostic: Option<String>,
 }
 
 /// 只接受 `http://` / `https://` + 非空 host；路径/查询可比照普通 URL，不作限制。
@@ -191,13 +210,29 @@ fn hostname() -> String {
         .unwrap_or_else(|_| DEVICE_FALLBACK.to_owned())
 }
 
-/// 把 `Settings` + 工作区根 + 环境变量 token 解析为可启动同步线程的配置。
+/// 把 `Settings` + 工作区根 + token 解析为可启动同步线程的配置（保留原签名供测试）。
 ///
 /// 配置缺失或非法一律返回错误由 UI 提示，不 panic、不用空串硬造 ID。
+///
+/// 生产 UI 走带诊断的变体；此签名保留供既有测试与兼容调用，不应删除。
+#[allow(dead_code)]
 pub fn resolve_config(
     settings: &Settings,
     root: &Path,
     token: Option<&str>,
+) -> Result<SyncConfig, SyncSetupError> {
+    resolve_config_with_diagnostic(settings, root, token, None)
+}
+
+/// D108/D109：与 [`resolve_config`] 相同，但携带 token 来源诊断并推导订阅 URL。
+///
+/// # Errors
+/// 配置缺失或非法返回对应 [`SyncSetupError`]；订阅 URL 推导失败视为服务端地址非法。
+pub fn resolve_config_with_diagnostic(
+    settings: &Settings,
+    root: &Path,
+    token: Option<&str>,
+    token_diagnostic: Option<String>,
 ) -> Result<SyncConfig, SyncSetupError> {
     let server_url = settings
         .sync_server_url
@@ -233,6 +268,9 @@ pub fn resolve_config(
         .filter(|token| !token.is_empty())
         .ok_or(SyncSetupError::MissingToken)?
         .to_owned();
+    // token 已进入内存配置；此处只推导 ws 地址，不再读取任何文件/环境变量。
+    let subscription_url = subscription_url(&server_url)
+        .map_err(|error| SyncSetupError::InvalidServerUrl(error.to_string()))?;
     let interval = Duration::from_secs(
         settings
             .sync_interval_secs
@@ -246,16 +284,21 @@ pub fn resolve_config(
         interval,
         token,
         generated_device_id,
+        subscription_url,
+        token_diagnostic,
     })
 }
 
-/// 主线程从环境变量读取 token；空串等同于未配置（调用方显示“未配置”）。
+/// 兼容入口：经 [`resolve_token`] 的优先级链取 token（D109）。
+///
+/// 使用空内存后端时等价于“只从环境变量读”，但多了一层坏 token 校验；
+/// 生产路径应由调用方直接传 `resolve_token(platform_store())` 的结果。
 #[must_use]
+#[allow(dead_code)]
 pub fn token_from_env() -> Option<String> {
-    std::env::var(SYNC_TOKEN_ENV)
+    resolve_token(&InMemoryTokenStore::new())
         .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+        .map(|resolution| resolution.token)
 }
 
 /// D91/D93 事件是否需要转发给同步线程（只标脏）。
@@ -325,6 +368,27 @@ pub fn sync_status_text(phase: &SyncPhase, status: Option<&LocalSyncStatus>) -> 
         if !status.conflict_docs.is_empty() {
             text.push_str(&format!(" · 冲突 {}", status.conflict_docs.len()));
         }
+    }
+    text
+}
+
+/// 带 D109 token 诊断的状态栏文案；原 [`sync_status_text`] 语义保持不变。
+///
+/// 桌面渲染走 `main.rs` 的拼接函数；此纯函数保留供契约测试与复用。
+#[must_use]
+#[allow(dead_code)]
+pub fn sync_status_text_with_diagnostic(
+    phase: &SyncPhase,
+    status: Option<&LocalSyncStatus>,
+    token_diagnostic: Option<&str>,
+    subscription_status: Option<&str>,
+) -> String {
+    let mut text = sync_status_text(phase, status);
+    if let Some(diagnostic) = token_diagnostic {
+        text.push_str(&format!(" · {diagnostic}"));
+    }
+    if let Some(subscription) = subscription_status {
+        text.push_str(&format!(" · {subscription}"));
     }
     text
 }
@@ -534,6 +598,17 @@ pub enum SyncReply {
         /// 引擎返回的解决结果（含待写回正文）。
         outcome: ResolveOutcome,
     },
+    /// D108：订阅线程收到远端变更提示，主线程只触发非破坏性 `SyncNow`。
+    RemoteChanged {
+        /// 有变更的工作区 ID（仅提示，不做合并决策）。
+        workspaces: Vec<String>,
+        /// 有变更的文档 ID（仅提示）。
+        doc_ids: Vec<String>,
+        /// 服务端游标提示（不得据此跳过拉取）。
+        cursor_hint: Option<u64>,
+    },
+    /// D108：订阅失败/断线；周期同步仍继续，状态栏展示回退提示。
+    SubscriptionFailed(String),
 }
 
 /// 同步线程句柄：drop 即发 `Shutdown` 并在独立等待线程 join，不阻塞 GPUI 主线程。
@@ -542,6 +617,10 @@ pub struct SyncHandle {
     tx: mpsc::Sender<SyncCommand>,
     /// 同步线程；`None` 表示已被 join/回收。
     thread: Option<JoinHandle<()>>,
+    /// D108：订阅线程的停止标志；与同步线程同生命周期。
+    subscription_stop: Option<Arc<AtomicBool>>,
+    /// D108：专用订阅线程；不参与文档合并。
+    subscription_thread: Option<JoinHandle<()>>,
 }
 
 impl SyncHandle {
@@ -576,13 +655,91 @@ impl SyncHandle {
 impl Drop for SyncHandle {
     fn drop(&mut self) {
         let _ = self.tx.send(SyncCommand::Shutdown);
-        // ureq 调用可能还在进行中；join 放到独立等待线程，保证关窗时 UI 不卡住。
+        // 先停订阅线程：阻塞读取有超时，收到停止标志即退出，不留残留 socket。
+        if let Some(stop) = self.subscription_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        // ureq / TCP 调用可能还在进行中；join 放到独立等待线程，保证关窗时 UI 不卡住。
         if let Some(thread) = self.thread.take() {
             std::thread::spawn(move || {
                 let _ = thread.join();
             });
         }
+        if let Some(thread) = self.subscription_thread.take() {
+            std::thread::spawn(move || {
+                let _ = thread.join();
+            });
+        }
     }
+}
+
+/// 由同步配置推出订阅配置（纯数据变换，可在无 socket 环境下单测）。
+#[must_use]
+pub fn subscription_config(config: &SyncConfig) -> SubscriptionConfig {
+    SubscriptionConfig {
+        url: config.subscription_url.clone(),
+        workspace: config.workspace_id.to_string(),
+        token: config.token.clone(),
+        read_timeout: Duration::from_secs(5),
+        heartbeat: Duration::from_secs(15),
+    }
+}
+
+/// D108：专用阻塞订阅线程；收到事件只回传提示，绝不触碰本地文档/outbox。
+///
+/// 连接失败或断线只回传 [`SyncReply::SubscriptionFailed`] 后退出；同步线程仍独立运行，
+/// 由既有周期重试兜底。停止标志由 `SyncHandle::drop` 置位，读取超时保证能及时回收。
+fn spawn_subscription(
+    config: SubscriptionConfig,
+    replies: mpsc::Sender<SyncReply>,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("mazha-sync-subscribe".to_owned())
+        .spawn(move || {
+            let mut subscription = match TcpSubscription::connect(config) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    let _ = replies.send(SyncReply::SubscriptionFailed(
+                        subscription_error_message(&error),
+                    ));
+                    return;
+                }
+            };
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    subscription.close();
+                    break;
+                }
+                match subscription.next_event_timeout(Duration::from_millis(500)) {
+                    Ok(Some(SyncEvent::WorkspaceChanged {
+                        workspaces,
+                        doc_ids,
+                        cursor_hint,
+                    })) => {
+                        let _ = replies.send(SyncReply::RemoteChanged {
+                            workspaces,
+                            doc_ids,
+                            cursor_hint,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(SubscriptionError::Timeout) => continue,
+                    Err(error) => {
+                        let _ = replies.send(SyncReply::SubscriptionFailed(
+                            subscription_error_message(&error),
+                        ));
+                        break;
+                    }
+                }
+            }
+        })
+}
+
+/// 把订阅错误转成状态栏文案（不含 token）。
+#[must_use]
+pub fn subscription_error_message(error: &SubscriptionError) -> String {
+    error.to_string()
 }
 
 /// 启动专用同步线程：引擎与 HTTP 传输都只在该线程上创建/调用。
@@ -595,8 +752,13 @@ pub fn spawn_sync(
     replies: mpsc::Sender<SyncReply>,
 ) -> SyncHandle {
     let (tx, rx) = mpsc::channel::<SyncCommand>();
-    // 线程创建失败时也要能回传原因，因此留一个发送端副本在调用方。
+    // 线程创建失败时也要能回传原因，因此留发送端副本在调用方。
     let failure_replies = replies.clone();
+    let subscription_replies = replies.clone();
+    // D108：订阅线程与同步线程解耦；订阅建连失败也不影响下面的周期同步启动。
+    let sub_config = subscription_config(&config);
+    let subscription_stop = Arc::new(AtomicBool::new(false));
+    let sub_stop = Arc::clone(&subscription_stop);
     let spawned = std::thread::Builder::new()
         .name("mazha-sync".to_owned())
         .spawn(move || {
@@ -703,7 +865,25 @@ pub fn spawn_sync(
             None
         }
     };
-    SyncHandle { tx, thread }
+    let (subscription_thread, subscription_stop) = if thread.is_some() {
+        match spawn_subscription(sub_config, subscription_replies, sub_stop) {
+            Ok(subscription_thread) => (Some(subscription_thread), Some(subscription_stop)),
+            Err(error) => {
+                let _ = failure_replies.send(SyncReply::SubscriptionFailed(format!(
+                    "订阅线程启动失败：{error}"
+                )));
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    SyncHandle {
+        tx,
+        thread,
+        subscription_stop,
+        subscription_thread,
+    }
 }
 
 /// 为工作区根目录创建同步 Provider；失败时由调用方显示错误。
@@ -779,6 +959,45 @@ mod tests {
         let again = resolve_config(&settings, &root, Some("secret-token")).unwrap();
         assert_eq!(again.device_id, config.device_id);
         assert_eq!(again.generated_device_id, None);
+    }
+
+    #[test]
+    fn subscription_config_derives_ws_url_and_redacts_token() {
+        let settings = Settings {
+            sync_server_url: Some("https://sync.example.com/mz".into()),
+            sync_workspace_id: Some("ws-1".into()),
+            sync_device_id: Some("dev-a".into()),
+            ..Settings::default()
+        };
+        let config = resolve_config_with_diagnostic(
+            &settings,
+            &path_buf("/tmp/ws"),
+            Some("secret-token"),
+            Some("平台密钥链不可用".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            config.subscription_url,
+            "wss://sync.example.com/mz/sync/v0/subscribe"
+        );
+        assert_eq!(config.token_diagnostic.as_deref(), Some("平台密钥链不可用"));
+        let sub = subscription_config(&config);
+        assert_eq!(sub.workspace, "ws-1");
+        assert!(!format!("{sub:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn sync_status_diagnostic_is_additive() {
+        let base = sync_status_text(&SyncPhase::Idle { last_cursor: 1 }, None);
+        let with = sync_status_text_with_diagnostic(
+            &SyncPhase::Idle { last_cursor: 1 },
+            None,
+            Some("平台密钥链不可用"),
+            Some("订阅已断开，已回退周期同步"),
+        );
+        assert!(with.starts_with(&base));
+        assert!(with.contains("平台密钥链不可用"));
+        assert!(with.contains("已回退周期同步"));
     }
 
     #[test]
@@ -1013,7 +1232,12 @@ mod tests {
     #[test]
     fn resolve_commands_are_sent_through_the_handle() {
         let (tx, rx) = mpsc::channel::<SyncCommand>();
-        let handle = SyncHandle { tx, thread: None };
+        let handle = SyncHandle {
+            tx,
+            thread: None,
+            subscription_stop: None,
+            subscription_thread: None,
+        };
         handle.resolve_conflict(
             "笔记/a.md".to_owned(),
             SyncChoice::Merge,

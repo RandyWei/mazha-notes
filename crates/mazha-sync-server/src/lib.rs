@@ -16,10 +16,14 @@ pub mod auth;
 pub mod http;
 pub mod service;
 pub mod store;
+/// D108 变更订阅总线（additive，不影响既有四路由）。
+pub mod subscription;
 
 pub use auth::{AuthError, TokenAuth, TokenRule, bearer_token};
 pub use http::{
     CONTENT_TYPE, HttpRequest, HttpResponse, handle_request, run_server, serve, status_for,
+    subscribe_handshake,
 };
 pub use service::{SyncService, error_payload};
 pub use store::{FileSyncStore, LogEntry, StoreError, SyncStore, WorkspaceState};
+pub use subscription::{SubscriptionHub, SubscriptionSession};

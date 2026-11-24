@@ -4538,6 +4538,7 @@ dependencies = [
  "mazha-sync",
  "mazha-sync-http",
  "mazha-sync-local",
+ "mazha-sync-ws",
  "mermaid-rs-renderer",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -4547,6 +4548,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "ratex-gpui",
  "rfd",
+ "security-framework",
  "serde",
  "serde_json",
  "smallvec",
@@ -4603,6 +4605,17 @@ dependencies = [
  "mazha-crdt",
  "mazha-store",
  "mazha-sync",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mazha-sync-ws"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "sha1",
  "thiserror 2.0.21",
 ]
 

@@ -7,6 +7,7 @@ members = [
     "crates/mazha-sync",
     "crates/mazha-sync-local",
     "crates/mazha-sync-http",
+    "crates/mazha-sync-ws",
     "crates/mazha-sync-server",
     "crates/mazha-store",
     "crates/mazha-export",

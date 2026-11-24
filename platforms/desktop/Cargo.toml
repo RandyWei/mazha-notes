@@ -21,6 +21,8 @@ mazha-sync-local = { path = "../../crates/mazha-sync-local" }
 mazha-sync-http = { path = "../../crates/mazha-sync-http" }
 # Phase 5 S5a：WorkspaceId / DeviceId 身份校验（空 ID 回退也走这里）
 mazha-sync = { path = "../../crates/mazha-sync" }
+# Phase 5 S5b 第三批：阻塞式 WS 订阅（additive 旁路，不触碰 SyncTransport）
+mazha-sync-ws = { path = "../../crates/mazha-sync-ws" }
 # PDF 导出
 mazha-export = { path = "../../crates/mazha-export" }
 # 文件对话框
@@ -45,6 +47,8 @@ mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 smallvec = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# D109：直接访问系统 Keychain 保存同步令牌（避免引入 keyring 传递依赖）
+security-framework = "3.7"
 # 中文斜体合成倾斜：取 CoreText 字形轮廓 → 剪切 → 自绘（见 `src/oblique.rs`）
 core-text = "21"
 core-graphics = "0.24"

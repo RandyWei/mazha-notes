@@ -4,18 +4,45 @@
 //! 便于不启监听端口也能做契约测试。`run_server` 用 `tiny_http` 把它挂到真实 socket，
 //! 保持阻塞式同步风格（D24），不引入 async runtime；TLS 由反向代理终结。
 
+use std::io::Write;
 use std::net::TcpListener;
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use mazha_sync::SyncErrorCode;
 use mazha_sync::SyncMessage;
 use mazha_sync::TransportError;
+use mazha_sync::WorkspaceId;
 use mazha_sync::wire::{WireError, decode_message, decode_snapshot_request, encode_message};
+use mazha_sync_ws::{
+    SUBSCRIBE_PATH, SyncEvent, UpgradeRequest, WsFrame, accept_key, encode_event_json,
+    encode_ws_frame, validate_upgrade, workspace_from_subscribe_path,
+};
 
 use crate::service::{SyncService, error_payload};
 use crate::store::SyncStore;
 
 /// 同步帧的 Content-Type；`batch_id`/游标/身份只在 wire 信封内，不放 HTTP header。
 pub const CONTENT_TYPE: &str = "application/x-mazha-sync+wire";
+
+/// 订阅心跳间隔： recv 超时后发一个空 Ping 帧探测连接是否仍存活。
+const SUBSCRIBE_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// 纯函数：校验第 5 条订阅路由的 Upgrade 请求，返回 `(workspace, Sec-WebSocket-Accept)`。
+///
+/// 不启端口、不碰鉴权；鉴权与窗口注册由 `serve` 之后完成。既有四路由的
+/// `handle_request` 分支保持不变（D108 additive 边界）。
+///
+/// # Errors
+/// 握手头非法、workspace query 非法或 Accept 计算失败时返回订阅错误。
+pub fn subscribe_handshake(
+    request: &UpgradeRequest<'_>,
+) -> Result<(String, String), mazha_sync_ws::SubscriptionError> {
+    let valid = validate_upgrade(request)?;
+    let workspace = workspace_from_subscribe_path(&valid.path)?;
+    let accept = accept_key(&valid.key)?;
+    Ok((workspace, accept))
+}
 
 /// 与传输无关的 HTTP 请求视图：由具体 HTTP 库填充，再交给 `handle_request`。
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +190,41 @@ pub fn serve<S: SyncStore>(service: &SyncService<S>, listener: TcpListener) -> R
             .iter()
             .find(|header| header.field.equiv("Content-Type"))
             .map(|header| header.value.as_str().to_owned());
+        let upgrade = incoming
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Upgrade"))
+            .map(|header| header.value.as_str().to_owned());
+        let connection = incoming
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Connection"))
+            .map(|header| header.value.as_str().to_owned());
+        let ws_key = incoming
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Sec-WebSocket-Key"))
+            .map(|header| header.value.as_str().to_owned());
+        let ws_version = incoming
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Sec-WebSocket-Version"))
+            .map(|header| header.value.as_str().to_owned());
+
+        // D108 第 5 条路由：GET Upgrade 在读取 body 之前接管，避免影响既有 POST 四路由。
+        if method == "GET" && path.split('?').next() == Some(SUBSCRIBE_PATH) {
+            serve_subscription(
+                service,
+                incoming,
+                &path,
+                authorization.as_deref(),
+                upgrade.as_deref(),
+                connection.as_deref(),
+                ws_key.as_deref(),
+                ws_version.as_deref(),
+            );
+            continue;
+        }
 
         let mut body = Vec::new();
         if let Err(error) = incoming.as_reader().read_to_end(&mut body) {
@@ -191,6 +253,116 @@ pub fn serve<S: SyncStore>(service: &SyncService<S>, listener: TcpListener) -> R
         }
     }
     Ok(())
+}
+
+/// 接管第 5 条 GET Upgrade 路由：握手校验 → 鉴权登记 → 阻塞推送事件帧。
+///
+/// 既有四路由仍走 `handle_request`；这里不读 body、不改 `HttpResponse`，失败只回 400。
+// 八个参数分别来自 tiny_http 的不同 header，聚成结构体会把借用关系拆散；此处保留直传。
+#[allow(clippy::too_many_arguments)]
+fn serve_subscription<S: SyncStore>(
+    service: &SyncService<S>,
+    incoming: tiny_http::Request,
+    path: &str,
+    authorization: Option<&str>,
+    upgrade: Option<&str>,
+    connection: Option<&str>,
+    ws_key: Option<&str>,
+    ws_version: Option<&str>,
+) {
+    let request = UpgradeRequest {
+        method: "GET",
+        path,
+        upgrade,
+        connection,
+        key: ws_key,
+        version: ws_version,
+    };
+    let (workspace_raw, accept) = match subscribe_handshake(&request) {
+        Ok(result) => result,
+        Err(error) => {
+            respond_bad_request(incoming, error.to_string());
+            return;
+        }
+    };
+    let workspace = match WorkspaceId::new(workspace_raw.clone()) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            respond_bad_request(
+                incoming,
+                format!("订阅工作区 ID 非法：{workspace_raw}（{error}）"),
+            );
+            return;
+        }
+    };
+    let token = authorization.and_then(crate::auth::bearer_token);
+    let session = match service.subscribe(&workspace, token) {
+        Ok(session) => session,
+        Err(error) => {
+            // 401 不泄漏 token，只回中文原因；既有 HTTP 错误映射保持不动。
+            respond_bad_request(incoming, error.to_string());
+            return;
+        }
+    };
+    let accept_header =
+        match tiny_http::Header::from_bytes(&b"Sec-WebSocket-Accept"[..], accept.as_bytes()) {
+            Ok(header) => header,
+            Err(error) => {
+                respond_bad_request(incoming, format!("握手响应头构造失败：{error:?}"));
+                return;
+            }
+        };
+    let response =
+        tiny_http::Response::empty(tiny_http::StatusCode(101)).with_header(accept_header);
+    let mut stream = incoming.upgrade("websocket", response);
+    serve_ws_events(&session.receiver, &mut stream);
+}
+
+/// 订阅事件循环：从总线取事件编码成文本帧；空闲时发 Ping 探测断线。
+///
+/// 服务端帧不 mask（RFC6455）；写失败即视为客户端断开，句柄 Drop 会自动注销。
+fn serve_ws_events(receiver: &Receiver<SyncEvent>, stream: &mut dyn Write) {
+    loop {
+        match receiver.recv_timeout(SUBSCRIBE_HEARTBEAT) {
+            Ok(event) => {
+                let text = match encode_event_json(&event) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("订阅事件编码失败：{error}");
+                        continue;
+                    }
+                };
+                let frame = match encode_ws_frame(&WsFrame::Text { text, fin: true }, None) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        eprintln!("订阅帧编码失败：{error}");
+                        continue;
+                    }
+                };
+                if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let Ok(ping) = encode_ws_frame(&WsFrame::Ping(Vec::new()), None) else {
+                    break;
+                };
+                if stream.write_all(&ping).is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// 订阅握手失败时回一个最小 400（不影响既有四路由的 wire 错误体）。
+fn respond_bad_request(incoming: tiny_http::Request, reason: String) {
+    let response =
+        tiny_http::Response::from_string(reason).with_status_code(tiny_http::StatusCode(400));
+    if let Err(error) = incoming.respond(response) {
+        eprintln!("写回订阅握手失败响应失败：{error}");
+    }
 }
 
 /// 绑定地址并阻塞服务；生产部署请在前面放反向代理终结 TLS。
@@ -231,6 +403,46 @@ mod tests {
             },
         )))
         .unwrap()
+    }
+
+    #[test]
+    fn subscribe_handshake_is_pure_and_validates_inputs() {
+        let request = UpgradeRequest {
+            method: "GET",
+            path: "/sync/v0/subscribe?workspace=ws-1",
+            upgrade: Some("websocket"),
+            connection: Some("Upgrade"),
+            key: Some("dGhlIHNhbXBsZSBub25jZQ=="),
+            version: Some("13"),
+        };
+        let (workspace, accept) = subscribe_handshake(&request).unwrap();
+        assert_eq!(workspace, "ws-1");
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        let mut bad = request;
+        bad.path = "/sync/v0/hello";
+        assert!(subscribe_handshake(&bad).is_err());
+        let mut bad = request;
+        bad.key = Some("bad");
+        assert!(subscribe_handshake(&bad).is_err());
+    }
+
+    #[test]
+    fn subscribe_event_frame_roundtrip_without_socket() {
+        let event = SyncEvent::WorkspaceChanged {
+            workspaces: vec!["ws-1".into()],
+            doc_ids: vec!["a.md".into()],
+            cursor_hint: Some(7),
+        };
+        let text = encode_event_json(&event).unwrap();
+        let frame = encode_ws_frame(&WsFrame::Text { text, fin: true }, None).unwrap();
+        let (decoded, consumed) = mazha_sync_ws::decode_ws_frame(&frame, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, frame.len());
+        let WsFrame::Text { text, fin: true } = decoded else {
+            panic!("期望完整文本帧");
+        };
+        assert_eq!(mazha_sync_ws::decode_event_json(&text).unwrap(), event);
     }
 
     #[test]

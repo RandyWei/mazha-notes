@@ -1,0 +1,18 @@
+[package]
+name = "mazha-sync-ws"
+description = "码札同步 WebSocket 订阅：阻塞式轻量客户端与纯函数握手/帧编解码，不触碰 SyncTransport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+thiserror = "2"
+
+[lints]
+workspace = true

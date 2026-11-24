@@ -71,14 +71,20 @@ mod media;
 mod oblique;
 mod settings;
 mod sync;
+// D109：假后端/纯函数与跨平台分支主要由单测或非 macOS 构建使用，保留以便契约核对。
+#[allow(dead_code)]
+mod token_store;
 
 use settings::{FONT_STEP, Settings, ThemePreference, clamp_font_size, clamp_mono_font_size};
 // D102：同步线程层与纯函数层；UI 只发命令/收状态，不直接调用 LocalSyncEngine。
 use sync::{
     SYNC_TOKEN_ENV, SyncBanner, SyncBannerAction, SyncBannerKind, SyncChoice, SyncHandle,
     SyncPhase, SyncReply, SyncSetupError, destructive_choice_confirmation_text, doc_id_for_path,
-    forwardable_watch_event, open_provider, resolve_config, spawn_sync, sync_banner,
-    sync_choice_label, sync_status_is_alert, sync_status_text, token_from_env,
+    forwardable_watch_event, open_provider, resolve_config_with_diagnostic, spawn_sync,
+    sync_banner, sync_choice_label, sync_status_is_alert, sync_status_text,
+};
+use token_store::{
+    TokenStore, TokenStoreError, platform_store, resolve_token, token_error_message, validate_token,
 };
 
 /// 未指定文件时的内置示例文档（覆盖主要语法，便于肉眼验收投影渲染）。
@@ -2617,6 +2623,8 @@ enum PaletteAction {
     MoveCurrentFile,
     /// D102：立即同步（只发 `SyncNow`，不自动丢弃 outbox/本地文件）。
     SyncNow,
+    /// D109：从剪贴板读取 token 并存入平台密钥链（覆盖需二次确认）。
+    SetSyncToken,
     SetTheme(ThemePreference),
     CycleUiFont,
     CycleMonoFont,
@@ -2782,6 +2790,24 @@ fn status_bar_hint(
     parts.push(sync_status_text(sync_phase, sync_status));
     alert |= sync_status_is_alert(sync_phase, sync_status);
     (parts.join(" · "), alert)
+}
+
+/// D108/D109：在原状态提示后追加订阅状态与 token 诊断（不改既有测试签名）。
+fn status_bar_hint_with_diagnostics(
+    export: Option<&ExportStatus>,
+    sync_phase: &SyncPhase,
+    sync_status: Option<&LocalSyncStatus>,
+    token_diagnostic: Option<&str>,
+    subscription_status: Option<&str>,
+) -> (String, bool) {
+    let (mut text, alert) = status_bar_hint(export, sync_phase, sync_status);
+    if let Some(diagnostic) = token_diagnostic {
+        text.push_str(&format!(" · {diagnostic}"));
+    }
+    if let Some(status) = subscription_status {
+        text.push_str(&format!(" · {status}"));
+    }
+    (text, alert)
 }
 
 /// 把 Markdown 渲染为所选格式的字节（D82；不含对话框/文件系统写入）。
@@ -3351,6 +3377,10 @@ struct DocView {
     sync_status: Option<LocalSyncStatus>,
     /// 当前同步线程绑定的工作区根（canonicalize 后）。
     sync_root: Option<PathBuf>,
+    /// D109：token 来源的非阻断诊断（平台密钥链不可用/env 回退等）。
+    sync_token_diagnostic: Option<String>,
+    /// D108：订阅连接状态提示（失败时明确告知已回退周期同步）。
+    sync_subscription_status: Option<String>,
     /// S5b：待二次确认的选择（第一次点击只记录，第二次才发命令）。
     sync_pending_choice: Option<SyncChoice>,
     /// S5b：待确认选择的目标文档（跨标签冲突时用于定位正文）。
@@ -3516,6 +3546,8 @@ impl DocView {
             },
             sync_status: None,
             sync_root: None,
+            sync_token_diagnostic: None,
+            sync_subscription_status: None,
             sync_pending_choice: None,
             sync_pending_doc_id: None,
             sync_pending_kind: None,
@@ -5596,6 +5628,7 @@ impl DocView {
             ),
             mk("移动当前文件…", "", MoveCurrentFile),
             mk("立即同步", "", SyncNow),
+            mk("设置同步令牌（从剪贴板）", "", SetSyncToken),
             mk(
                 "主题：跟随系统",
                 theme_hint(ThemePreference::System),
@@ -5707,6 +5740,7 @@ impl DocView {
             ToggleSourceMode => self.toggle_source_mode(cx),
             MoveCurrentFile => self.move_current_file_dialog(window, cx),
             SyncNow => self.request_sync_now(cx),
+            SetSyncToken => self.set_sync_token_from_clipboard(cx),
             SetTheme(preference) => self.set_theme_preference(preference, window, cx),
             CycleUiFont => self.cycle_ui_font(cx),
             CycleMonoFont => self.cycle_mono_font(cx),
@@ -6507,6 +6541,8 @@ impl DocView {
         self.sync_rx = None;
         self.sync_root = None;
         self.sync_status = None;
+        self.sync_token_diagnostic = None;
+        self.sync_subscription_status = None;
         // 引擎已重建，旧横幅的待确认选择不再有效。
         self.clear_sync_pending();
         let Some(root) = root else {
@@ -6526,8 +6562,31 @@ impl DocView {
                 return;
             }
         };
-        let token = token_from_env();
-        let config = match resolve_config(&self.settings, root, token.as_deref()) {
+        // D109：密钥链优先、env 回退；两者都无时沿用 MissingToken 文案。
+        let store = platform_store();
+        let token = match resolve_token(store.as_ref()) {
+            Ok(resolution) => resolution,
+            Err(TokenStoreError::MissingToken) => {
+                self.sync_phase = SyncPhase::NotConfigured {
+                    reason: SyncSetupError::MissingToken.message(),
+                };
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.sync_phase = SyncPhase::NotConfigured {
+                    reason: token_error_message(&error),
+                };
+                cx.notify();
+                return;
+            }
+        };
+        let config = match resolve_config_with_diagnostic(
+            &self.settings,
+            root,
+            Some(&token.token),
+            token.diagnostic.clone(),
+        ) {
             Ok(config) => config,
             Err(error) => {
                 self.sync_phase = SyncPhase::NotConfigured {
@@ -6537,6 +6596,7 @@ impl DocView {
                 return;
             }
         };
+        self.sync_token_diagnostic = config.token_diagnostic.clone();
         // hostname 回退的设备 ID 写回 settings.json，重启后身份保持稳定（D102）。
         if let Some(device_id) = config.generated_device_id.clone() {
             self.settings.sync_device_id = Some(device_id);
@@ -6551,6 +6611,87 @@ impl DocView {
         self.sync_phase = SyncPhase::Idle { last_cursor: 0 };
         self.poll_sync_replies(cx);
         cx.notify();
+    }
+
+    /// D109：从剪贴板读取同步令牌并写入平台密钥链（用户可触达的写入入口）。
+    ///
+    /// 剪贴板文本只在内存中短暂存在，校验通过后立即交给后端；任何状态文案与日志
+    /// 都不包含 token 原文。若后端已有令牌（或读取失败无法判断是否已有），先弹窗二次
+    /// 确认，避免静默覆盖用户既有的凭据。
+    fn set_sync_token_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            self.sync_token_diagnostic = Some("剪贴板中没有可读取的文本".to_owned());
+            cx.notify();
+            return;
+        };
+        let Some(raw) = clipboard.text() else {
+            self.sync_token_diagnostic = Some("剪贴板中没有文本令牌".to_owned());
+            cx.notify();
+            return;
+        };
+        let token = match validate_token(&raw) {
+            Ok(token) => token,
+            Err(error) => {
+                self.sync_token_diagnostic = Some(token_error_message(&error));
+                cx.notify();
+                return;
+            }
+        };
+        let store = platform_store();
+        // 读取失败时也按“可能已有令牌”处理：宁可多问一次，也不静默覆盖旧凭据。
+        let (needs_confirm, read_diagnostic) = match store.get() {
+            Ok(Some(_)) => (true, None),
+            Ok(None) => (false, None),
+            Err(error) => (true, Some(token_error_message(&error))),
+        };
+        if needs_confirm {
+            self.begin_dialog(cx);
+            let description = match read_diagnostic {
+                Some(reason) => format!(
+                    "无法确认密钥链中是否已有令牌（{reason}）。覆盖后旧令牌不可恢复，确认写入剪贴板中的新令牌？"
+                ),
+                None => {
+                    "系统密钥链中已有同步令牌，覆盖后旧令牌不可恢复。确认写入剪贴板中的新令牌？"
+                        .to_owned()
+                }
+            };
+            let dialog = rfd::AsyncMessageDialog::new()
+                .set_title("覆盖同步令牌")
+                .set_description(description)
+                .set_buttons(rfd::MessageButtons::YesNo);
+            cx.spawn(async move |this, cx| {
+                let confirmed = dialog.show().await == rfd::MessageDialogResult::Yes;
+                let _ = this.update(cx, |view, cx| {
+                    view.dialog_open = false;
+                    if confirmed {
+                        view.write_sync_token(store.as_ref(), token, cx);
+                    } else {
+                        view.sync_token_diagnostic = Some("已取消写入同步令牌".to_owned());
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.write_sync_token(store.as_ref(), token, cx);
+        }
+    }
+
+    /// 实际写入 token 并重启同步线程；状态提示只写结果，绝不回显 token。
+    fn write_sync_token(&mut self, store: &dyn TokenStore, token: String, cx: &mut Context<Self>) {
+        match store.set(&token) {
+            Ok(()) => {
+                // 先克隆根路径再调用 &mut self 方法，避免同一表达式里同时借用 self。
+                let root = self.sync_root.clone();
+                self.restart_sync(root.as_deref(), cx);
+                // restart_sync 会重置诊断；成功提示在它之后设置，确保用户看得见。
+                self.sync_token_diagnostic = Some("已存入系统密钥链".to_owned());
+            }
+            Err(error) => {
+                self.sync_token_diagnostic = Some(token_error_message(&error));
+                cx.notify();
+            }
+        }
     }
 
     /// 从同步线程收状态：短间隔轮询 + `WeakView::update` 回写，绝不跨线程改 GPUI 状态。
@@ -6588,6 +6729,8 @@ impl DocView {
 
     /// 应用同步线程回传的阶段/状态/解决结果；`SetupFailed` 视为未配置并释放线程句柄。
     fn apply_sync_replies(&mut self, replies: Vec<SyncReply>, cx: &mut Context<Self>) {
+        // 一批里多条远端提示只合并成一次 SyncNow：绝不逐条覆盖本地/清 outbox。
+        let mut remote_changed = false;
         for reply in replies {
             match reply {
                 SyncReply::Phase(phase) => self.sync_phase = phase,
@@ -6608,7 +6751,24 @@ impl DocView {
                     }
                     self.clear_sync_pending();
                 }
+                SyncReply::RemoteChanged {
+                    workspaces,
+                    doc_ids,
+                    cursor_hint,
+                } => {
+                    // 只展示提示并标脏触发既有 sync_once；不在此处写文档或动 outbox。
+                    let _ = (workspaces, doc_ids, cursor_hint);
+                    remote_changed = true;
+                    self.sync_subscription_status = Some("收到远端变更提示 · 正在同步".to_owned());
+                }
+                SyncReply::SubscriptionFailed(reason) => {
+                    self.sync_subscription_status =
+                        Some(format!("订阅不可用（已回退周期同步）：{reason}"));
+                }
             }
+        }
+        if remote_changed && let Some(handle) = self.sync_handle.as_ref() {
+            handle.sync_now();
         }
         cx.notify();
     }
@@ -8006,10 +8166,12 @@ impl Render for DocView {
                 row.into_any_element()
             });
         // D83 + D102：导出与同步提示在同一提示位拼接，互不覆盖；异常用强调色。
-        let (status_hint, status_hint_alert) = status_bar_hint(
+        let (status_hint, status_hint_alert) = status_bar_hint_with_diagnostics(
             self.export_status.as_ref(),
             &self.sync_phase,
             self.sync_status.as_ref(),
+            self.sync_token_diagnostic.as_deref(),
+            self.sync_subscription_status.as_deref(),
         );
         let status_hint_color = if status_hint_alert {
             palette.accent
