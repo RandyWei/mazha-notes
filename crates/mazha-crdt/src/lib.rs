@@ -15,7 +15,10 @@ mod meta;
 mod roster;
 
 pub use error::{CrdtError, CrdtResult};
-pub use meta::{MetaChange, OpId, RosterMeta, Tombstone, TombstoneReason};
+pub use meta::{
+    DeviceAcks, MetaChange, OpId, RosterMeta, Tombstone, TombstoneArchive, TombstoneGcReport,
+    TombstoneReason,
+};
 pub use roster::{CrdtRoster, DocId};
 
 use yrs::updates::decoder::Decode;

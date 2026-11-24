@@ -75,11 +75,11 @@ pub struct LocalSyncEngine {
     /// 自己写回文件后的字节标记：`Some` 为刚写入的字节，`None` 为刚删除。
     write_marks: BTreeMap<DocId, Option<Vec<u8>>>,
     /// 已显式确认过的冲突副本指纹：`DocId` → 冲突帧字节列表。
-    /// 只有当前墓碑的冲突帧与之一致时才抑制横幅；同一会话内新冲突仍会提示。
-    /// 仅内存有效（重启后指纹丢失，横幅可能重现），不写状态文件。
+    /// 只有当前墓碑的冲突帧与之一致时才抑制横幅；新冲突仍会提示。
+    /// 状态文件 v2 持久化（D107），重启后横幅不重现。
     resolved_conflict_frames: BTreeMap<DocId, Vec<Vec<u8>>>,
     /// 已显式确认过的快照门槛 outbox 指纹（批次 ID 升序集合）。
-    /// 只有当前 outbox 与之一致时才抑制；新批次仍会提示。仅内存有效。
+    /// 只有当前 outbox 与之一致时才抑制；新批次仍会提示。状态文件 v2 持久化。
     resolved_snapshot_batches: Option<BTreeSet<String>>,
     /// 对外状态快照。
     status: LocalSyncStatus,
@@ -123,7 +123,12 @@ impl LocalSyncEngine {
         };
         // 身份类型在此被会话消费；检查点身份从会话自身读取，避免额外克隆。
         let mut session = SyncSession::new(workspace_id, device_id, roster);
+        let mut resolved_conflict_frames = BTreeMap::new();
+        let mut resolved_snapshot_batches = None;
         if let Some(state) = loaded {
+            // v2 指纹在 checkpoint 拿走 outbox 之前取出：重启后立刻抑制已确认横幅（D107）。
+            resolved_conflict_frames = state.resolved_conflict_frames;
+            resolved_snapshot_batches = state.resolved_snapshot_batches;
             // 重启后强制重新握手；会话 ID 只保留诊断，不拿旧会话 ID 去拉增量。
             let checkpoint = SessionCheckpoint {
                 workspace_id: session.workspace_id().as_str().to_owned(),
@@ -140,7 +145,7 @@ impl LocalSyncEngine {
             session.restore_checkpoint(&checkpoint)?;
         }
         let status = LocalSyncStatus {
-            conflict_docs: visible_conflict_docs(&session, &BTreeMap::new()),
+            conflict_docs: visible_conflict_docs(&session, &resolved_conflict_frames),
             ..LocalSyncStatus::default()
         };
         Ok(Self {
@@ -150,8 +155,8 @@ impl LocalSyncEngine {
             coalesce_window,
             dirty: BTreeSet::new(),
             write_marks: BTreeMap::new(),
-            resolved_conflict_frames: BTreeMap::new(),
-            resolved_snapshot_batches: None,
+            resolved_conflict_frames,
+            resolved_snapshot_batches,
             status,
         })
     }
@@ -447,6 +452,8 @@ impl LocalSyncEngine {
             op_clock: checkpoint.op_clock,
             batch_counter: checkpoint.batch_counter,
             outbox: checkpoint.outbox,
+            resolved_conflict_frames: self.resolved_conflict_frames.clone(),
+            resolved_snapshot_batches: self.resolved_snapshot_batches.clone(),
         })
     }
 
@@ -486,8 +493,9 @@ fn outbox_fingerprint(session: &SyncSession) -> Option<BTreeSet<String>> {
 
 /// 仍需在状态中展示的墓碑冲突文档 ID（升序）。
 ///
-/// 墓碑的冲突帧字节列表与已确认指纹完全一致时视为「已解决」，本会话内不再弹横幅；
-/// 帧内容变化（同一文档产生新冲突）则照常提示。指纹只存内存，重启后自然重现。
+/// 墓碑的冲突帧字节列表与已确认指纹完全一致时视为「已解决」，不再弹横幅；
+/// 帧内容变化（同一文档产生新冲突）则照常提示。指纹由状态文件 v2 持久化（D107），
+/// 重启后仍生效。
 fn visible_conflict_docs(
     session: &SyncSession,
     resolved: &BTreeMap<DocId, Vec<Vec<u8>>>,
@@ -879,6 +887,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolved_conflict_fingerprint_survives_reopen() {
+        let (_dir, storage, mut engine, _client) = conflict_fixture();
+        let frames_before = engine.session().roster().tombstones()["a.md"]
+            .conflict_frames()
+            .to_vec();
+        engine
+            .resolve_conflict("a.md", "本地补写", ConflictChoice::UseRemote)
+            .unwrap();
+        assert!(engine.status().conflict_docs.is_empty());
+
+        let persisted = LocalSyncStore::new(Arc::clone(&storage))
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.resolved_conflict_frames.get("a.md"),
+            Some(&frames_before)
+        );
+
+        let (ws, dev) = ids("设备乙");
+        let reopened = LocalSyncEngine::open(Arc::clone(&storage), ws, dev).unwrap();
+        assert!(reopened.session().roster().is_tombstoned("a.md"));
+        assert!(reopened.status().conflict_docs.is_empty());
+    }
+
     /// 非回声观察必须清除旧写入标记：用户改回旧字节时应识别为真实编辑。
     #[test]
     fn stale_write_mark_does_not_swallow_later_revert() {
@@ -1038,7 +1072,8 @@ mod tests {
         a.sync_once(&mut client_a).unwrap();
         let synced_cursor = server.borrow().cursor();
 
-        let mut b = LocalSyncEngine::open(Arc::clone(&storage_b), ws, dev_b).unwrap();
+        let mut b =
+            LocalSyncEngine::open(Arc::clone(&storage_b), ws.clone(), dev_b.clone()).unwrap();
         b.sync_once(&mut client_b).unwrap();
         write_md(storage_b.as_ref(), "a.md", "本地未同步");
         b.handle_watch_events(&[WatchEvent::Modified {
@@ -1055,6 +1090,22 @@ mod tests {
         // outbox 未变，同一门槛不应重复出现。
         assert!(b.sync_once(&mut client_b).is_err());
         assert!(!b.status().needs_confirmation);
+
+        // D107：指纹已写入状态文件 v2，重启后同一门槛仍不重复提示。
+        let persisted = LocalSyncStore::new(Arc::clone(&storage_b))
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(persisted.resolved_snapshot_batches.is_some());
+        let mut reopened =
+            LocalSyncEngine::open(Arc::clone(&storage_b), ws.clone(), dev_b.clone()).unwrap();
+        assert_eq!(
+            reopened.session().pending_batches().len(),
+            b.session().pending_batches().len()
+        );
+        let mut reopened_client = transport(&server, &ws, &dev_b);
+        assert!(reopened.sync_once(&mut reopened_client).is_err());
+        assert!(!reopened.status().needs_confirmation);
     }
 
     #[test]

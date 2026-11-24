@@ -17,6 +17,7 @@
 mod fake;
 mod protocol;
 mod session;
+mod snapshot;
 mod transport;
 pub mod wire;
 
@@ -31,4 +32,5 @@ pub use session::{
     HandshakeOutcome, PendingBatch, PullOutcome, PushOutcome, SessionCheckpoint, SnapshotOutcome,
     SyncOnceOutcome, SyncSession, SyncSessionError,
 };
+pub use snapshot::compact_snapshot_payload;
 pub use transport::{SyncTransport, TransportError};

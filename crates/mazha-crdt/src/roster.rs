@@ -18,7 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use yrs::Update;
 use yrs::updates::decoder::Decode;
 
-use crate::{CrdtDoc, CrdtError, CrdtResult, MetaChange, OpId, RosterMeta, Tombstone};
+use crate::{
+    CrdtDoc, CrdtError, CrdtResult, DeviceAcks, MetaChange, OpId, RosterMeta, Tombstone,
+    TombstoneGcReport,
+};
 
 /// 名册键的类型别名（等价于 [`String`]）。
 ///
@@ -288,6 +291,17 @@ impl CrdtRoster {
     #[must_use]
     pub fn meta_snapshot(&self) -> RosterMeta {
         self.meta.clone()
+    }
+
+    /// 按设备确认收缩名册墓碑副本（S5b 第二批 D105，additive）。
+    ///
+    /// 只委托 [`RosterMeta::gc_tombstones`]；活动文档不受影响，墓碑本体保留以防旧 upsert
+    /// 复活，转储出的副本由报告返回给调用方（服务端落审计归档）。
+    ///
+    /// # Errors
+    /// 任一墓碑非法时返回对应错误，名册不变。
+    pub fn gc_tombstones(&mut self, device_acks: &DeviceAcks) -> CrdtResult<TombstoneGcReport> {
+        self.meta.gc_tombstones(device_acks)
     }
 
     /// 应用一组元数据变更（无内容帧），返回受影响文档 ID（升序）。
@@ -907,6 +921,40 @@ mod tests {
         let frames = &roster.tombstones()["a.md"].conflict_frames();
         assert_eq!(frames.len(), 1);
         assert_eq!(recover(&frames[0]), "离线编辑");
+    }
+
+    #[test]
+    fn gc_tombstones_keeps_tombstone_and_blocks_old_upsert() {
+        let mut roster = CrdtRoster::new();
+        roster.create_from_text("笔记/c.md", "原文").unwrap();
+        roster.remove_with_op("笔记/c.md", op(2, "dev-a")).unwrap();
+
+        let mut acks = DeviceAcks::new();
+        acks.insert("dev-a".to_owned(), op(2, "dev-a"));
+        acks.insert("dev-b".to_owned(), op(5, "dev-b"));
+        let report = roster.gc_tombstones(&acks).unwrap();
+        assert_eq!(report.shrunk().to_vec(), vec!["笔记/c.md".to_owned()]);
+        assert_eq!(report.archived().len(), 1);
+        assert_eq!(recover(&report.archived()[0].frames()[0]), "原文");
+        assert!(roster.is_tombstoned("笔记/c.md"));
+        assert!(
+            roster.tombstones()["笔记/c.md"]
+                .conflict_frames()
+                .is_empty()
+        );
+
+        // 收缩后墓碑的 op_id 仍在：低/等 op_id 的旧 upsert 不得复活，新帧重新成为副本。
+        roster
+            .apply_meta(&[MetaChange::Upsert {
+                doc_id: "笔记/c.md".to_owned(),
+                op_id: op(2, "dev-a"),
+                frame: frame("旧编辑"),
+            }])
+            .unwrap();
+        assert!(!roster.contains("笔记/c.md"));
+        let frames = &roster.tombstones()["笔记/c.md"].conflict_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(recover(&frames[0]), "旧编辑");
     }
 
     #[test]

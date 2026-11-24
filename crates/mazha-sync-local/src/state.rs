@@ -5,15 +5,15 @@
 //! CRC32 助手，但用独立的 `MZLS` magic 与线上 `MZS0` 帧区分。坏文件一律报错，
 //! 不回退空状态（那会丢游标与批次计数器，导致服务端去重吞掉新编辑）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use mazha_crdt::RosterMeta;
+use mazha_crdt::{DocId, RosterMeta};
 use mazha_store::{DocPath, StorageProvider, StoreError};
 use mazha_sync::DocFrameMap;
 use mazha_sync::wire::{
-    WireReader, crc32, put_frame_map, put_meta, put_meta_changes, put_string, put_u8, put_u32,
-    put_u64, read_frame_map, read_meta, read_meta_changes,
+    WireReader, crc32, put_bytes, put_frame_map, put_meta, put_meta_changes, put_string, put_u8,
+    put_u32, put_u64, read_frame_map, read_meta, read_meta_changes,
 };
 use mazha_sync::{BatchId, PendingBatch, SyncCursor};
 
@@ -22,8 +22,11 @@ use crate::error::LocalSyncError;
 /// 状态文件 magic（与线上 `MZS0` 区分）。
 const MAGIC: [u8; 4] = *b"MZLS";
 
-/// 状态文件格式版本：未知版本一律拒绝，不猜测兼容。
-const VERSION: u32 = 1;
+/// 当前状态文件格式版本（S5b 第二批升 v2，追加已确认指纹）。
+const VERSION: u32 = 2;
+
+/// 旧版格式：只含 v1 字段，读取时新字段初始化为空（D107）。
+const VERSION_V1: u32 = 1;
 
 /// 状态文件工作区相对路径。
 fn state_path() -> DocPath {
@@ -55,6 +58,10 @@ pub struct LocalSyncState {
     pub batch_counter: u64,
     /// 未确认出站批次（FIFO 原序）。
     pub outbox: Vec<PendingBatch>,
+    /// 已显式确认的冲突帧指纹：DocId → 冲突帧字节列表（v2 新增，v1 读为空）。
+    pub resolved_conflict_frames: BTreeMap<DocId, Vec<Vec<u8>>>,
+    /// 已显式确认的快照门槛 outbox 批次指纹（v2 新增，v1 读为 None）。
+    pub resolved_snapshot_batches: Option<BTreeSet<String>>,
 }
 
 impl Default for LocalSyncState {
@@ -67,6 +74,8 @@ impl Default for LocalSyncState {
             op_clock: 0,
             batch_counter: 0,
             outbox: Vec::new(),
+            resolved_conflict_frames: BTreeMap::new(),
+            resolved_snapshot_batches: None,
         }
     }
 }
@@ -121,11 +130,16 @@ impl LocalSyncStore {
     }
 }
 
-/// 把状态编码为磁盘字节：头 + 负载 + CRC32（CRC 覆盖除自身外的全部字节）。
+/// 把状态编码为磁盘字节（始终写当前 v2）：头 + 负载 + CRC32。
 fn encode_state(state: &LocalSyncState) -> Vec<u8> {
+    encode_state_version(state, VERSION)
+}
+
+/// 按指定版本编码，供 v1 兼容测试复用同一套字段布局。
+fn encode_state_version(state: &LocalSyncState, version: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    put_u32(&mut out, VERSION);
+    put_u32(&mut out, version);
     put_u64(&mut out, state.last_cursor.get());
     put_u64(&mut out, state.op_clock);
     put_u64(&mut out, state.batch_counter);
@@ -147,6 +161,31 @@ fn encode_state(state: &LocalSyncState) -> Vec<u8> {
         put_string(&mut out, batch_id.as_str());
         put_frame_map(&mut out, &frames);
         put_meta_changes(&mut out, &changes);
+    }
+
+    // v2 新字段：已确认指纹，均受末尾 CRC 覆盖；v1 不写这两段。
+    if version >= VERSION {
+        put_u32(
+            &mut out,
+            u32::try_from(state.resolved_conflict_frames.len()).unwrap_or(u32::MAX),
+        );
+        for (doc_id, frames) in &state.resolved_conflict_frames {
+            put_string(&mut out, doc_id);
+            put_u32(&mut out, u32::try_from(frames.len()).unwrap_or(u32::MAX));
+            for frame in frames {
+                put_bytes(&mut out, frame);
+            }
+        }
+        match &state.resolved_snapshot_batches {
+            None => put_u8(&mut out, 0),
+            Some(batches) => {
+                put_u8(&mut out, 1);
+                put_u32(&mut out, u32::try_from(batches.len()).unwrap_or(u32::MAX));
+                for batch in batches {
+                    put_string(&mut out, batch);
+                }
+            }
+        }
     }
     let checksum = crc32(&out);
     put_u32(&mut out, checksum);
@@ -194,7 +233,8 @@ fn decode_state(bytes: &[u8]) -> Result<LocalSyncState, LocalSyncError> {
         ));
     }
     let version = reader.read_u32()?;
-    if version != VERSION {
+    // v1 文件缺新增两段，读为空指纹即可平滑升级；未知版本仍拒绝。
+    if version != VERSION && version != VERSION_V1 {
         return Err(LocalSyncError::CorruptState(format!(
             "不支持的状态文件版本：{version}"
         )));
@@ -224,6 +264,37 @@ fn decode_state(bytes: &[u8]) -> Result<LocalSyncState, LocalSyncError> {
         let changes = read_meta_changes(&mut reader)?;
         outbox.push(PendingBatch::new(batch_id, batch_frames, changes));
     }
+
+    let mut resolved_conflict_frames = BTreeMap::new();
+    let mut resolved_snapshot_batches = None;
+    if version >= VERSION {
+        let doc_count = read_count(&mut reader)?;
+        for _ in 0..doc_count {
+            let doc_id = reader.read_string()?;
+            let frame_count = read_count(&mut reader)?;
+            let mut frames = Vec::with_capacity(frame_count);
+            for _ in 0..frame_count {
+                frames.push(reader.read_bytes()?.to_vec());
+            }
+            resolved_conflict_frames.insert(doc_id, frames);
+        }
+        resolved_snapshot_batches = match reader.read_u8()? {
+            0 => None,
+            1 => {
+                let count = read_count(&mut reader)?;
+                let mut batches = BTreeSet::new();
+                for _ in 0..count {
+                    batches.insert(reader.read_string()?);
+                }
+                Some(batches)
+            }
+            other => {
+                return Err(LocalSyncError::CorruptState(format!(
+                    "已确认快照批次标志非法：{other}"
+                )));
+            }
+        };
+    }
     reader.ensure_finished()?;
     Ok(LocalSyncState {
         frames,
@@ -233,6 +304,8 @@ fn decode_state(bytes: &[u8]) -> Result<LocalSyncState, LocalSyncError> {
         op_clock,
         batch_counter,
         outbox,
+        resolved_conflict_frames,
+        resolved_snapshot_batches,
     })
 }
 
@@ -275,6 +348,13 @@ mod tests {
             op_clock: 7,
             batch_counter: 1,
             outbox: vec![batch],
+            resolved_conflict_frames: BTreeMap::from([(
+                "旧.md".to_owned(),
+                vec![CrdtDoc::from_text("已确认副本").encode_update()],
+            )]),
+            resolved_snapshot_batches: Some(BTreeSet::from([
+                "设备甲-00000000000000000000".to_owned()
+            ])),
         }
     }
 
@@ -298,7 +378,7 @@ mod tests {
         ));
 
         let mut bad_version = good.clone();
-        bad_version[4..8].copy_from_slice(&2u32.to_le_bytes());
+        bad_version[4..8].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             decode_state(&bad_version),
             Err(LocalSyncError::CorruptState(_))
@@ -315,6 +395,26 @@ mod tests {
         let truncated = &good[..good.len() - 1];
         assert!(matches!(
             decode_state(truncated),
+            Err(LocalSyncError::CorruptState(_))
+        ));
+    }
+
+    #[test]
+    fn v1_state_is_readable_with_empty_fingerprints() {
+        let state = rich_state();
+        let bytes = encode_state_version(&state, VERSION_V1);
+        let decoded = decode_state(&bytes).unwrap();
+        let mut expected = state;
+        expected.resolved_conflict_frames.clear();
+        expected.resolved_snapshot_batches = None;
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn unknown_version_with_valid_crc_is_rejected() {
+        let bytes = encode_state_version(&rich_state(), 3);
+        assert!(matches!(
+            decode_state(&bytes),
             Err(LocalSyncError::CorruptState(_))
         ));
     }

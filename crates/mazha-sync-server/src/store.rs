@@ -9,18 +9,22 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mazha_crdt::RosterMeta;
+use mazha_crdt::{OpId, RosterMeta, TombstoneArchive};
 use mazha_sync::wire::{
-    MAX_FRAME_BYTES, WireError, WireReader, crc32, put_frame_map, put_meta, put_meta_changes,
-    put_string, put_u32, put_u64, read_frame_map, read_meta, read_meta_changes,
+    MAX_FRAME_BYTES, WireError, WireReader, crc32, put_bytes, put_frame_map, put_meta,
+    put_meta_changes, put_op_id, put_string, put_u32, put_u64, read_frame_map, read_meta,
+    read_meta_changes, read_op_id,
 };
 use mazha_sync::{BatchId, DeviceId, DocFrameMap, SyncCursor, WorkspaceId};
 
 /// 磁盘状态文件 magic：与线上帧的 `MZS0` 区分，避免误把状态当同步帧解码。
 const STATE_MAGIC: [u8; 4] = *b"MZWS";
 
-/// 磁盘格式版本，与线上 `WIRE_VERSION` 独立演进。
-const STATE_FORMAT_VERSION: u32 = 1;
+/// 磁盘格式版本，与线上 `WIRE_VERSION` 独立演进（S5b 第二批升 v2）。
+const STATE_FORMAT_VERSION: u32 = 2;
+
+/// 旧版磁盘格式：只含 v1 字段，读取时把新增字段初始化为空（D105）。
+const STATE_FORMAT_VERSION_V1: u32 = 1;
 
 /// 持久化错误：IO、字节格式与 CRC 分层，便于上层映射为 `Internal`。
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +80,10 @@ pub struct WorkspaceState {
     pub log: Vec<LogEntry>,
     /// 已应用批次 → 首次 ack 游标。
     pub dedup: BTreeMap<(DeviceId, BatchId), SyncCursor>,
+    /// 设备 → 已确认的最高操作 ID（D105，v2 新增；v1 读为空）。
+    pub device_acks: BTreeMap<DeviceId, OpId>,
+    /// 墓碑 GC 转储出的可恢复归档（D105，v2 新增；v1 读为空）。
+    pub gc_archive: Vec<TombstoneArchive>,
 }
 
 impl Default for WorkspaceState {
@@ -88,6 +96,8 @@ impl Default for WorkspaceState {
             meta: RosterMeta::new(),
             log: Vec::new(),
             dedup: BTreeMap::new(),
+            device_acks: BTreeMap::new(),
+            gc_archive: Vec::new(),
         }
     }
 }
@@ -164,11 +174,16 @@ impl SyncStore for FileSyncStore {
     }
 }
 
-/// 把工作区状态编码为磁盘字节：`magic | version | 字段 | CRC32`。
+/// 把工作区状态编码为磁盘字节：`magic | version | 字段 | CRC32`（始终写当前 v2）。
 fn encode_state(state: &WorkspaceState) -> Result<Vec<u8>, StoreError> {
+    encode_state_version(state, STATE_FORMAT_VERSION)
+}
+
+/// 按指定版本编码，供 v1 兼容测试复用同一套字段布局。
+fn encode_state_version(state: &WorkspaceState, version: u32) -> Result<Vec<u8>, StoreError> {
     let mut out = Vec::new();
     out.extend_from_slice(&STATE_MAGIC);
-    put_u32(&mut out, STATE_FORMAT_VERSION);
+    put_u32(&mut out, version);
     put_u64(&mut out, state.cursor.get());
     put_u64(&mut out, state.log_floor.get());
     put_u64(&mut out, state.session_counter);
@@ -193,6 +208,33 @@ fn encode_state(state: &WorkspaceState) -> Result<Vec<u8>, StoreError> {
         put_u64(&mut out, cursor.get());
     }
 
+    // v2 新字段：设备确认与 GC 归档，均受末尾 CRC 覆盖；v1 不包含这两段。
+    if version >= STATE_FORMAT_VERSION {
+        put_u32(
+            &mut out,
+            u32::try_from(state.device_acks.len()).unwrap_or(u32::MAX),
+        );
+        for (device, ack) in &state.device_acks {
+            put_string(&mut out, device.as_str());
+            put_op_id(&mut out, ack);
+        }
+        put_u32(
+            &mut out,
+            u32::try_from(state.gc_archive.len()).unwrap_or(u32::MAX),
+        );
+        for archive in &state.gc_archive {
+            put_string(&mut out, archive.doc_id());
+            put_op_id(&mut out, archive.op_id());
+            put_u32(
+                &mut out,
+                u32::try_from(archive.frames().len()).unwrap_or(u32::MAX),
+            );
+            for frame in archive.frames() {
+                put_bytes(&mut out, frame);
+            }
+        }
+    }
+
     if out.len() > MAX_FRAME_BYTES {
         return Err(StoreError::TooLarge);
     }
@@ -215,7 +257,8 @@ fn decode_state(bytes: &[u8]) -> Result<WorkspaceState, StoreError> {
             .try_into()
             .map_err(|_| StoreError::Truncated)?,
     );
-    if version != STATE_FORMAT_VERSION {
+    // v1 文件没有新字段，读为空值即可平滑升级；其余未知版本照旧拒绝。
+    if version != STATE_FORMAT_VERSION && version != STATE_FORMAT_VERSION_V1 {
         return Err(StoreError::UnsupportedFormat(version));
     }
     let body_end = bytes.len() - 4;
@@ -253,6 +296,38 @@ fn decode_state(bytes: &[u8]) -> Result<WorkspaceState, StoreError> {
         let cursor = SyncCursor::new(reader.read_u64()?);
         dedup.insert((device, batch), cursor);
     }
+
+    let mut device_acks = BTreeMap::new();
+    let mut gc_archive = Vec::new();
+    if version >= STATE_FORMAT_VERSION {
+        let ack_count = read_bounded_count(&mut reader)?;
+        for _ in 0..ack_count {
+            let device = DeviceId::new(reader.read_string()?)
+                .map_err(|_| StoreError::Wire(WireError::InvalidId { field: "device_id" }))?;
+            let ack = read_op_id(&mut reader)?;
+            // ack 的 device 必须与键一致，否则 GC 无法把它当作该设备的确认。
+            if ack.device() != device.as_str() {
+                return Err(StoreError::Wire(WireError::InvalidId {
+                    field: "device_id",
+                }));
+            }
+            device_acks.insert(device, ack);
+        }
+
+        let archive_count = read_bounded_count(&mut reader)?;
+        for _ in 0..archive_count {
+            let doc_id = reader.read_string()?;
+            let op_id = read_op_id(&mut reader)?;
+            let frame_count = read_bounded_count(&mut reader)?;
+            let mut frames = Vec::with_capacity(frame_count);
+            for _ in 0..frame_count {
+                frames.push(reader.read_bytes()?.to_vec());
+            }
+            let archive = TombstoneArchive::new(doc_id, op_id, frames)
+                .map_err(|error| StoreError::Wire(WireError::InvalidFrame(error.to_string())))?;
+            gc_archive.push(archive);
+        }
+    }
     reader.ensure_finished()?;
     Ok(WorkspaceState {
         cursor,
@@ -262,6 +337,8 @@ fn decode_state(bytes: &[u8]) -> Result<WorkspaceState, StoreError> {
         meta,
         log,
         dedup,
+        device_acks,
+        gc_archive,
     })
 }
 
@@ -324,6 +401,8 @@ mod tests {
                 meta_changes: vec![MetaChange::Tombstone(tombstone)],
             }],
             dedup,
+            device_acks: BTreeMap::new(),
+            gc_archive: Vec::new(),
         }
     }
 
@@ -368,6 +447,48 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         assert!(matches!(store.load(&workspace), Err(StoreError::BadCrc)));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v1_state_is_readable_with_empty_gc_fields() {
+        let state = sample_state();
+        // 用同一套字段布局编码成 v1（不含新字段），验证平滑升级。
+        let bytes = encode_state_version(&state, STATE_FORMAT_VERSION_V1).unwrap();
+        let decoded = decode_state(&bytes).unwrap();
+        let mut expected = state;
+        expected.device_acks.clear();
+        expected.gc_archive.clear();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn v2_state_roundtrips_device_acks_and_gc_archive() {
+        let mut state = sample_state();
+        state.device_acks.insert(
+            DeviceId::new("设备-B").unwrap(),
+            OpId::new(9, "设备-B").unwrap(),
+        );
+        state.gc_archive.push(
+            TombstoneArchive::new(
+                "笔记/归档.md".to_owned(),
+                OpId::new(4, "设备-B").unwrap(),
+                vec![frame("可恢复副本"), frame("另一份副本")],
+            )
+            .unwrap(),
+        );
+
+        let bytes = encode_state(&state).unwrap();
+        assert_eq!(&bytes[4..8], &STATE_FORMAT_VERSION.to_le_bytes());
+        assert_eq!(decode_state(&bytes).unwrap(), state);
+    }
+
+    #[test]
+    fn unknown_disk_version_is_rejected() {
+        let bytes = encode_state_version(&WorkspaceState::default(), 3).unwrap();
+        assert!(matches!(
+            decode_state(&bytes),
+            Err(StoreError::UnsupportedFormat(3))
+        ));
     }
 
     #[test]

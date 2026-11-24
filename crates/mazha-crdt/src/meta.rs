@@ -6,7 +6,7 @@
 //!
 //! 参见 `SPEC.md` §6.5、§14 D95/D98。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use yrs::Update;
 use yrs::updates::decoder::Decode;
@@ -281,6 +281,142 @@ impl RosterMeta {
     pub(crate) fn remove(&mut self, id: &str) {
         self.tombstones.remove(id);
     }
+
+    /// 按设备确认安全收缩墓碑副本（S5b 第二批 D105，additive）。
+    ///
+    /// 已知设备是确认表键与全部墓碑来源设备的并集；只有每个已知设备都有与键匹配的
+    /// ack，且 `ack >= tombstone.op_id`（`(clock, device)` 全序）时，该墓碑才允许收缩。
+    /// 收缩只把 `conflict_frames` 移入归档并清空，墓碑本身与 `op_id` 永久保留，避免旧
+    /// upsert 复活已删文档。缺确认/确认落后/确认表为空一律跳过；副本已空的墓碑不重复归档。
+    ///
+    /// # Errors
+    /// 任一墓碑自身非法时返回对应错误，且不改动任何墓碑。
+    pub fn gc_tombstones(&mut self, device_acks: &DeviceAcks) -> CrdtResult<TombstoneGcReport> {
+        let mut report = TombstoneGcReport::default();
+        // 没有墓碑或没有任何确认时没有可安全收缩的材料，直接返回空报告。
+        if self.tombstones.is_empty() || device_acks.is_empty() {
+            return Ok(report);
+        }
+        // 先整表校验，避免部分墓碑已归档后才发现坏数据。
+        for tombstone in self.tombstones.values() {
+            tombstone.validate()?;
+        }
+
+        // 确认表可能在历史同步中遗漏设备；用并集可阻止"少一台设备确认就 GC"的误判。
+        let mut known_devices: BTreeSet<String> = device_acks.keys().cloned().collect();
+        for tombstone in self.tombstones.values() {
+            known_devices.insert(tombstone.op_id().device().to_owned());
+        }
+
+        for (doc_id, tombstone) in &mut self.tombstones {
+            // 逐墓碑判断：较旧墓碑仍可在新墓碑尚未被所有设备确认时安全归档。
+            // ack 的 device 必须与键一致，否则视为该设备未确认。
+            let fully_acked = known_devices.iter().all(|device| {
+                device_acks
+                    .get(device)
+                    .filter(|ack| ack.device() == device.as_str())
+                    .is_some_and(|ack| ack >= tombstone.op_id())
+            });
+            if !fully_acked || tombstone.conflict_frames.is_empty() {
+                continue;
+            }
+            // 先整体移出副本作为可恢复归档，再清空墓碑副本；墓碑的 op_id/reason 不变。
+            report.archived.push(TombstoneArchive {
+                doc_id: doc_id.clone(),
+                op_id: tombstone.op_id().clone(),
+                frames: std::mem::take(&mut tombstone.conflict_frames),
+            });
+            report.shrunk.push(doc_id.clone());
+        }
+        Ok(report)
+    }
+}
+
+/// 设备确认表：设备标识 → 该设备已确认的最高操作 ID（D105）。
+///
+/// 只记录同步进度，不推测缺失设备的确认；键必须与 `OpId.device()` 一致才算有效 ack。
+pub type DeviceAcks = BTreeMap<String, OpId>;
+
+/// 墓碑冲突副本的可恢复归档（D105）。
+///
+/// GC 前先把墓碑的全部副本帧转储到这里返回给调用方（服务端落 `gc_archive`），
+/// 之后墓碑只保留最小摘要；任取一帧应用到空 [`crate::CrdtDoc`] 仍可恢复历史文本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TombstoneArchive {
+    /// 被删除的文档 ID。
+    doc_id: DocId,
+    /// 触发该墓碑的操作 ID，保留用于防止旧 upsert 复活。
+    op_id: OpId,
+    /// 归档的可恢复副本帧（按字节排序去重）。
+    frames: Vec<Vec<u8>>,
+}
+
+impl TombstoneArchive {
+    /// 构造归档记录并校验文档 ID 与每帧可解码（反序列化入口）。
+    ///
+    /// # Errors
+    /// ID 非法返回 [`CrdtError::InvalidDocumentId`]；任一帧不是合法 Yjs v1 帧返回
+    /// [`CrdtError::InvalidConflictFrame`]。
+    pub fn new(doc_id: DocId, op_id: OpId, frames: Vec<Vec<u8>>) -> CrdtResult<Self> {
+        validate_id(&doc_id)?;
+        for frame in &frames {
+            validate_conflict_frame(&doc_id, frame)?;
+        }
+        Ok(Self {
+            doc_id,
+            op_id,
+            frames,
+        })
+    }
+
+    /// 文档 ID。
+    #[must_use]
+    pub fn doc_id(&self) -> &str {
+        &self.doc_id
+    }
+
+    /// 墓碑操作 ID。
+    #[must_use]
+    pub fn op_id(&self) -> &OpId {
+        &self.op_id
+    }
+
+    /// 归档的可恢复副本帧。
+    #[must_use]
+    pub fn frames(&self) -> &[Vec<u8>] {
+        &self.frames
+    }
+}
+
+/// 一次墓碑 GC 的结果（D105）。
+///
+/// `shrunk` 是被收缩的文档 ID，`archived` 是对应的可恢复副本归档；两者顺序一致。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TombstoneGcReport {
+    /// 已清空副本帧的墓碑对应文档 ID（升序，与 `archived` 一一对应）。
+    shrunk: Vec<DocId>,
+    /// 从墓碑转储出的可恢复归档。
+    archived: Vec<TombstoneArchive>,
+}
+
+impl TombstoneGcReport {
+    /// 被收缩的文档 ID 列表。
+    #[must_use]
+    pub fn shrunk(&self) -> &[DocId] {
+        &self.shrunk
+    }
+
+    /// 归档记录列表。
+    #[must_use]
+    pub fn archived(&self) -> &[TombstoneArchive] {
+        &self.archived
+    }
+
+    /// 本次 GC 是否没有任何变化。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.shrunk.is_empty() && self.archived.is_empty()
+    }
 }
 
 /// 元数据变更：一条删除墓碑，或一次同路径 upsert（D98）。
@@ -497,6 +633,96 @@ mod tests {
             Err(CrdtError::InvalidConflictFrame { .. })
         ));
         assert!(meta.get("a.md").unwrap().conflict_frames().is_empty());
+    }
+
+    #[test]
+    fn gc_tombstones_archives_frames_while_keeping_minimal_tombstone() {
+        let mut meta = RosterMeta::new();
+        meta.merge_tombstone(
+            Tombstone::new("a.md", OpId::new(2, "dev-a").unwrap())
+                .unwrap()
+                .with_reason(TombstoneReason::RenameSource)
+                .with_conflict_frame(text_frame("归档 A"))
+                .unwrap(),
+        )
+        .unwrap();
+        meta.merge_tombstone(
+            Tombstone::new("笔记/b.md", OpId::new(3, "dev-b").unwrap())
+                .unwrap()
+                .with_conflict_frame(text_frame("归档 B"))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut acks = DeviceAcks::new();
+        // 全序含 device tie-break：dev-a 的 ack 需严格更高 clock 才能越过 dev-b 的墓碑。
+        acks.insert("dev-a".to_owned(), OpId::new(4, "dev-a").unwrap());
+        // 相等 op_id 也应算已确认（全序比较包含等于）。
+        acks.insert("dev-b".to_owned(), OpId::new(3, "dev-b").unwrap());
+
+        let report = meta.gc_tombstones(&acks).unwrap();
+        assert_eq!(
+            report.shrunk().to_vec(),
+            vec!["a.md".to_owned(), "笔记/b.md".to_owned()]
+        );
+        assert_eq!(report.archived().len(), 2);
+        assert!(!report.is_empty());
+        for archive in report.archived() {
+            assert_eq!(archive.frames().len(), 1);
+            let mut restored = CrdtDoc::new();
+            restored.apply_update(&archive.frames()[0]).unwrap();
+            let expected = if archive.doc_id() == "a.md" {
+                "归档 A"
+            } else {
+                "归档 B"
+            };
+            assert_eq!(restored.text(), expected);
+        }
+        // 墓碑本体永久保留，op_id/reason 不变，仅副本被清空。
+        let a = meta.get("a.md").unwrap();
+        assert_eq!(a.op_id(), &OpId::new(2, "dev-a").unwrap());
+        assert_eq!(a.reason(), TombstoneReason::RenameSource);
+        assert!(a.conflict_frames().is_empty());
+        assert!(meta.get("笔记/b.md").unwrap().conflict_frames().is_empty());
+        // 重复调用不产生新归档（幂等）。
+        assert!(meta.gc_tombstones(&acks).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_tombstones_skips_when_any_device_lacks_valid_ack() {
+        let mut meta = RosterMeta::new();
+        meta.merge_tombstone(
+            Tombstone::new("a.md", OpId::new(2, "dev-a").unwrap())
+                .unwrap()
+                .with_conflict_frame(text_frame("离线编辑"))
+                .unwrap(),
+        )
+        .unwrap();
+        let frame_before = meta.get("a.md").unwrap().conflict_frames().to_vec();
+
+        // 确认表为空：即使墓碑来源设备可见也不能猜测确认。
+        assert!(meta.gc_tombstones(&DeviceAcks::new()).unwrap().is_empty());
+        assert_eq!(meta.get("a.md").unwrap().conflict_frames(), frame_before);
+
+        // 只有 dev-b 确认：墓碑来源 dev-a 仍缺 ack。
+        let mut acks = DeviceAcks::new();
+        acks.insert("dev-b".to_owned(), OpId::new(5, "dev-b").unwrap());
+        assert!(meta.gc_tombstones(&acks).unwrap().is_empty());
+
+        // dev-a 的 ack 落后：跳过。
+        acks.insert("dev-a".to_owned(), OpId::new(1, "dev-a").unwrap());
+        assert!(meta.gc_tombstones(&acks).unwrap().is_empty());
+
+        // ack 的 device 与键不匹配：视为未确认。
+        acks.insert("dev-a".to_owned(), OpId::new(9, "dev-x").unwrap());
+        assert!(meta.gc_tombstones(&acks).unwrap().is_empty());
+        assert_eq!(meta.get("a.md").unwrap().conflict_frames(), frame_before);
+
+        // 补齐匹配的 ack 后才收缩。
+        acks.insert("dev-a".to_owned(), OpId::new(9, "dev-a").unwrap());
+        let report = meta.gc_tombstones(&acks).unwrap();
+        assert_eq!(report.shrunk().to_vec(), vec!["a.md".to_owned()]);
+        assert_eq!(report.archived()[0].frames(), frame_before);
     }
 
     #[test]

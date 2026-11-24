@@ -1,9 +1,12 @@
 # 码札（Mazha）同步 SPEC 草案
 
-> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）；S5a 桌面接入第一批契约已定并实现（D102，见 §5.10 / §9.6 / §11.4）；S5b 第一批（增量 Document patch + 合并/覆盖交互）契约已定并实现（D103/D104，见 §5.11 / §9.7 / §11.5）**  
-> 日期：2026-11-24  
-> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D104；`HANDOFF.md` 下一步 S5b 第二批  
-> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录，S5a 桌面周期/手动同步与状态/冲突提示由 D102 与本文件 §5.10 / §9.6 / §11.4 记录，S5b 第一批的增量 patch 与显式合并/覆盖交互由 D103/D104 与本文件 §5.11 / §9.7 / §11.5 记录。S5b 第二批（WS 订阅、快照压缩、墓碑 GC、平台安全存储）仍待实现。
+> 状态：**S0 方向已确认（D95-D97）；S1 纯模型已实现（D98）；S2 协议/会话/假 transport 契约已定并实现（D99，见 §5.7 / §6.4）；S3 线上字节编码/持久化服务端/真实 HTTP 传输已实现（D100，见 §5.8 / §7.4 / §9.4）；S4 本地工作区同步编排契约已定并实现（D101，见 §5.9 / §9.5 / §11.3）；S5a 桌面接入第一批契约已定并实现（D102，见 §5.10 / §9.6 / §11.4）；S5b 第一批（增量 Document patch + 合并/覆盖交互）契约已定并实现（D103/D104，见 §5.11 / §9.7 / §11.5）；S5b 第二批本批（墓碑 GC + 快照压缩 + 已确认状态持久化）契约已定并实现（D105/D106/D107，见 §5.12 / §5.8.5 / §7.4.5）**
+>
+> 日期：2026-11-24
+>
+> 关联：`SPEC.md` §4.3、§5、§6.2、§6.5、§10 Phase 5、§14 D24/D91-D107；`HANDOFF.md` 下一步 S5b 第三批（WS 订阅 + 平台安全存储）
+>
+> 目标：为“服务端/传输与跨设备删除墓碑”提供独立设计边界；本文不替代 `SPEC.md`（单一事实来源），S0 已确认的高优先级项由 D95-D97 记录，S1 数据结构契约由 D98 与 `SPEC.md` §6.5 记录，S2 内存协议/会话契约由 D99 与本文件 §5.7 / §6.4 记录，S3 线上字节编码/持久化服务端/真实 HTTP 传输由 D100 与本文件 §5.8 / §7.4 / §9.4 记录，S4 本地文件⇄名册编排与本地持久化由 D101 与本文件 §5.9 / §9.5 记录，S5a 桌面周期/手动同步与状态/冲突提示由 D102 与本文件 §5.10 / §9.6 / §11.4 记录，S5b 第一批的增量 patch 与显式合并/覆盖交互由 D103/D104 与本文件 §5.11 / §9.7 / §11.5 记录。S5b 第二批本批的墓碑 GC（D105）、快照压缩（D106）与已确认状态持久化（D107）见 §5.12 / §5.8.5 / §7.4.5；**WebSocket 订阅与平台安全存储仍留第三批**。
 
 ---
 
@@ -211,7 +214,7 @@ Tombstone {
 
 - `reason` 只用于诊断/UI 文案（D95 的重命名按“删旧建新”落为 `rename-source`），**不参与收敛判断**；纯模型不存墙钟时间，展示用时间由 S2 同步信封携带。
 - `conflict_frames` 是 D95 “禁止静默丢数据”的落地：每个元素是一份**自包含的 Yjs v1 全量更新帧**（由 `CrdtDoc::encode_update()` 产出），代表一份被墓碑取代但必须可恢复的本地副本。来源包括：本机墓碑化删除时被移除的文档内容、墓碑 wins 时被忽略的离线编辑内容帧、被拒绝的低/等 `op_id` upsert 的帧。任取一帧应用到空 `CrdtDoc` 即可还原当时文本。
-- 帧列表按字节字典序**排序 + 去重**，因此不同投递顺序的多端副本合并结果一致；每帧在构造/合并时校验可解码，坏帧使整批拒绝、零改动。MVP 不做墓碑 GC（D95/S-04），故帧只增不减地归并。
+- 帧列表按字节字典序**排序 + 去重**，因此不同投递顺序的多端副本合并结果一致；每帧在构造/合并时校验可解码，坏帧使整批拒绝、零改动。MVP 不 GC；S5b 第二批由 D105 定义**安全收缩**：只在所有已知设备确认越过墓碑 `op_id` 后把副本帧转储给调用方，墓碑最小摘要（含 `op_id`）永久保留，低 `op_id` 旧 upsert 仍不得复活。
 - 更高 `op_id` 的墓碑覆盖旧墓碑时，**必须归并双方的 `conflict_frames`**，不得因“胜出”丢弃旧墓碑已保存的副本。
 
 #### 4.5.3 `RosterMeta` 与确定性合并
@@ -465,6 +468,29 @@ MetaChange =
 - 严格拒绝：未知版本、未知 kind、截断帧、坏 CRC、坏 UTF-8、越界长度、非规范枚举值；
   解码失败不返回任何半构造的 `SyncMessage`。
 
+#### 5.8.5 SnapshotPayload 的 CRDT 级压缩（D106 / 0.1.127）
+
+> 压缩只作用于**快照引导**路径，不进入九种消息、wire `MZS0` 帧头/body 编码或普通
+> 增量 `pull`。不新增外部依赖（评估过 `flate2`：虽已在依赖树中，但字节级 gzip 会
+> 改变载荷语义且旧解码器无法直接消费；复用 `CrdtDoc::snapshot()` 更贴合 Yjs 帧契约）。
+
+- **层级与入口**：纯函数位于 `mazha-sync/src/snapshot.rs`：
+  `compact_snapshot_payload(&SnapshotPayload) -> CrdtResult<SnapshotPayload>`。
+  入参/出参仍是 §5.7.1 定义的 `SnapshotPayload`（`frames` + `meta` + `cursor`），
+  只把 `frames` 中每篇文档的历史收敛到 O(文本长度)，`meta` 与 `cursor` 语义不变。
+  服务端 `SyncService::snapshot_request` 在返回前调用它，使新设备引导拿到压缩快照；
+  `SyncService::compact_snapshot` 是显式维护入口（不写回服务端历史帧）。
+- **算法**：在**新的空 `CrdtRoster`** 上用 `apply_updates_with_meta(frames, meta_change)` 一次提交
+  （与 §5.7.3 同一原子边界，坏帧整批拒绝），再 `snapshot()` 清 CRDT 历史，最后
+  `encode_diff_with_meta(&BTreeMap::new())` 得到全量帧与元数据。任何一步失败都只返回错误，
+  入参不可变、零改动；不读系统时钟、不碰 IO/GUI/async。
+- **兼容边界**：压缩后的帧仍是标准 Yjs v1 全量帧，`CrdtDoc::apply_update` 可直接恢复文本；
+  客户端快照应用仍走 `apply_updates_with_meta` 在空名册上替换（D99），压缩帧**绝不**
+  作为增量 pull 帧应用到已有名册（新 CRDT 身份会导致文本重复）。墓碑元数据原样携带，
+  被墓碑挡下的内容帧继续并入 `conflict_frames`（D95 不静默丢数据）。
+- **单测**：CJK/emoji 文本 roundtrip、压缩帧显著小于历史帧、压缩后继续编辑再同步收敛、
+  坏帧返回错误且输入不变。
+
 ---
 
 ### 5.9 S4 本地工作区同步编排契约（已定，D101 / 0.1.124）
@@ -679,10 +705,10 @@ MetaChange =
 - `resolve_conflict` / `resolve_snapshot_confirmation` 返回 `ResolveOutcome`，其中
   `document_text: Option<String>` 交给桌面通过既有本地保存路径写回；引擎不依赖
   `mazha-core`、不直接操作已打开的 `Document`。
-- 已确认状态仅存于内存：引擎为冲突副本保存“帧字节指纹”、为快照门槛保存
+- 已确认状态在本批仅存于内存：引擎为冲突副本保存“帧字节指纹”、为快照门槛保存
   “outbox 批次 ID 指纹”，只有材料完全一致时同一会话内才抑制重复横幅；新冲突/
-  新批次照常提示。指纹不写入 `.mazha/sync-state.bin`，重启后横幅可能重现；
-  持久化确认状态留 S5b 第二批，本批不引入新的状态文件字段。
+  新批次照常提示。本批不引入新的状态文件字段，重启后横幅可能重现；
+  **S5b 第二批 D107 已把这两份指纹写入 `.mazha/sync-state.bin` v2（见 §5.12.2）**。
 
 #### 5.11.3 桌面交互入口（D104）
 
@@ -697,6 +723,59 @@ MetaChange =
   经 `SyncReply::Resolved { doc_id, outcome }` 回传；主线程在 `apply_sync_replies` 中
   按工作区根校验写回路径、应用 `document_text` 到对应标签并刷新状态栏/横幅，写盘失败
   时保留内存文档并提示失败。
+
+---
+
+### 5.12 S5b 第二批本批契约：墓碑 GC / 快照压缩 / 已确认状态持久化（D105/D106/D107 / 0.1.127）
+
+> 本批只做三项：**墓碑 GC（D105）**、**快照压缩（D106，见 §5.8.5）**、
+> **已确认状态持久化（D107）**。WebSocket 订阅与平台安全存储由第三批处理，桌面 UI
+> 与 D95–D104 的既有签名/语义零改动；核心 crate 仍无 GUI/网络/async，不新增依赖。
+
+#### 5.12.1 墓碑 GC 的安全边界（D105）
+
+- **问题**：`Tombstone.conflict_frames` 是 D95「禁止静默丢数据」的保底，随删除/冲突不断
+  增长；但过早删除墓碑会让旧 upsert 复活已删文档，直接丢帧又会静默丢数据。
+- **决策**：采用**“先转储、再收缩、保留最小墓碑”**，不做整条墓碑删除：
+  1. 纯 Rust 类型 `DeviceAcks = BTreeMap<String, OpId>`（设备 → 该设备已确认的最高 `OpId`）
+     与 `TombstoneGcReport { shrunk, archived }` 定义在 `mazha-crdt`；
+     `RosterMeta::gc_tombstones(&DeviceAcks)` / `CrdtRoster::gc_tombstones` 为 additive API。
+  2. **已知设备** = `DeviceAcks` 的键 ∪ 当前墓碑 `op_id.device` 的集合。只有**每个**已知设备
+     都有 ack 且 `ack >= tombstone.op_id`（全序 `(clock, device)`）才允许收缩；缺任一设备的
+     ack、`DeviceAcks` 为空、或任一端落后一律跳过。不推测/补齐缺失确认。
+  3. 被允许收缩的墓碑把 `conflict_frames` 移入 `TombstoneArchive { doc_id, op_id, frames }`
+     作为**可恢复归档记录**返回给调用方；墓碑本身（含 `op_id`/`reason`）**永久保留**，
+     `conflict_frames` 清空。这是“副本非空时不得 GC”的替代分支：先转储再收缩，绝不静默丢帧。
+  4. **不复活**：低/等 `op_id` 的旧 upsert 遇到已收缩墓碑时，仍由 D98 规则把其帧并入
+     `conflict_frames`，墓碑不删除、活动文档不建立；后续可在新确认齐备后再次归档收缩。
+  5. 幂等：重复调用同一份确认表不产生新归档（已收缩墓碑帧为空即跳过）；CJK `DocId` 合法。
+- **服务端配合（仍 additive，四路由语义不变）**：
+  - `WorkspaceState` 增 `device_acks: BTreeMap<DeviceId, OpId>` 与
+    `gc_archive: Vec<TombstoneArchive>`；磁盘 `MZWS` 格式版本 1 → **2**，v1 文件仍可读
+    （缺字段视为空），坏 CRC/截断/未知版本照旧拒绝。
+  - `SyncService::pull` 用现有 `PullRequest.known_metadata`（客户端已应用的墓碑快照）
+    **推断确认**：取每个墓碑 `op_id` 与旧 ack 的最大值，仅在变化时保存状态；不新增
+    消息字段、不改游标/日志/去重规则。
+  - `SyncService::gc_tombstones(workspace, token)` 为显式调度入口：加载状态 → 在克隆
+    roster 上调用 `RosterMeta::gc_tombstones(&acks)` → 把归档追加进 `gc_archive`、写回
+    收缩后的元数据并落盘；零变化时不写盘、不推进游标（压缩的是审计副本，不是同步日志）。
+
+#### 5.12.2 已确认状态持久化（D107）
+
+- `mazha-sync-local` 的 `.mazha/sync-state.bin` 从 `MZLS | version(1) | …` 升级到
+  **version 2**，在原有 outbox 之后追加两段（均在 CRC 覆盖范围内）：
+  ```
+  resolved_conflict_frames: u32 数量 + (DocId 字符串 + u32 帧数 + 帧字节)*
+  resolved_snapshot_batches: u8 标志(0=None/1=Some) + [u32 数量 + BatchId 字符串*]
+  ```
+- v1 文件仍可读：缺这两段时视为空指纹（`BTreeMap::new()` / `None`），平滑升级，不迁移写盘；
+  写入始终为 v2。未知版本、坏 magic/CRC/长度/UTF-8 仍返回 `LocalSyncError::CorruptState`，
+  不 panic、不回退空状态。
+- `LocalSyncState` 增同名字段（`Default` 为空）；`LocalSyncEngine::open` 从加载状态恢复两份
+  指纹，用于初始 `conflict_docs` 与后续 `needs_confirmation` 抑制；`persist()` 与原路径一致
+  （暂存成功、传输/快照失败、resolve 成功均落盘）。重启后已确认材料不再重现横幅；
+  新冲突帧或新 outbox 批次因指纹不匹配照常提示。
+- **不改**桌面 UI、不改 `resolve_*` 签名/三选一语义；token 仍只从环境变量读取（第三批替换）。
 
 ---
 
@@ -845,6 +924,21 @@ pub trait SyncTransport {
   本地集成测试只绑定 `127.0.0.1:0` 的明文端口。
 - **WebSocket 订阅（S4）后置**：本阶段只有请求-响应，无 `subscribe`，`SyncMessage`
   九种顺序与 `SyncTransport` 四方法不变。
+
+#### 7.4.5 S5b 第二批服务端维护契约（D105/D106 / 0.1.127）
+
+- **设备确认推断（不新增消息字段）**：`SyncService::pull` 读取 `PullRequest.known_metadata`
+  中的墓碑 `op_id`，与 `WorkspaceState.device_acks` 中该设备已有 ack 取全序最大值；
+  仅当推断结果变化时保存状态。客户端无需推送新消息，也不推断/补齐缺失设备的确认。
+- **快照压缩**：`snapshot_request` 在构造 `SnapshotPayload` 后调用
+  `mazha_sync::compact_snapshot_payload`（§5.8.5），返回压缩后的标准 Yjs v1 全量帧；
+  `compact_snapshot(workspace, token)` 是不写回服务端历史帧的显式维护入口。
+- **GC 调度**：`gc_tombstones(workspace, token)` 加载状态 → 在克隆 roster 上以
+  `device_acks ∪ 墓碑来源设备` 为确认表调用 `RosterMeta::gc_tombstones` → 把归档追加进
+  `gc_archive`、写回收缩后的 `meta` 并落盘。零变化时**不写盘**，游标/日志/去重/四路由
+  语义完全不变；归档只服务于审计/恢复，不进入 pull 日志、不伪装成内容帧。
+- **磁盘兼容**：`MZWS` 版本 1 → 2，在 dedup 之后追加 `device_acks` 与 `gc_archive`
+  两段（均受 CRC 覆盖）；v1 仍可读并把新字段初始化为空，未知版本/坏 CRC/截断照旧拒绝。
 
 ---
 
@@ -1086,6 +1180,20 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
   `cargo test --workspace` 全绿；桌面 `cargo fmt --check`、`cargo clippy -- -D warnings`、
   `cargo test`、`cargo build` 全绿；测试计数变化记入 `HANDOFF.md`。
 
+### 11.6 S5b 第二批验收标准与测试分层（已定，D105/D106/D107）
+
+- **GC 纯 Rust**：全设备 ack 达阈值才收缩；缺任一设备 ack/空表/任一端落后时整批零改动；
+  归档帧可应用到空 `CrdtDoc` 恢复文本，墓碑与其 `op_id` 永不删除；收缩后低 `op_id`
+  upsert 仍不复活且新帧并入副本；重复调用幂等；CJK `DocId` 与磁盘 v1→v2 往返通过。
+- **快照压缩纯 Rust**：CJK/emoji 文本 roundtrip、压缩帧显著小于历史帧、压缩后继续编辑
+  再同步收敛、坏帧返回错误且入参不变；九种 `SyncMessage`/wire golden vector 不受影响。
+- **服务端**：`known_metadata` 推断 ack 并写盘、`gc_tombstones` 只收缩/归档不推进游标、
+  快照入口返回压缩帧，四路由与既有去重/游标测试继续成立。
+- **本地持久化**：v2 往返与 v1 兼容读、坏 CRC/未知版本/截断仍 `CorruptState`；
+  确认过的冲突/门槛在重启后不重现横幅，新冲突帧或新批次照常提示；`resolve_*` 签名与
+  三选一语义零改动。
+- **门禁**：与 §11.5 相同；桌面 UI 本批零改动但仍须跑独立 workspace 四门禁。
+
 ---
 
 ## 12. 开放问题与建议决策项
@@ -1095,14 +1203,14 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 | S-01 | `DocId` 继续用路径还是引入稳定 UUID？ | MVP 用路径，重命名按删旧建新；后续再评估 UUID。 | 高 |
 | S-02 | 删除与离线编辑冲突时谁赢？ | **已确认（D95）**：默认墓碑 wins，但必须保留冲突副本或可恢复记录；禁止静默丢数据。S1 契约见 §4.5.4。 | 高（已决） |
 | S-03 | 同路径“删除后重建”是否允许复活？ | **已确认（D95/D98）**：允许，使用更高 `op_id` 的 upsert 覆盖墓碑；全序为 `(clock, device)`，`op_id` 相同时墓碑胜出。 | 高（已决） |
-| S-04 | 墓碑何时 GC？ | MVP 不 GC；引入“所有已知设备游标越过墓碑”后再 GC。 | 中 |
+| S-04 | 墓碑何时 GC？ | **已定（D105，S5b 第二批）**：所有已知设备（`DeviceAcks` 键 ∪ 墓碑来源设备）均有 ack 且 `ack >= tombstone.op_id` 时才“先转储副本、再清空副本、保留墓碑”，缺 ack 一律跳过；不整条删除墓碑。 | 中（已决） |
 | S-05 | 最小服务端形态？ | **已定（D100）**：`mazha-sync-server`，带持久化的同步中继（temp+rename 落盘、批次去重、服务端 CRDT 校验），不做 Markdown 语义合并。 | 高（已决） |
 | S-06 | 传输 MVP 选型？ | **已定（D100）**：同步 HTTP（ureq client + tiny_http server），请求-响应优先，WebSocket 订阅后置。 | 中（已决） |
 | S-07 | `mazha-sync` 是否独立 crate？ | **已定（D99）**：独立 crate，协议/会话/transport trait/假服务端都在此；核心 crate 保持纯净，无网络/GUI/async。 | 高（已决） |
 | S-08 | `apply_remote` 整体重建导致 undo/选区丢失如何处理？ | **已实现（D103，S5b 第一批）**：`apply_remote` 签名/返回值不变，内部生成 `RemotePatch` 并增量应用；远端变更不进 undo，已有 undo 历史偏移重映射、redo 清空，光标/选区用同一个纯函数重映射。 | 中（已决） |
 | S-09 | 认证模型？ | **已定（D100）**：MVP 先设备 token + 工作区授权（`Authorization: Bearer`，工作区隔离），团队/组织权限后置。 | 高（已决） |
 | S-10 | 是否需要 E2EE？ | MVP 不承诺；协议预留密文载荷字段。 | 中 |
-| S-11 | 快照与增量日志的本地存储格式？ | **已定（D100）**：先复用 wire 小端/长度前缀助手做单文件 hex 持久化（temp+rename），后续引入 append-only log + compaction。 | 中（已决） |
+| S-11 | 快照与增量日志的本地存储格式？ | **已定（D100）**：先复用 wire 小端/长度前缀助手做单文件 hex 持久化（temp+rename）；**S5b 第二批（D106/D107）** 加 CRDT 级快照压缩与 `MZLS` v2 已确认指纹（v1 可读），append-only log + compaction 仍属后续。 | 中（已决） |
 | S-12 | 结构性并发（表格/块）冲突提示？ | 继续沿用 §6.5 `[待确认]`；先记录冲突事件，不自动重写语义结构。S4 只在 `status().conflict_docs` 暴露墓碑冲突副本所在的 `DocId`。 | 低（S4 仅暴露 DocId） |
 | S-13 | 桌面何时接入本地引擎与冲突 UI？ | **已实现（D102，S5a；D104，S5b 第一批）**：S5a 注入 `HttpTransport`、周期/手动同步与状态/冲突提示；S5b 第一批补上“保留本地/采用远端/合并”三选一与破坏性二次确认，所有覆盖均需用户显式确认，绝不静默丢弃。 | 高（已决） |
 
@@ -1175,10 +1283,17 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 - 桌面横幅加三选一按钮与破坏性二次确认，复用 `SyncHandle`/`SyncReply`/D92 样式；
   D95–D102 签名与语义零改动，根依赖不变。
 
-### Phase S5b 第二批：产品化（后置）
+### Phase S5b 第二批：墓碑 GC / 快照压缩 / 已确认状态持久化（D105–D107，0.1.127 已落地）
 
-- WebSocket 订阅、快照压缩、墓碑 GC、平台安全存储（token 不再从环境变量读取）。
-- 已确认状态持久化（避免重启后横幅重现）与确认后的自动重试策略。
+- `mazha-crdt` additive 安全 GC：全设备确认才转储副本并收缩，保留墓碑与 `op_id`，不复活。
+- `mazha-sync` 纯函数 `compact_snapshot_payload` + 服务端快照入口压缩；九种消息/wire 不变。
+- `MZWS` v2 记录设备 ack 与归档，显式 `gc_tombstones` 调度入口不推进游标/日志。
+- `MZLS` v2 持久化已确认冲突帧/快照批次指纹，v1 可读为空，重启后横幅不重现。
+
+### Phase S5b 第三批：平台化（后置）
+
+- WebSocket 订阅（`subscribe`/推送）与平台安全存储（token 不再从环境变量读取）。
+- 确认后的自动重试策略与 GC 调度策略产品化（周期/阈值/归档审计导出）。
 
 ---
 
@@ -1192,6 +1307,7 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
 | watcher 与同步写盘回环 | 重复更新、性能抖动、假冲突 | 统一变更来源与回声抑制。 |
 | 服务端过早产品化 | 范围膨胀 | MVP 只做带持久化中继。 |
 | 安全边界不清 | 数据泄露或越权 | TLS + 工作区授权 + 最小日志作为上线门槛。 |
+| GC/快照压缩误删可恢复数据 | 旧冲突副本丢失或压缩帧被当增量重放 | D105 全设备确认才转储归档并保留墓碑；D106 压缩帧只走快照引导，普通 pull 零改动。 |
 
 ---
 
@@ -1214,3 +1330,8 @@ platforms/desktop（独立 workspace，只改本目录与桌面 Cargo.lock）
   §11.5（验收）/§12 S-08/S-13/§13 S5b 第一批与第二批拆分；`SPEC.md` §5 crate 表补
   `mazha-core`/`mazha-sync-local` 的 additive 能力、§6.5 增 S5b 第一批段、
   §14 新增 D103/D104、§15 记 0.1.126；`HANDOFF.md` 同步版本/状态/测试数/下一步 S5b 第二批。
+- **S5b 第二批回填（0.1.127）**：本文 §5.8.5（快照压缩）/§7.4.5（服务端确认推断与 GC）/
+  §5.12/§11.6（本批契约与验收）/§12 S-04/S-11/§13 S5b 第二批与第三批拆分/§14 风险；
+  `SPEC.md` §5 crate 表补 `mazha-crdt`/`mazha-sync`/`mazha-sync-local`/`mazha-sync-server`
+  的 additive 能力、§6.5 增 S5b 第二批段、§14 新增 D105/D106/D107、§15 记 0.1.127；
+  `HANDOFF.md` 同步版本/状态/测试数/下一步 S5b 第三批。
