@@ -38,4 +38,32 @@ pub enum CrdtError {
     /// 操作目标文档不存在。
     #[error("文档不存在：{0}")]
     DocumentNotFound(String),
+
+    /// 操作 ID 非法：设备标识必须非空且不含控制字符（S1/D98）。
+    #[error("操作 ID 非法（设备标识必须非空且不含控制字符）：{0}")]
+    InvalidOpId(String),
+
+    /// 冲突副本帧非法：墓碑保存的可恢复 Yjs v1 帧无法解码（S1/D98）。
+    #[error("冲突副本帧非法（文档 {doc_id}）：{source}")]
+    InvalidConflictFrame {
+        /// 所属文档 ID，便于定位坏人元数据。
+        doc_id: String,
+        /// yrs v1 解码错误。
+        #[source]
+        source: yrs::encoding::read::Error,
+    },
+
+    /// 元数据帧非法：upsert 携带的 Yjs v1 内容帧无法解码（S1/D98）。
+    #[error("元数据帧非法（文档 {doc_id}）：{source}")]
+    InvalidMetaFrame {
+        /// 所属文档 ID，便于定位坏元数据。
+        doc_id: String,
+        /// yrs v1 解码错误。
+        #[source]
+        source: yrs::encoding::read::Error,
+    },
+
+    /// 墓碑冲突：试图把不同文档的墓碑归并到一起（S1/D98）。
+    #[error("墓碑冲突：doc_id 不一致（{0}）")]
+    TombstoneConflict(String),
 }

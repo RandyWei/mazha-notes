@@ -1,0 +1,15 @@
+[package]
+name = "mazha-sync"
+description = "码札同步会话层：内存协议模型、请求-响应 transport trait、假服务端与会话状态机"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mazha-crdt = { path = "../mazha-crdt" }
+thiserror = "2"
+
+[lints]
+workspace = true

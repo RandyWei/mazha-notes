@@ -2,17 +2,20 @@
 //!
 //! 基于 [yrs](https://crates.io/crates/yrs) 的多端同步层：在 `Y.Text` 中保存
 //! Markdown 源文本，产出/消费标准 Yjs 更新帧，支持状态向量与合并。
-//! [`CrdtRoster`] 在此之上按稳定 ID 管理多篇文档，并以 ID → Yjs v1 帧的映射提供整册同步。
-//! 见 `SPEC.md` §6.5。
+//! [`CrdtRoster`] 在此之上按稳定 ID 管理多篇文档，并以 ID → Yjs v1 帧的映射提供整册同步；
+//! [`OpId`]/[`Tombstone`]/[`RosterMeta`]/[`MetaChange`] 提供 S1 墓碑元数据纯模型（D95/D98）。
+//! 内容帧与元数据信封严格分离，见 `SPEC.md` §6.5 与 `docs/SYNC-SPEC.md` §4.5。
 //!
 //! ## 索引单位
 //! 本层的对外接口使用 **字符索引**（与 `mazha-core` 的 rope 一致）；而 `yrs::TextRef`
 //! 内部按 **UTF-8 字节**计量。所有跨边界处用 [`char_to_byte`] 转换，避免中文被切坏。
 
 mod error;
+mod meta;
 mod roster;
 
 pub use error::{CrdtError, CrdtResult};
+pub use meta::{MetaChange, OpId, RosterMeta, Tombstone, TombstoneReason};
 pub use roster::{CrdtRoster, DocId};
 
 use yrs::updates::decoder::Decode;

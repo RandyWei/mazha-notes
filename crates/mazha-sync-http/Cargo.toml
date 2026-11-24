@@ -1,0 +1,15 @@
+[package]
+name = "mazha-sync-http"
+description = "码札同步的真实 HTTP client transport（ureq，同步请求-响应）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mazha-sync = { path = "../mazha-sync" }
+ureq = "2"
+
+[lints]
+workspace = true
